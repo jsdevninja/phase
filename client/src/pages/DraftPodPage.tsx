@@ -8,11 +8,12 @@
  * 4. Deckbuilding: LimitedDeckBuilder (reuses Quick Draft component)
  */
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useNavigate, useSearchParams } from "react-router";
 
 import { CardPreview } from "../components/card/CardPreview";
+import { MenuSelect } from "../components/ui/MenuSelect";
 import type { CardHoverInfo } from "../components/card/CardPreview";
 import { ScreenChrome } from "../components/chrome/ScreenChrome";
 import { CubeSetupPanel } from "../components/draft/CubeSetupPanel";
@@ -30,6 +31,7 @@ import { SeatStatusRing } from "../components/draft/SeatStatusRing";
 import { SetSelector } from "../components/draft/SetSelector";
 import { StandingsTable } from "../components/draft/StandingsTable";
 import { menuButtonClass } from "../components/menu/buttonStyles";
+import { MenuShell } from "../components/menu/MenuShell";
 import {
   useMultiplayerDraftStore,
   type MultiplayerDraftPhase,
@@ -69,6 +71,17 @@ function PodSetup() {
     ? t("podSetup.policyCompetitiveDesc")
     : t("podSetup.policyCasualDesc");
   const podSizeDescription = t("podSetup.podSizeDesc", { count: config.podSize });
+  const podSizeItems = useMemo(
+    () =>
+      [4, 6, 8].map((n) => ({
+        value: String(n),
+        label: t("podSetup.playerCount", { count: n }),
+      })),
+    [t],
+  );
+  const podSizeLabel =
+    podSizeItems.find((item) => item.value === String(config.podSize))?.label ??
+    t("podSetup.playerCount", { count: config.podSize });
 
   if (mode === "choose") {
     return (
@@ -84,10 +97,10 @@ function PodSetup() {
           {/* Host card */}
           <button
             onClick={() => setMode("host")}
-            className="group flex flex-col gap-3 rounded-[16px] border border-emerald-300/18 bg-emerald-400/5 p-6 text-left backdrop-blur-md transition-colors hover:border-emerald-300/30 hover:bg-emerald-400/10"
+            className="group flex flex-col gap-3 rounded-card border border-jade/30 surface-card p-6 text-left transition-all duration-150 hover:-translate-y-[3px] hover:border-jade/50 hover:shadow-panel"
           >
-            <div className="text-lg font-semibold text-emerald-100">{t("podSetup.hostCardTitle")}</div>
-            <p className="text-sm leading-relaxed text-white/50 group-hover:text-white/60">
+            <div className="font-display text-lg font-semibold text-jade-text">{t("podSetup.hostCardTitle")}</div>
+            <p className="text-sm leading-relaxed text-fg-card-body group-hover:text-fg-muted">
               {t("podSetup.hostCardDesc")}
             </p>
           </button>
@@ -95,17 +108,17 @@ function PodSetup() {
           {/* Join card */}
           <button
             onClick={() => setMode("join")}
-            className="group flex flex-col gap-3 rounded-[16px] border border-blue-300/18 bg-blue-400/5 p-6 text-left backdrop-blur-md transition-colors hover:border-blue-300/30 hover:bg-blue-400/10"
+            className="group flex flex-col gap-3 rounded-card border border-arcane/30 surface-card p-6 text-left transition-all duration-150 hover:-translate-y-[3px] hover:border-arcane/50 hover:shadow-panel"
           >
-            <div className="text-lg font-semibold text-blue-100">{t("podSetup.joinCardTitle")}</div>
-            <p className="text-sm leading-relaxed text-white/50 group-hover:text-white/60">
+            <div className="font-display text-lg font-semibold text-arcane-text">{t("podSetup.joinCardTitle")}</div>
+            <p className="text-sm leading-relaxed text-fg-card-body group-hover:text-fg-muted">
               {t("podSetup.joinCardDesc")}
             </p>
           </button>
         </div>
 
-        <div className="rounded-[16px] border border-white/8 bg-white/3 px-5 py-4 backdrop-blur-md">
-          <div className="mb-2 text-[0.68rem] font-semibold uppercase tracking-[0.18em] text-slate-500">
+        <div className="rounded-card border border-hairline-strong bg-surface-panel px-5 py-4">
+          <div className="mb-2 text-[0.68rem] font-semibold uppercase tracking-[0.22em] text-fg-meta">
             {t("podSetup.howItWorksTitle")}
           </div>
           <ul className="space-y-1.5 text-sm leading-relaxed text-white/50">
@@ -238,20 +251,19 @@ function PodSetup() {
           <p className="text-xs text-white/40">{policyDescription}</p>
         </div>
 
-        {/* Pod size */}
         <div className="flex flex-col gap-1">
-          <label className="text-sm font-medium text-white/60">{t("podSetup.podSize")}</label>
-          <select
-            value={config.podSize}
-            onChange={(e) => setConfig({ podSize: Number(e.target.value) })}
-            className="w-32 rounded-lg border border-white/10 bg-black/30 px-3 py-2 text-white outline-none focus:border-emerald-400/40"
-          >
-            {[4, 6, 8].map((n) => (
-              <option key={n} value={n}>
-                {t("podSetup.playerCount", { count: n })}
-              </option>
-            ))}
-          </select>
+          <span className="text-sm font-medium text-white/60">{t("podSetup.podSize")}</span>
+          <MenuSelect
+            ariaLabel={t("podSetup.podSize")}
+            label={podSizeLabel}
+            selectedValue={String(config.podSize)}
+            items={podSizeItems}
+            onSelect={(value) => setConfig({ podSize: Number(value) })}
+            menuLayout="dropdown"
+            fitContainer
+            wrapperClassName="w-full max-w-[8rem]"
+            className="min-h-[44px] !rounded-lg border border-white/10 !bg-black/30 px-3 !py-2 text-base text-white shadow-none !hover:bg-black/30 !focus-visible:ring-emerald-400/50"
+          />
           <p className="text-xs text-white/40">{podSizeDescription}</p>
         </div>
 
@@ -781,9 +793,12 @@ export function DraftPodPage() {
     <div className="menu-scene relative flex min-h-screen flex-col overflow-hidden">
       <ScreenChrome onBack={showBack ? handleLeave : undefined} />
 
-      <div className="relative z-10 mx-auto flex w-full max-w-6xl flex-col px-6 py-16">
-        {phaseContent(phase, handleLeave)}
-      </div>
+      {/* Centered MenuShell column — same responsive framing as every other
+          out-of-match surface. Each phase view renders its own heading, so no
+          MenuShell title is passed. */}
+      <MenuShell layout="stacked">
+        <div className="flex w-full flex-col">{phaseContent(phase, handleLeave)}</div>
+      </MenuShell>
 
       <HostControls />
     </div>

@@ -17,8 +17,12 @@ pub fn resolve(
     ability: &ResolvedAbility,
     events: &mut Vec<GameEvent>,
 ) -> Result<(), EffectError> {
-    let (target_filter, cost) = match &ability.effect {
-        Effect::CastCopyOfCard { target, cost } => (target, cost),
+    let (target_filter, cost, count) = match &ability.effect {
+        Effect::CastCopyOfCard {
+            target,
+            cost,
+            count,
+        } => (target, cost, count),
         _ => return Err(EffectError::MissingParam("CastCopyOfCard".to_string())),
     };
 
@@ -47,18 +51,33 @@ pub fn resolve(
             .collect();
 
         if !source_ids.is_empty() {
-            let count = source_ids.len();
+            // CR 707.12a: "you may cast UP TO N of the copies" caps how many of
+            // the copies may be cast. `count: None` (the 13 existing cards) means
+            // every copy may be cast. The choice is always `up_to` (the player
+            // chooses individually whether to cast each copy), so the cap is the
+            // upper bound `min(N, available)`.
+            let cap = count
+                .as_ref()
+                .map(|expr| {
+                    crate::game::quantity::resolve_quantity_with_targets(state, expr, ability)
+                        .max(0) as usize
+                })
+                .unwrap_or(source_ids.len());
+            let choose = cap.min(source_ids.len());
             let mut resume = ability.clone();
             resume.effect = Effect::CastCopyOfCard {
                 target: TargetFilter::None,
                 cost: cost.clone(),
+                // The cap is consumed by this choice; the resumed cast of the
+                // chosen copies (explicit targets) must not re-apply it.
+                count: None,
             };
             resume.sub_ability = None;
             super::append_to_pending_continuation(state, Some(Box::new(resume)));
             state.waiting_for = WaitingFor::ChooseFromZoneChoice {
                 player: ability.controller,
                 cards: source_ids,
-                count,
+                count: choose,
                 up_to: true,
                 constraint: None,
                 source_id: ability.source_id,
@@ -79,13 +98,14 @@ pub fn resolve(
         let copy_id =
             cast_one_copy(state, source_id, ability, events).map_err(EffectError::InvalidParam)?;
 
-        if open_copy_target_selection(state, copy_id, ability.controller)
+        if open_copy_target_selection(state, copy_id, ability.controller, None)
             .map_err(EffectError::InvalidParam)?
         {
             let mut resume = ability.clone();
             resume.effect = Effect::CastCopyOfCard {
                 target: TargetFilter::None,
                 cost: cost.clone(),
+                count: None,
             };
             resume.sub_ability = None;
             if index + 1 < source_ids.len() {
@@ -155,6 +175,12 @@ fn cast_one_copy(
     // CR 707.12 + CR 601.2a: The copy is created and cast as a spell on the stack.
     copy.zone = Zone::Stack;
     copy.is_token = false;
+    // CR 707.12a: the copy is NOT represented by a card, so abilities gated on
+    // "if this spell is represented by a card" (e.g. Cipher's encode, CR 702.99a)
+    // must not fire for it. `is_token` stays false (this copy goes to the
+    // graveyard like a card per the engine's CastCopyOfCard model), so the
+    // copy-ness is recorded separately here.
+    copy.is_copy = true;
     copy.tapped = false;
     copy.prepared = None;
     // CR 707.12: The copy is created in the same zone as the source object before casting.
@@ -163,6 +189,20 @@ fn cast_one_copy(
     copy.kickers_paid.clear();
     copy.additional_cost_payment_count = 0;
     state.objects.insert(copy_id, copy);
+
+    // CR 611.2f + CR 707.12: This cast path bypasses `finalize_cast`, so snapshot
+    // the copy's effective keywords here (mirroring the finalize_cast snapshot at
+    // casting_costs.rs). The post-record SpellCast trigger seams (Cascade per
+    // CR 702.85a, Demonstrate per CR 702.144a) read `obj.cast_spell_keywords`
+    // rather than re-querying `effective_spell_keywords`; without this, a copy of
+    // a printed-Cascade card would carry an empty snapshot and silently drop its
+    // Cascade trigger. `effective_spell_keyword_instances` preserves multi-instance
+    // keywords (Cascade x2, Ripple) exactly as the seams' instance counting expects.
+    let cast_spell_keywords =
+        crate::game::casting::effective_spell_keyword_instances(state, ability.controller, copy_id);
+    if let Some(copy_mut) = state.objects.get_mut(&copy_id) {
+        copy_mut.cast_spell_keywords = cast_spell_keywords;
+    }
 
     let mut resolved =
         ability_def.map(|def| build_resolved_from_def(&def, copy_id, ability.controller));
@@ -261,6 +301,7 @@ mod tests {
             Effect::CastCopyOfCard {
                 target: TargetFilter::None,
                 cost: ManaCost::zero(),
+                count: None,
             },
             vec![TargetRef::Object(source_id)],
             ObjectId(99),
@@ -304,6 +345,7 @@ mod tests {
                     id: TrackedSetId(0),
                 },
                 cost: ManaCost::zero(),
+                count: None,
             },
             Vec::new(),
             ObjectId(99),
@@ -349,6 +391,7 @@ mod tests {
                     id: TrackedSetId(1),
                 },
                 cost: ManaCost::zero(),
+                count: None,
             },
             Vec::new(),
             ObjectId(99),
@@ -395,6 +438,7 @@ mod tests {
             Effect::CastCopyOfCard {
                 target: TargetFilter::None,
                 cost: ManaCost::zero(),
+                count: None,
             },
             vec![TargetRef::Object(source_id)],
             ObjectId(99),
@@ -414,5 +458,73 @@ mod tests {
             )),
             other => panic!("expected spell with resolved ability, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn cast_copy_snapshots_printed_keywords_for_spellcast_seams() {
+        use crate::types::keywords::Keyword;
+
+        // CR 611.2f + CR 707.12: A copy cast via this effect bypasses
+        // `finalize_cast`, so the cast-time keyword snapshot must be stamped here.
+        // The post-record SpellCast trigger seams (Cascade per CR 702.85a,
+        // Demonstrate per CR 702.144a) read `obj.cast_spell_keywords`; if the copy
+        // were left with an empty snapshot, a copy of a printed-Cascade card would
+        // silently drop its Cascade trigger.
+        let mut state = GameState::new_two_player(7);
+        let source_id = add_exiled_spell_card(&mut state, "Bloodbraid Elf");
+        {
+            let source = state
+                .objects
+                .get_mut(&source_id)
+                .expect("source object exists");
+            source.keywords.push(Keyword::Cascade);
+        }
+        let mut events = Vec::new();
+        let ability = ResolvedAbility::new(
+            Effect::CastCopyOfCard {
+                target: TargetFilter::None,
+                cost: ManaCost::zero(),
+                count: None,
+            },
+            vec![TargetRef::Object(source_id)],
+            ObjectId(99),
+            PlayerId(0),
+        );
+
+        resolve(&mut state, &ability, &mut events).expect("cast copy resolves");
+
+        let copy_id = state.stack.back().expect("copy on stack").id;
+        let copy = state.objects.get(&copy_id).expect("copy object exists");
+        assert!(
+            copy.cast_spell_keywords
+                .iter()
+                .any(|k| matches!(k, Keyword::Cascade)),
+            "cast-copy of a printed-Cascade card must snapshot Cascade so the \
+             post-record SpellCast seam can enqueue the trigger"
+        );
+
+        // Drive the post-record SpellCast seam end-to-end: the snapshot stamped
+        // above must let the Cascade trigger enqueue even though this cast path
+        // bypassed `finalize_cast`.
+        let cast_event = events
+            .iter()
+            .find_map(|event| match event {
+                GameEvent::SpellCast { object_id, .. } if *object_id == copy_id => {
+                    Some(event.clone())
+                }
+                _ => None,
+            })
+            .expect("cast-copy emits a SpellCast event for the copy");
+        crate::game::triggers::process_triggers(&mut state, &[cast_event]);
+
+        assert!(
+            state.stack.iter().any(|entry| matches!(
+                &entry.kind,
+                StackEntryKind::TriggeredAbility { ability, .. }
+                    if matches!(ability.effect, Effect::Cascade)
+            )),
+            "a cast copy of a printed-Cascade card should enqueue a Cascade trigger \
+             via the SpellCast seam reading the cast-time keyword snapshot"
+        );
     }
 }

@@ -9,6 +9,7 @@
 pub mod attribution;
 pub mod compare;
 pub mod inline_decks;
+pub mod perf;
 pub mod run;
 pub mod snapshots;
 pub mod spec;
@@ -35,10 +36,17 @@ pub enum FeatureKind {
     Tribal,
     Control,
     Aristocrats,
+    Artifacts,
+    Enchantments,
     AggroPressure,
     TokensWide,
     PlusOneCounters,
     SpellslingerProwess,
+    Reanimator,
+    Equipment,
+    Blink,
+    Mill,
+    Energy,
 }
 
 impl FeatureKind {
@@ -50,10 +58,17 @@ impl FeatureKind {
         FeatureKind::Tribal,
         FeatureKind::Control,
         FeatureKind::Aristocrats,
+        FeatureKind::Artifacts,
+        FeatureKind::Enchantments,
         FeatureKind::AggroPressure,
         FeatureKind::TokensWide,
         FeatureKind::PlusOneCounters,
         FeatureKind::SpellslingerProwess,
+        FeatureKind::Reanimator,
+        FeatureKind::Equipment,
+        FeatureKind::Blink,
+        FeatureKind::Mill,
+        FeatureKind::Energy,
     ];
 }
 
@@ -90,7 +105,7 @@ impl std::fmt::Debug for DeckRef {
 }
 
 /// Outcome tolerance for a matchup.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 pub enum Expected {
     /// Mirror match: P0 winrate must fall within `(0.5 - tolerance, 0.5 + tolerance)`.

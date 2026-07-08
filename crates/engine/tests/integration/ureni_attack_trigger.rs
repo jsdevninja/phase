@@ -22,8 +22,8 @@
 
 use engine::game::scenario::{GameScenario, P0, P1};
 use engine::types::ability::{
-    AbilityDefinition, AbilityKind, Effect, GainLifePlayer, QuantityExpr, StaticDefinition,
-    TargetFilter, TriggerDefinition, TypedFilter,
+    AbilityDefinition, AbilityKind, Effect, QuantityExpr, StaticDefinition, TargetFilter,
+    TriggerDefinition, TypedFilter,
 };
 use engine::types::actions::GameAction;
 use engine::types::game_state::ExtraPhase;
@@ -43,7 +43,7 @@ fn ureni_style_trigger() -> TriggerDefinition {
             AbilityKind::Spell,
             Effect::GainLife {
                 amount: QuantityExpr::Fixed { value: 1 },
-                player: GainLifePlayer::Controller,
+                player: TargetFilter::Controller,
             },
         ))
         .valid_card(TargetFilter::SelfRef)
@@ -152,6 +152,8 @@ fn ureni_attacks_in_second_combat_fires_again() {
     runner.state_mut().extra_phases.push(ExtraPhase {
         anchor: current_phase,
         phase: Phase::BeginCombat,
+        attacker_restriction: None,
+        attacker_restriction_source: None,
     });
 
     // Advance out of the current step (post-combat / end phase) into the
@@ -187,6 +189,7 @@ fn ureni_attacks_in_second_combat_fires_again() {
     runner
         .act(GameAction::DeclareAttackers {
             attacks: vec![(ureni, AttackTarget::Player(P1))],
+            bands: vec![],
         })
         .expect("second DeclareAttackers should succeed");
     runner.advance_until_stack_empty();

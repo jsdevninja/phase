@@ -155,7 +155,7 @@ describe("partitionByType", () => {
     expect(result.support).toEqual([]);
   });
 
-  it("excludes bestowed Aura-creature (Creature + Enchantment core types) when attached", () => {
+  it("excludes attached Aura subtype permanents from main rows", () => {
     // CR 702.103: Bestowed creatures are Auras as long as attached. Their
     // core_types still includes "Creature" — without the attached_to filter
     // running first, they'd land in the creatures row AND the chip row.
@@ -260,6 +260,23 @@ describe("groupByName", () => {
     expect(groups.find((g) => g.count === 1)?.ids).toEqual([3]);
   });
 
+  it("renders the ring-bearer solo even among identical same-named copies (issue #721)", () => {
+    const objects = [
+      makeGameObject({ id: 1, name: "Orc Army" }),
+      makeGameObject({ id: 2, name: "Orc Army" }),
+      makeGameObject({ id: 3, name: "Orc Army" }),
+    ];
+
+    const groups = groupByName(objects, new Set([2]));
+
+    // The ring-bearer (id 2) never gets hidden behind a non-bearer
+    // representative in a collapsed group — it always has its own entry so
+    // PermanentCard's ring-bearer badge is reachable.
+    expect(groups).toHaveLength(2);
+    expect(groups.find((g) => g.count === 2)?.ids).toEqual([1, 3]);
+    expect(groups.find((g) => g.count === 1)?.ids).toEqual([2]);
+  });
+
   it("separates copies with different counter amounts", () => {
     const objects = [
       makeGameObject({ id: 1, name: "Grizzly Bears", counters: { Plus1Plus1: 1 } }),
@@ -358,6 +375,168 @@ describe("groupByName", () => {
     expect(groups[0].representative.id).toBe(5);
     expect(groups[1].name).toBe("Mountain");
     expect(groups[1].representative.id).toBe(9);
+  });
+
+  it("keeps visually distinct tokens with the same name in separate groups", () => {
+    const attackPest = makeGameObject({
+      id: 1,
+      card_id: 0,
+      name: "Pest",
+      power: 1,
+      toughness: 1,
+      display_source: "Token",
+      token_rules_text: "Whenever this token attacks, you gain 1 life.",
+      token_image_ref: {
+        preset_id: "00a0801d-0212-5890-8957-3cde30f382f9",
+        scryfall_id: "ba854032-6ad2-4654-990a-64006e7f92fd",
+      },
+      card_types: {
+        supertypes: [],
+        core_types: ["Creature"],
+        subtypes: ["Pest"],
+      },
+      color: ["Black", "Green"],
+    });
+    const diesPest = makeGameObject({
+      id: 2,
+      card_id: 0,
+      name: "Pest",
+      power: 1,
+      toughness: 1,
+      display_source: "Token",
+      token_rules_text: "When this creature dies, you gain 1 life.",
+      token_image_ref: {
+        preset_id: "14c28cbd-1740-5c17-98ea-4aea094067f1",
+        scryfall_id: "2b613822-b9c2-439e-9533-a91bed12b5e9",
+      },
+      card_types: {
+        supertypes: [],
+        core_types: ["Creature"],
+        subtypes: ["Pest"],
+      },
+      color: ["Black", "Green"],
+    });
+
+    const groups = groupByName([attackPest, diesPest]);
+
+    expect(groups).toHaveLength(2);
+    expect(groups.map((g) => g.count).sort()).toEqual([1, 1]);
+  });
+
+  it("separates tokens that differ only in token_rules_text", () => {
+    const sharedImage = {
+      preset_id: "14c28cbd-1740-5c17-98ea-4aea094067f1",
+      scryfall_id: "2b613822-b9c2-439e-9533-a91bed12b5e9",
+    };
+    const objects = [
+      makeGameObject({
+        id: 1,
+        card_id: 0,
+        name: "Pest",
+        power: 1,
+        toughness: 1,
+        is_token: true,
+        display_source: "Token",
+        token_rules_text: "Whenever this token attacks, you gain 1 life.",
+        token_image_ref: sharedImage,
+        card_types: {
+          supertypes: [],
+          core_types: ["Creature"],
+          subtypes: ["Pest"],
+        },
+        color: ["Black", "Green"],
+      }),
+      makeGameObject({
+        id: 2,
+        card_id: 0,
+        name: "Pest",
+        power: 1,
+        toughness: 1,
+        is_token: true,
+        display_source: "Token",
+        token_rules_text: "When this creature dies, you gain 1 life.",
+        token_image_ref: sharedImage,
+        card_types: {
+          supertypes: [],
+          core_types: ["Creature"],
+          subtypes: ["Pest"],
+        },
+        color: ["Black", "Green"],
+      }),
+    ];
+
+    const groups = groupByName(objects);
+
+    expect(groups).toHaveLength(2);
+  });
+
+  it("separates tokens that differ only in token_image_ref.preset_id", () => {
+    const sharedRules = "When this creature dies, you gain 1 life.";
+    const objects = [
+      makeGameObject({
+        id: 1,
+        card_id: 0,
+        name: "Pest",
+        power: 1,
+        toughness: 1,
+        is_token: true,
+        display_source: "Token",
+        token_rules_text: sharedRules,
+        token_image_ref: {
+          preset_id: "00a0801d-0212-5890-8957-3cde30f382f9",
+          scryfall_id: "ba854032-6ad2-4654-990a-64006e7f92fd",
+        },
+        card_types: {
+          supertypes: [],
+          core_types: ["Creature"],
+          subtypes: ["Pest"],
+        },
+        color: ["Black", "Green"],
+      }),
+      makeGameObject({
+        id: 2,
+        card_id: 0,
+        name: "Pest",
+        power: 1,
+        toughness: 1,
+        is_token: true,
+        display_source: "Token",
+        token_rules_text: sharedRules,
+        token_image_ref: {
+          preset_id: "14c28cbd-1740-5c17-98ea-4aea094067f1",
+          scryfall_id: "2b613822-b9c2-439e-9533-a91bed12b5e9",
+        },
+        card_types: {
+          supertypes: [],
+          core_types: ["Creature"],
+          subtypes: ["Pest"],
+        },
+        color: ["Black", "Green"],
+      }),
+    ];
+
+    const groups = groupByName(objects);
+
+    expect(groups).toHaveLength(2);
+  });
+
+  it("keeps tokens separate from non-token cards with the same name", () => {
+    const objects = [
+      makeGameObject({ id: 1, name: "Soldier", power: 1, toughness: 1 }),
+      makeGameObject({
+        id: 2,
+        card_id: 0,
+        name: "Soldier",
+        power: 1,
+        toughness: 1,
+        is_token: true,
+        display_source: "Token",
+      }),
+    ];
+
+    const groups = groupByName(objects);
+
+    expect(groups).toHaveLength(2);
   });
 
   it("groups face-down permanents by public characteristics instead of hidden names", () => {

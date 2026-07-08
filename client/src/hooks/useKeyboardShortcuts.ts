@@ -3,7 +3,9 @@ import { useEffect } from "react";
 import { isMultiplayerMode, useGameStore } from "../stores/gameStore";
 import { useUiStore } from "../stores/uiStore";
 import { dispatchAction } from "../game/dispatch";
+import { getPlayerId } from "./usePlayerId";
 import { useAltToggle } from "./useAltToggle";
+import { useShiftHeld } from "./useShiftHeld";
 import {
   copyGameStateDebugSnapshot,
   exportGameStateDebugZip,
@@ -22,10 +24,13 @@ import {
  * - D: Copy game state JSON to clipboard (debug)
  * - Ctrl+D: Export game state JSON as a compressed ZIP (debug)
  * - `: Toggle debug panel
+ * - Ctrl+Shift+L: Toggle Flex Layout edit mode
+ * - Escape (in Flex Layout): Exit edit mode
  * - Triple-tap (touch): Toggle debug panel (iPad/mobile)
  */
 export function useKeyboardShortcuts(): void {
   useAltToggle();
+  useShiftHeld();
 
   // Triple-tap gesture for debug panel on touch devices (no keyboard)
   useEffect(() => {
@@ -70,6 +75,14 @@ export function useKeyboardShortcuts(): void {
         useGameStore.getState();
       const uiState = useUiStore.getState();
 
+      // Flex Layout edit mode owns Escape while active so it can't fall through
+      // to game-action cancellation.
+      if (uiState.flexEditMode && e.key === "Escape") {
+        e.preventDefault();
+        uiState.setFlexEditMode(false);
+        return;
+      }
+
       if (uiState.helpSheetOpen) {
         if (e.key === "Escape") {
           e.preventDefault();
@@ -93,13 +106,18 @@ export function useKeyboardShortcuts(): void {
 
         case "Enter": {
           e.preventDefault();
-          // Toggle auto-pass: if any auto-pass is active, cancel it; otherwise set UntilEndOfTurn
-          const playerId = gameState?.active_player ?? 0;
-          const currentAutoPass = gameState?.auto_pass?.[playerId];
+          // Toggle auto-pass: if any auto-pass is active, cancel it; otherwise
+          // set an UntilTurnBoundary session ending at the current turn's end.
+          // Read the LOCAL seat's entry — auto_pass is keyed by the player who
+          // armed it, and in multiplayer the local seat is rarely the active player.
+          const currentAutoPass = gameState?.auto_pass?.[getPlayerId()];
           if (currentAutoPass) {
             dispatchAction({ type: "CancelAutoPass" });
           } else {
-            dispatchAction({ type: "SetAutoPass", data: { mode: { type: "UntilEndOfTurn" } } });
+            dispatchAction({
+              type: "SetAutoPass",
+              data: { mode: { type: "UntilTurnBoundary", until: "EndOfCurrentTurn" } },
+            });
           }
           break;
         }
@@ -145,8 +163,8 @@ export function useKeyboardShortcuts(): void {
 
         case "Escape": {
           e.preventDefault();
-          const escPlayerId = gameState?.active_player ?? 0;
-          if (gameState?.auto_pass?.[escPlayerId]) {
+          // Local seat's own session — see the Enter handler note.
+          if (gameState?.auto_pass?.[getPlayerId()]) {
             dispatchAction({ type: "CancelAutoPass" });
           } else if (waitingFor?.type === "ManaPayment") {
             dispatch({ type: "CancelCast" });
@@ -186,6 +204,14 @@ export function useKeyboardShortcuts(): void {
         case "`":
           e.preventDefault();
           uiState.toggleDebugPanel();
+          break;
+
+        case "l":
+        case "L":
+          if (e.ctrlKey && e.shiftKey && !e.metaKey && !e.altKey) {
+            e.preventDefault();
+            uiState.toggleFlexEditMode();
+          }
           break;
       }
     };

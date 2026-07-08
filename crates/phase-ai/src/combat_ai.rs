@@ -1,21 +1,71 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
-use engine::game::combat::{can_block_pair, AttackTarget};
+use engine::game::combat::{
+    can_block_pair, can_block_pair_with_precomputed, collect_block_restriction_statics,
+    collect_blocker_allowed_statics, collect_blocker_restriction_statics, AttackTarget,
+};
 use engine::game::commander::commander_lethal_headroom;
 use engine::game::players;
-use engine::types::ability::{Effect, QuantityExpr, QuantityRef, TargetFilter};
+use engine::types::ability::StaticDefinition;
 use engine::types::card_type::CoreType;
 use engine::types::game_state::GameState;
 use engine::types::identifiers::ObjectId;
 use engine::types::keywords::Keyword;
 use engine::types::player::PlayerId;
 use engine::types::statics::StaticMode;
-use engine::types::triggers::TriggerMode;
 use engine::types::zones::Zone;
 
 use crate::config::AiProfile;
+use crate::damage_reflection::has_damage_reflection_to_controller;
 use crate::eval::{evaluate_creature, threat_level};
 use crate::projection::{project_to, Projection, ProjectionHorizon};
+use crate::session::AiSession;
+
+/// Block-legality static slices collected once per combat decision and threaded
+/// through the per-pair `can_block_pair` checks. Hoisting these out of the
+/// O(battlefield²) attacker/blocker loops avoids re-walking the battlefield's
+/// functioning statics for every candidate pair.
+pub(crate) struct BlockLegalitySlices {
+    blocker_restriction: Vec<(ObjectId, StaticDefinition)>,
+    block_restriction: Vec<(ObjectId, StaticDefinition)>,
+    blocker_allowed: Vec<(ObjectId, StaticDefinition)>,
+    // CR 604.1: shadow block-lift existence gate (CR 509.1b/609.4/702.28b),
+    // hoisted once so per-pair legality skips the O(N) CanBlockShadow sweep.
+    can_block_shadow_exists: bool,
+}
+
+impl BlockLegalitySlices {
+    pub(crate) fn collect(state: &GameState) -> Self {
+        Self {
+            blocker_restriction: collect_blocker_restriction_statics(state),
+            block_restriction: collect_block_restriction_statics(state),
+            blocker_allowed: collect_blocker_allowed_statics(state),
+            can_block_shadow_exists:
+                engine::game::functioning_abilities::any_functioning_static_mode(state, |m| {
+                    matches!(m, StaticMode::CanBlockShadow)
+                }),
+        }
+    }
+
+    /// CR 509.1a–b: per-pair block legality against the precomputed slices.
+    pub(crate) fn can_block_pair(
+        &self,
+        state: &GameState,
+        blocker_id: ObjectId,
+        attacker_id: ObjectId,
+    ) -> bool {
+        can_block_pair_with_precomputed(
+            state,
+            blocker_id,
+            attacker_id,
+            &self.blocker_restriction,
+            &self.block_restriction,
+            &self.blocker_allowed,
+            self.can_block_shadow_exists,
+        )
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CombatObjective {
@@ -23,6 +73,60 @@ enum CombatObjective {
     Stabilize,
     PreserveAdvantage,
     Race,
+}
+
+fn emit_attack_trace(
+    player: PlayerId,
+    candidate_attackers: &[ObjectId],
+    assignments: &[(ObjectId, AttackTarget)],
+) {
+    if !tracing::event_enabled!(target: "phase_ai::decision_trace", tracing::Level::DEBUG) {
+        return;
+    }
+    let chosen: Vec<String> = assignments
+        .iter()
+        .map(|(attacker, target)| format!("{attacker:?}->{target:?}"))
+        .collect();
+    let rejected: Vec<ObjectId> = candidate_attackers
+        .iter()
+        .copied()
+        .filter(|id| !assignments.iter().any(|(attacker, _)| attacker == id))
+        .collect();
+    tracing::debug!(
+        target: "phase_ai::decision_trace",
+        ai_player = player.0,
+        combat_kind = "attack",
+        chosen = ?chosen,
+        rejected = ?rejected,
+        "combat decision"
+    );
+}
+
+fn emit_block_trace(
+    player: PlayerId,
+    candidate_blockers: &[ObjectId],
+    assignments: &[(ObjectId, ObjectId)],
+) {
+    if !tracing::event_enabled!(target: "phase_ai::decision_trace", tracing::Level::DEBUG) {
+        return;
+    }
+    let chosen: Vec<String> = assignments
+        .iter()
+        .map(|(blocker, attacker)| format!("{blocker:?}->{attacker:?}"))
+        .collect();
+    let rejected: Vec<ObjectId> = candidate_blockers
+        .iter()
+        .copied()
+        .filter(|id| !assignments.iter().any(|(blocker, _)| blocker == id))
+        .collect();
+    tracing::debug!(
+        target: "phase_ai::decision_trace",
+        ai_player = player.0,
+        combat_kind = "block",
+        chosen = ?chosen,
+        rejected = ?rejected,
+        "combat decision"
+    );
 }
 
 /// Choose which creatures to attack with and assign each to an opponent.
@@ -33,7 +137,15 @@ pub fn choose_attackers_with_targets(
     state: &GameState,
     player: PlayerId,
 ) -> Vec<(ObjectId, AttackTarget)> {
-    choose_attackers_with_targets_with_profile(state, player, &AiProfile::default(), false, None)
+    choose_attackers_with_targets_with_profile(
+        state,
+        player,
+        &AiProfile::default(),
+        false,
+        None,
+        None,
+        None,
+    )
 }
 
 pub fn choose_attackers_with_targets_with_profile(
@@ -42,6 +154,8 @@ pub fn choose_attackers_with_targets_with_profile(
     profile: &AiProfile,
     combat_lookahead: bool,
     valid_attacker_ids: Option<&[ObjectId]>,
+    valid_attack_targets: Option<&[AttackTarget]>,
+    session: Option<&AiSession>,
 ) -> Vec<(ObjectId, AttackTarget)> {
     let opponents = players::opponents(state, player);
     if opponents.is_empty() {
@@ -71,10 +185,20 @@ pub fn choose_attackers_with_targets_with_profile(
     // attackers or the engine rejects the whole declaration. Partition them out
     // and union them back unconditionally — value heuristics only apply to the
     // free choices. `creature_must_attack` is the engine's single authority.
+    // Loop-invariant hoist: `attackable_player_targets` depends only on `state`
+    // (immutable during this filter), so compute it once instead of per creature
+    // inside `creature_must_attack`.
+    let attackable = engine::game::combat::attackable_player_targets(state);
     let mandatory: Vec<ObjectId> = candidates
         .iter()
         .copied()
-        .filter(|&id| engine::game::combat::creature_must_attack(state, id))
+        .filter(|&id| {
+            engine::game::combat::creature_must_attack_with_attackable_players(
+                state,
+                id,
+                &attackable,
+            )
+        })
         .collect();
 
     let preferred_opponent = preferred_attack_opponent(state, player, &opponents, &candidates);
@@ -103,6 +227,12 @@ pub fn choose_attackers_with_targets_with_profile(
         profile,
     );
 
+    // Hoist the block-legality static slices once for the whole candidate sweep —
+    // `defender_best_block` runs an O(blockers) `can_block_pair` filter per
+    // candidate, so collecting these per call would re-walk the battlefield's
+    // statics O(candidates × blockers) times.
+    let slices = BlockLegalitySlices::collect(state);
+
     // Determine which creatures should attack (same logic as before)
     let mut attacking_ids = Vec::new();
     for &id in &candidates {
@@ -116,29 +246,26 @@ pub fn choose_attackers_with_targets_with_profile(
 
         let is_unblockable = has_cant_be_blocked(state, obj);
         let has_lifelink = obj.has_keyword(&Keyword::Lifelink);
+        let is_commander = obj.is_commander;
 
         if is_unblockable || opponent_blockers.is_empty() {
             attacking_ids.push(id);
             continue;
         }
 
-        let best_blocker_value = opponent_blockers
-            .iter()
-            .filter(|&&bid| can_block_pair(state, bid, id))
-            .map(|&bid| (bid, evaluate_creature(state, bid)))
-            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-
-        match best_blocker_value {
+        // CR 509.1a: Evaluate the attack against the defender's *best* block, not
+        // its cheapest creature. Assuming the defender chump-trades with its
+        // weakest body let the AI swing doomed creatures into a "favorable trade"
+        // the defender would never offer — it instead kills the attacker for free
+        // with a first-striker or a larger body (gamestate1: a 1/1 animated land
+        // sent into a 2/1 first strike).
+        match defender_best_block(state, id, my_value, &opponent_blockers, &slices) {
             None => attacking_ids.push(id),
-            Some((blocker_id, blocker_value)) => {
-                // CR 702.7b + CR 702.4b + CR 702.2c: Use keyword-aware combat
-                // evaluation (first strike, double strike, deathtouch) instead of
-                // raw P/T comparison.
-                let blocker_obj = state.objects.get(&blocker_id).unwrap();
-                let (blocker_kills_attacker, blocker_survives) =
-                    evaluate_block_outcome(blocker_obj, obj);
-                let kills_blocker = !blocker_survives;
-                let attacker_survives = !blocker_kills_attacker;
+            Some(DefenderBlock {
+                blocker_value,
+                kills_blocker,
+                attacker_survives,
+            }) => {
                 let free_damage = kills_blocker && attacker_survives;
                 let favorable_trade = kills_blocker && my_value <= blocker_value;
                 if should_attack_given_objective(
@@ -147,7 +274,8 @@ pub fn choose_attackers_with_targets_with_profile(
                     favorable_trade,
                     has_lifelink,
                     my_power,
-                    profile,
+                    attacker_survives,
+                    is_commander,
                 ) {
                     attacking_ids.push(id);
                 }
@@ -166,21 +294,44 @@ pub fn choose_attackers_with_targets_with_profile(
             CombatObjective::PreserveAdvantage | CombatObjective::Race
         )
     {
-        let mut valued: Vec<(ObjectId, f64)> = candidates
+        // CR 903.8: exclude the commander from the desperation alpha-strike for
+        // the same reason the per-creature gate does — don't trade it away.
+        // Alpha-strike only fires under PreserveAdvantage|Race when the per-loop
+        // gate rejected every candidate, so any commander here was a
+        // `!free_damage` rejection: `is_commander` is equivalent to the loop's
+        // `is_commander && !free_damage && objective != PushLethal`. Filter
+        // BEFORE the cost/benefit math so unblocked_power/worst_loss_value match
+        // the actual swing set. (A goaded commander is re-added by the
+        // must-attack union below, which runs after this block.)
+        let alpha_candidates: Vec<ObjectId> = candidates
             .iter()
-            .map(|&id| (id, evaluate_creature(state, id)))
+            .copied()
+            .filter(|&id| {
+                !state
+                    .objects
+                    .get(&id)
+                    .map(|o| o.is_commander)
+                    .unwrap_or(false)
+            })
             .collect();
-        valued.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
-        let blocked_count = opponent_blockers.len();
-        let unblocked_power: i32 = valued[blocked_count..]
-            .iter()
-            .filter_map(|&(id, _)| state.objects.get(&id)?.power)
-            .sum();
-        let worst_loss_value: f64 = valued[..blocked_count].iter().map(|&(_, v)| v).sum();
+        if alpha_candidates.len() > opponent_blockers.len() {
+            let mut valued: Vec<(ObjectId, f64)> = alpha_candidates
+                .iter()
+                .map(|&id| (id, evaluate_creature(state, id)))
+                .collect();
+            valued.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
-        if unblocked_power as f64 > worst_loss_value {
-            attacking_ids = candidates.clone();
+            let blocked_count = opponent_blockers.len();
+            let unblocked_power: i32 = valued[blocked_count..]
+                .iter()
+                .filter_map(|&(id, _)| state.objects.get(&id)?.power)
+                .sum();
+            let worst_loss_value: f64 = valued[..blocked_count].iter().map(|&(_, v)| v).sum();
+
+            if unblocked_power as f64 > worst_loss_value {
+                attacking_ids = alpha_candidates;
+            }
         }
     }
 
@@ -200,14 +351,30 @@ pub fn choose_attackers_with_targets_with_profile(
         // crackback_damage sees scaled creatures (Ouroboroid class) and
         // attack-trigger pumps (Battle Cry, Mentor). Failure to project
         // falls through to current state — matches pre-projection behavior.
-        let projection = if combat_lookahead {
-            project_to(
-                state,
-                player,
-                opponents[0],
-                ProjectionHorizon::OpponentAttackersDeclared,
-            )
-            .ok()
+        let projection: Option<Arc<Projection>> = if combat_lookahead {
+            match session {
+                // Session present: route through the per-game projection cache
+                // (turn-scoped key; identical result to project_to on a miss,
+                // cached on subsequent identical combat decisions this turn).
+                Some(session) => session
+                    .get_or_project(
+                        state,
+                        player,
+                        opponents[0],
+                        ProjectionHorizon::OpponentAttackersDeclared,
+                    )
+                    .ok(),
+                // No session (public wrappers, tests): fall back to the free
+                // projection, wrapped in Arc to unify the branch type.
+                None => project_to(
+                    state,
+                    player,
+                    opponents[0],
+                    ProjectionHorizon::OpponentAttackersDeclared,
+                )
+                .ok()
+                .map(Arc::new),
+            }
         } else {
             None
         };
@@ -216,7 +383,7 @@ pub fn choose_attackers_with_targets_with_profile(
             player,
             &opponents,
             &attacking_ids,
-            projection.as_ref(),
+            projection.as_deref(),
         );
         if cb_damage >= my_life {
             // Sort non-vigilance attackers by value descending — hold back most valuable first
@@ -248,7 +415,7 @@ pub fn choose_attackers_with_targets_with_profile(
                     .map(|(_, &id)| id)
                     .collect();
                 let cb =
-                    crackback_damage(state, player, &opponents, &remaining, projection.as_ref());
+                    crackback_damage(state, player, &opponents, &remaining, projection.as_deref());
                 if cb < my_life {
                     break;
                 }
@@ -263,14 +430,119 @@ pub fn choose_attackers_with_targets_with_profile(
         }
     }
 
-    // Single opponent: all attackers go to the same target
+    // Single opponent: attackers go to the player, except a "kill it or ignore
+    // it" planeswalker redirect (see redirect_attackers_to_planeswalker).
     if opponents.len() == 1 {
-        let target = AttackTarget::Player(opponents[0]);
-        return attacking_ids.into_iter().map(|id| (id, target)).collect();
+        let opp = opponents[0];
+        let opponent_life = state.players[opp.0 as usize].life;
+        let assignments = redirect_attackers_to_planeswalker(
+            state,
+            &attacking_ids,
+            valid_attack_targets,
+            objective,
+            opp,
+            opponent_life,
+        );
+        emit_attack_trace(player, &candidates, &assignments);
+        return assignments;
     }
 
-    // Multi-opponent: assign attack targets
-    assign_attack_targets(state, player, &opponents, attacking_ids)
+    // Multi-opponent: assign attack targets (planeswalker redirect deferred).
+    let assignments = assign_attack_targets(state, player, &opponents, attacking_ids);
+    emit_attack_trace(player, &candidates, &assignments);
+    assignments
+}
+
+/// Single-opponent planeswalker redirect (CR 508.1: legality of attacking a
+/// planeswalker is decided by the engine, which surfaces every legal target in
+/// `valid_attack_targets` — this only *chooses* among them).
+///
+/// Policy: when not pushing lethal and the full swing isn't near-lethal at the
+/// face, redirect the *fewest large* attackers needed to KILL the
+/// highest-loyalty opponent planeswalker (largest-power-first), provided at
+/// least one attacker still hits the player. Otherwise every attacker goes to
+/// the player. "Kill it or ignore it" — never dribble partial loyalty damage,
+/// never empty the face, never dilute a lethal race. Loyalty is a rough
+/// entrenchment proxy, not a true threat score (deferred refinement).
+fn redirect_attackers_to_planeswalker(
+    state: &GameState,
+    attacking_ids: &[ObjectId],
+    valid_attack_targets: Option<&[AttackTarget]>,
+    objective: CombatObjective,
+    opponent: PlayerId,
+    opponent_life: i32,
+) -> Vec<(ObjectId, AttackTarget)> {
+    let player_target = AttackTarget::Player(opponent);
+    let all_at_player = || -> Vec<(ObjectId, AttackTarget)> {
+        attacking_ids
+            .iter()
+            .map(|&id| (id, player_target))
+            .collect()
+    };
+
+    // Don't dilute a lethal / near-lethal swing at the face.
+    if objective == CombatObjective::PushLethal {
+        return all_at_player();
+    }
+    let total_power: i32 = attacking_ids
+        .iter()
+        .filter_map(|&id| state.objects.get(&id)?.power)
+        .sum();
+    if total_power >= opponent_life {
+        return all_at_player();
+    }
+
+    // Highest-loyalty attackable opponent planeswalker from the engine's list.
+    let Some(targets) = valid_attack_targets else {
+        return all_at_player();
+    };
+    let best_pw = targets
+        .iter()
+        .filter_map(|t| match t {
+            AttackTarget::Planeswalker(id) => {
+                let loyalty = state.objects.get(id)?.loyalty.unwrap_or(0);
+                (loyalty > 0).then_some((*id, loyalty as i32))
+            }
+            _ => None,
+        })
+        .max_by_key(|&(_, loyalty)| loyalty);
+    let Some((pw_id, loyalty)) = best_pw else {
+        return all_at_player();
+    };
+
+    // Largest-power-first: the fewest big attackers that sum to >= loyalty.
+    let mut by_power: Vec<(ObjectId, i32)> = attacking_ids
+        .iter()
+        .filter_map(|&id| Some((id, state.objects.get(&id)?.power.unwrap_or(0))))
+        .collect();
+    by_power.sort_by_key(|b| std::cmp::Reverse(b.1));
+
+    let mut redirected: Vec<ObjectId> = Vec::new();
+    let mut acc: i32 = 0;
+    for (id, power) in &by_power {
+        if acc >= loyalty {
+            break;
+        }
+        redirected.push(*id);
+        acc += power;
+    }
+
+    // Kill-it-or-ignore-it: bail if we can't kill it or doing so empties the face.
+    if acc < loyalty || redirected.len() == attacking_ids.len() {
+        return all_at_player();
+    }
+
+    let pw_target = AttackTarget::Planeswalker(pw_id);
+    attacking_ids
+        .iter()
+        .map(|&id| {
+            if redirected.contains(&id) {
+                (id, pw_target)
+            } else {
+                (id, player_target)
+            }
+        })
+        .collect()
 }
 
 fn preferred_attack_opponent(
@@ -431,7 +703,13 @@ pub fn choose_blockers_with_profile(
     valid_block_targets: Option<&HashMap<ObjectId, Vec<ObjectId>>>,
 ) -> Vec<(ObjectId, ObjectId)> {
     let mut assignments = Vec::new();
-    let mut used_blockers = Vec::new();
+    // CR 509.1a: `used_blockers` / `blocked_attackers` are membership indices over
+    // the assignment set, hot on large boards (token swarms) where the per-pass
+    // `Vec::contains` / `iter().any()` scans were O(blockers²) / O(attackers ·
+    // assignments). HashSet lookups make them O(1); the produced assignments are
+    // identical because neither set is ever iterated, only membership-tested.
+    let mut used_blockers: HashSet<ObjectId> = HashSet::new();
+    let mut blocked_attackers: HashSet<ObjectId> = HashSet::new();
     let objective = determine_block_objective(state, player, attacker_ids, profile);
 
     // Collect available blockers and their pre-computed values in one pass.
@@ -463,6 +741,7 @@ pub fn choose_blockers_with_profile(
     if matches!(objective, CombatObjective::Stabilize)
         && block_is_futile(state, player, attacker_ids, &available_blockers)
     {
+        emit_block_trace(player, &available_blockers, &[]);
         return Vec::new();
     }
 
@@ -503,14 +782,15 @@ pub fn choose_blockers_with_profile(
         }) {
             let blocker_id = available_blockers[pos];
             assignments.push((blocker_id, attacker_id));
-            used_blockers.push(blocker_id);
+            used_blockers.insert(blocker_id);
+            blocked_attackers.insert(attacker_id);
         }
     }
 
     // Second pass: assign remaining blockers where they'd survive.
     // CR 702.111b: Skip menace attackers — they require 2+ blockers (handled in gang-block pass).
-    for &(attacker_id, _) in &sorted_attackers {
-        if assignments.iter().any(|&(_, a)| a == attacker_id) {
+    for &(attacker_id, attacker_value) in &sorted_attackers {
+        if blocked_attackers.contains(&attacker_id) {
             continue; // Already blocked
         }
 
@@ -541,7 +821,7 @@ pub fn choose_blockers_with_profile(
                     .then(a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))
             });
 
-        if let Some((blocker_id, priority, _)) = best {
+        if let Some((blocker_id, priority, selected_blocker_value)) = best {
             let attacker_power = attacker.power.unwrap_or(0);
             let p_life = state.players[player.0 as usize].life;
 
@@ -603,9 +883,16 @@ pub fn choose_blockers_with_profile(
             // (e.g. 1/1 in front of a 12/12 trample commander with 3 cmd-damage headroom).
             let chump_unsafe = priority == 0
                 && commander_chump_unsafe(state, player, attacker_id, blocker_toughness);
-            if !chump_unsafe && (priority > 0 || should_chump_stabilize || should_chump_race) {
+            let favorable_trade =
+                priority != 1 || selected_blocker_value <= attacker_value + damage_prevented as f64;
+            if !chump_unsafe
+                && ((priority > 0 && favorable_trade)
+                    || should_chump_stabilize
+                    || should_chump_race)
+            {
                 assignments.push((blocker_id, attacker_id));
-                used_blockers.push(blocker_id);
+                used_blockers.insert(blocker_id);
+                blocked_attackers.insert(attacker_id);
             }
         }
     }
@@ -614,7 +901,7 @@ pub fn choose_blockers_with_profile(
     // when no single blocker can kill it but combined power can.
     // Only gang-block when the combined blocker value is less than the attacker value.
     for &(attacker_id, attacker_value) in &sorted_attackers {
-        if assignments.iter().any(|&(_, a)| a == attacker_id) {
+        if blocked_attackers.contains(&attacker_id) {
             continue; // Already blocked
         }
         let attacker = match state.objects.get(&attacker_id) {
@@ -723,8 +1010,9 @@ pub fn choose_blockers_with_profile(
         {
             for bid in gang_set {
                 assignments.push((bid, attacker_id));
-                used_blockers.push(bid);
+                used_blockers.insert(bid);
             }
+            blocked_attackers.insert(attacker_id);
         }
     }
 
@@ -734,7 +1022,7 @@ pub fn choose_blockers_with_profile(
         let p_life = state.players[player.0 as usize].life;
         let unblocked_damage: i32 = sorted_attackers
             .iter()
-            .filter(|&&(aid, _)| !assignments.iter().any(|&(_, a)| a == aid))
+            .filter(|&&(aid, _)| !blocked_attackers.contains(&aid))
             .filter_map(|&(aid, _)| state.objects.get(&aid))
             .map(|obj| obj.power.unwrap_or(0))
             .sum();
@@ -746,7 +1034,7 @@ pub fn choose_blockers_with_profile(
             // estimate 1 here (minimum toughness) and refine at assignment time.
             let mut unblocked: Vec<(ObjectId, i32, i32)> = sorted_attackers
                 .iter()
-                .filter(|&&(aid, _)| !assignments.iter().any(|&(_, a)| a == aid))
+                .filter(|&&(aid, _)| !blocked_attackers.contains(&aid))
                 .filter_map(|&(aid, _)| {
                     let obj = state.objects.get(&aid)?;
                     let power = obj.power.unwrap_or(0);
@@ -786,7 +1074,8 @@ pub fn choose_blockers_with_profile(
                             .unwrap_or(false)
                 }) {
                     assignments.push((blocker_id, attacker_id));
-                    used_blockers.push(blocker_id);
+                    used_blockers.insert(blocker_id);
+                    blocked_attackers.insert(attacker_id);
                     // CR 702.19b: Trample only requires lethal damage assigned to blocker;
                     // excess tramples through. A chump block only prevents blocker_toughness.
                     let damage_prevented = if attacker.has_keyword(&Keyword::Trample) {
@@ -807,7 +1096,7 @@ pub fn choose_blockers_with_profile(
         // lethality from commander B, so iterate each unblocked commander attacker
         // independently and chump if a safe (non-trample-defeated) blocker exists.
         for &(attacker_id, _) in &sorted_attackers {
-            if assignments.iter().any(|&(_, a)| a == attacker_id) {
+            if blocked_attackers.contains(&attacker_id) {
                 continue; // Already blocked
             }
             let attacker = match state.objects.get(&attacker_id) {
@@ -843,7 +1132,8 @@ pub fn choose_blockers_with_profile(
             });
             if let Some(&blocker_id) = safe_blocker {
                 assignments.push((blocker_id, attacker_id));
-                used_blockers.push(blocker_id);
+                used_blockers.insert(blocker_id);
+                blocked_attackers.insert(attacker_id);
             }
             // No safe chump exists — accept the loss on this commander rather than
             // wasting a creature that won't actually save the player. Continue to
@@ -851,6 +1141,7 @@ pub fn choose_blockers_with_profile(
         }
     }
 
+    emit_block_trace(player, &available_blockers, &assignments);
     assignments
 }
 
@@ -1015,11 +1306,27 @@ fn should_attack_given_objective(
     favorable_trade: bool,
     has_lifelink: bool,
     attacker_power: i32,
-    _profile: &AiProfile,
+    attacker_survives: bool,
+    is_commander: bool,
 ) -> bool {
-    // Lifelink creates a life swing: opponent loses N, you gain N = 2N effective swing.
-    // This makes marginal attacks worthwhile, especially while racing.
-    let lifelink_bonus = has_lifelink && attacker_power > 0;
+    // CR 903.8: a commander recast from the command zone costs an extra {2} per
+    // prior cast (commander tax), and trading it away surrenders the player's
+    // most valuable permanent. Don't trade the commander in combat — only swing
+    // it into a block when it survives (free_damage) or when pushing lethal.
+    // Unblockable / no-blocker commander swings are handled by the earlier
+    // branch (before this function is reached), so this only suppresses trades.
+    if is_commander && !free_damage && objective != CombatObjective::PushLethal {
+        return false;
+    }
+    // CR 702.15b: lifelink gains life whenever the creature *deals* combat
+    // damage — including a value-unfavorable simultaneous trade, and a
+    // first-strike pinger that then dies. So life IS still gained on a bad
+    // trade; this is a VALUE decision, not a rules claim: don't let the lifelink
+    // swing justify throwing the creature away for nothing (it dies, the blocker
+    // lives, no kill). Pursue the swing only when the attack is otherwise
+    // non-losing — free damage, a favorable trade, or the attacker survives.
+    let lifelink_bonus =
+        has_lifelink && attacker_power > 0 && (free_damage || favorable_trade || attacker_survives);
     match objective {
         CombatObjective::PushLethal => true,
         CombatObjective::Stabilize => free_damage || lifelink_bonus,
@@ -1093,6 +1400,9 @@ fn crackback_damage(
     // Without a projection, fall back to current-state filtering.
     let projected_state = projection.map(|p| &p.state);
     let attacker_source = projected_state.unwrap_or(state);
+    // Hoist block-legality statics once for the greedy O(attackers × blockers)
+    // assignment sweep below. `attacker_source` is the only state queried.
+    let slices = BlockLegalitySlices::collect(attacker_source);
     let mut opp_attackers: Vec<(ObjectId, i32)> = opponents
         .iter()
         .flat_map(|&opp| {
@@ -1114,7 +1424,13 @@ fn crackback_damage(
     opp_attackers.sort_by_key(|b| std::cmp::Reverse(b.1));
 
     let mut unblocked_damage = 0i32;
-    let mut blocker_idx = 0;
+    // CR 509.1: greedy 1:1 blocker assignment. Track which blockers have been
+    // committed rather than a single advancing cursor: a blocker that can't
+    // legally block the CURRENT attacker (e.g. a ground creature vs a flyer)
+    // must remain available for later attackers it CAN block. A shared cursor
+    // permanently discarded such a blocker, over-estimating crackback and making
+    // the AI hold back profitable attacks.
+    let mut used = vec![false; our_blockers.len()];
     for &(opp_id, opp_power) in &opp_attackers {
         // Keyword lookup mirrors the power lookup: prefer the projected view
         // (e.g., Battle Cry / Mentor pumps, newly-granted Trample).
@@ -1125,24 +1441,27 @@ fn crackback_damage(
             Some(o) => o,
             None => continue,
         };
-        let blocked = loop {
-            if blocker_idx >= our_blockers.len() {
-                break false;
+        // First not-yet-committed blocker that can legally block this attacker.
+        let mut blocked = false;
+        for (i, &bid) in our_blockers.iter().enumerate() {
+            if used[i] {
+                continue;
             }
-            let bid = our_blockers[blocker_idx];
-            if let Some(blocker) = state.objects.get(&bid) {
-                if can_block_pair(state, bid, opp_id) {
-                    blocker_idx += 1;
-                    if opp_obj.has_keyword(&Keyword::Trample) {
-                        let blocker_toughness = blocker.toughness.unwrap_or(0);
-                        let trample_through = (opp_power - blocker_toughness).max(0);
-                        unblocked_damage += trample_through;
-                    }
-                    break true;
-                }
+            if !slices.can_block_pair(attacker_source, bid, opp_id) {
+                continue; // skip — still available for other attackers
             }
-            blocker_idx += 1;
-        };
+            used[i] = true;
+            blocked = true;
+            if opp_obj.has_keyword(&Keyword::Trample) {
+                let blocker_toughness = attacker_source
+                    .objects
+                    .get(&bid)
+                    .and_then(|b| b.toughness)
+                    .unwrap_or(0);
+                unblocked_damage += (opp_power - blocker_toughness).max(0);
+            }
+            break;
+        }
         if !blocked {
             unblocked_damage += opp_power;
         }
@@ -1190,9 +1509,13 @@ fn sum_power(state: &GameState, ids: &[ObjectId]) -> i32 {
 /// bail) only cost CPU; false positives (bailing when a save existed) cannot
 /// happen because the bound dominates any real assignment's absorption.
 ///
-/// Optimal greedy under the relaxation: chump the N highest-power non-trample
-/// non-unblockable attackers (each absorbs full attacker_power), then apply
-/// remaining blocker toughness to tramplers (each absorbs blocker_toughness).
+/// Optimal allocation under the relaxation: a blocker spent chumping absorbs the
+/// attacker's full power (toughness-independent); a blocker spent on trample
+/// absorbs its own toughness. Chumping the most attackers is NOT always optimal —
+/// chumping a low-power attacker can waste a high-toughness blocker that would
+/// soak more trample. So maximize over every chump count `k` in `0..=min(chumps,
+/// blockers)`: chump the `k` highest-power attackers (using the `k` smallest
+/// blockers) and reserve the `blockers - k` largest-toughness blockers for trample.
 fn block_is_futile(
     state: &GameState,
     player: PlayerId,
@@ -1233,25 +1556,39 @@ fn block_is_futile(
         .collect();
     blocker_toughnesses.sort_unstable_by(|a, b| b.cmp(a));
 
-    let chump_count = chumpable_powers.len().min(blocker_toughnesses.len());
-    let chump_absorption: i32 = chumpable_powers.iter().take(chump_count).sum();
-    let remaining_blocker_toughness: i32 = blocker_toughnesses.iter().skip(chump_count).sum();
-    let trample_absorption = trample_power.min(remaining_blocker_toughness);
+    // CR 510.1c: Chumping a non-trample attacker absorbs its full power regardless
+    // of the blocker's toughness, so chump with the SMALLEST blockers and reserve
+    // the LARGEST-toughness ones to soak trample. `blocker_toughnesses` is sorted
+    // descending, so `toughness_prefix[m]` is the absorption of the m largest.
+    let total_blockers = blocker_toughnesses.len();
+    let mut toughness_prefix = vec![0i32; total_blockers + 1];
+    for (i, &t) in blocker_toughnesses.iter().enumerate() {
+        toughness_prefix[i + 1] = toughness_prefix[i] + t;
+    }
 
-    let max_absorption = chump_absorption + trample_absorption;
+    // Maximize absorption over every chump count `k`: chumping the `k` biggest
+    // attackers frees the `total_blockers - k` largest blockers for trample.
+    // Forcing the maximum `k` under-counted absorption (a small chump can cost a
+    // big trample blocker) and wrongly reported survivable boards as futile.
+    let max_chump = chumpable_powers.len().min(total_blockers);
+    let mut max_absorption = 0;
+    let mut chump_absorption = 0;
+    for k in 0..=max_chump {
+        if k > 0 {
+            chump_absorption += chumpable_powers[k - 1];
+        }
+        let trample_absorption = trample_power.min(toughness_prefix[total_blockers - k]);
+        max_absorption = max_absorption.max(chump_absorption + trample_absorption);
+    }
     let min_residual = total_attacker_power - max_absorption;
 
-    // Residual is unblockable_power + uncovered chumpables + uncovered trample.
-    // Equivalently: total - max_absorption (which already accounts for unblockable
-    // contributing zero absorption). Bail iff that residual STRICTLY EXCEEDS life
-    // — at exact lethal we still chump per the existing "minimize damage even when
-    // dying" semantics (theoretical opponent miscounts / instant-speed lifegain).
-    debug_assert_eq!(
-        min_residual,
-        unblockable_power
-            + (chumpable_powers.iter().sum::<i32>() - chump_absorption)
-            + (trample_power - trample_absorption)
-    );
+    // Residual = unblockable_power + uncovered chumpables + uncovered trample.
+    // Absorption only ever neutralizes chumpable/trample power, never unblockable,
+    // so the residual can never drop below the unblockable total. Bail iff residual
+    // STRICTLY EXCEEDS life — at exact lethal we still chump per the existing
+    // "minimize damage even when dying" semantics (opponent miscounts / lifegain).
+    debug_assert!(min_residual >= unblockable_power);
+    debug_assert!(max_absorption <= chumpable_powers.iter().sum::<i32>() + trample_power);
     min_residual > life
 }
 
@@ -1272,6 +1609,14 @@ fn can_attack(state: &GameState, obj_id: ObjectId) -> bool {
         return false;
     }
     if obj.has_keyword(&Keyword::Defender) {
+        return false;
+    }
+
+    // CR 508.1c + CR 611.2c: respect an active additional-combat attacker
+    // restriction (Last Night Together / Bumi). Hardens this hypothetical/test
+    // fallback path; at runtime the AI consumes the engine's pre-filtered
+    // valid_attacker_ids, and validate_attackers remains the ultimate gate.
+    if !engine::game::combat::passes_combat_attacker_restriction(state, obj_id) {
         return false;
     }
 
@@ -1361,6 +1706,69 @@ fn can_block_with_engine_map(
     }
 }
 
+/// The block a rational defending player would commit against one attacker,
+/// described from the ATTACKER's point of view.
+struct DefenderBlock {
+    /// Value of the blocking creature the defender chooses.
+    blocker_value: f64,
+    /// Whether the attacker kills that blocker in the exchange.
+    kills_blocker: bool,
+    /// Whether the attacker survives the exchange.
+    attacker_survives: bool,
+}
+
+/// CR 509.1a: Choose the block the defending player would actually make against
+/// a single attacker. A rational defender maximizes its own value — it kills the
+/// attacker when that is value-positive, preferring a blocker that survives the
+/// exchange (a "free" kill via first strike or a larger body, CR 702.7b) and
+/// otherwise the cheapest creature whose loss the kill justifies. Returns `None`
+/// when no creature can legally block (the attack connects unimpeded).
+///
+/// This deliberately models the defender's *best* block rather than its cheapest
+/// creature. The cheapest-blocker model let the AI swing doomed creatures on the
+/// false premise of a favorable trade the defender would sidestep — e.g. a 1/1
+/// attacker into a 2/1 first-striker that eats it for free while a 2/1 token sat
+/// nearby looking like an even trade.
+fn defender_best_block(
+    state: &GameState,
+    attacker_id: ObjectId,
+    attacker_value: f64,
+    blockers: &[ObjectId],
+    slices: &BlockLegalitySlices,
+) -> Option<DefenderBlock> {
+    let attacker = state.objects.get(&attacker_id)?;
+    blockers
+        .iter()
+        .filter(|&&bid| slices.can_block_pair(state, bid, attacker_id))
+        .filter_map(|&bid| {
+            let blocker = state.objects.get(&bid)?;
+            let blocker_value = evaluate_creature(state, bid);
+            // CR 702.7b + CR 702.4b + CR 702.2c: keyword-aware outcome (first
+            // strike, double strike, deathtouch), not a raw P/T comparison.
+            let (blocker_kills_attacker, blocker_survives) =
+                evaluate_block_outcome(blocker, attacker);
+            // Defender utility: the attacker value it removes (only if the block
+            // is lethal) minus the value of its own blocker (only if that blocker
+            // dies). A free kill scores `attacker_value`; a trade nets the
+            // difference; a chump that dies for nothing scores negative.
+            let defender_gain = (if blocker_kills_attacker {
+                attacker_value
+            } else {
+                0.0
+            }) - (if blocker_survives { 0.0 } else { blocker_value });
+            Some((
+                defender_gain,
+                DefenderBlock {
+                    blocker_value,
+                    kills_blocker: !blocker_survives,
+                    attacker_survives: !blocker_kills_attacker,
+                },
+            ))
+        })
+        .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(_, outcome)| outcome)
+}
+
 /// Evaluate whether a single blocker kills the attacker and/or survives combat,
 /// accounting for first strike (CR 702.7), double strike (CR 702.4), and
 /// deathtouch (CR 702.2).
@@ -1430,44 +1838,13 @@ fn evaluate_block_outcome(
     (kills, survives)
 }
 
-/// Check if a creature has a DamageReceived trigger that deals the received damage
-/// amount back to its controller (the Jackal Pup / Boros Reckoner pattern).
-/// Returns true if blocking with this creature causes its controller to take the same
-/// damage the creature receives.
-fn has_damage_reflection_to_controller(object: &engine::game::game_object::GameObject) -> bool {
-    object.trigger_definitions.iter_unchecked().any(|trigger| {
-        if trigger.mode != TriggerMode::DamageReceived {
-            return false;
-        }
-        // Check that valid_card is SelfRef (triggers on damage to itself)
-        let self_card = trigger
-            .valid_card
-            .as_ref()
-            .is_some_and(|f| matches!(f, TargetFilter::SelfRef));
-        if !self_card {
-            return false;
-        }
-        // Check the execute ability deals EventContextAmount damage to Controller
-        let Some(execute) = &trigger.execute else {
-            return false;
-        };
-        matches!(
-            &*execute.effect,
-            Effect::DealDamage {
-                amount: QuantityExpr::Ref {
-                    qty: QuantityRef::EventContextAmount
-                },
-                target: TargetFilter::Controller,
-                ..
-            }
-        )
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::planner::quick_state_hash;
+    use crate::projection::ProjectionKey;
     use engine::game::zones::create_object;
+    use engine::types::game_state::WaitingFor;
     use engine::types::identifiers::CardId;
 
     fn setup() -> GameState {
@@ -1510,6 +1887,167 @@ mod tests {
         obj.keywords = keywords;
         obj.entered_battlefield_turn = Some(1);
         id
+    }
+
+    /// Item E (revert-failing perf): the must-attack partition computes the
+    /// attackable-player set ONCE, so the number of `attackable_player_targets`
+    /// sweeps does NOT scale with the goaded-creature count. Pre-fix each
+    /// goaded creature's `creature_must_attack` recomputed it, so the sweep count
+    /// grew with K.
+    fn goaded_attacker_sweep_count(num_goaded: usize) -> u64 {
+        let mut state = setup();
+        state.phase = engine::types::phase::Phase::DeclareAttackers;
+        for _ in 0..num_goaded {
+            let id = add_creature(&mut state, PlayerId(0), "Goaded", 2, 2, vec![]);
+            state
+                .objects
+                .get_mut(&id)
+                .unwrap()
+                .goaded_by
+                .insert(PlayerId(1));
+        }
+        engine::game::perf_counters::reset();
+        let _ = choose_attackers(&state, PlayerId(0));
+        engine::game::perf_counters::snapshot().attackable_player_sweeps
+    }
+
+    #[test]
+    fn attacker_choice_sweeps_attackable_players_independent_of_goaded_count() {
+        let one = goaded_attacker_sweep_count(1);
+        let many = goaded_attacker_sweep_count(4);
+        assert!(
+            one >= 1,
+            "the must-attack partition must actually sweep (non-degenerate fixture)"
+        );
+        assert_eq!(
+            one, many,
+            "attackable-player sweeps must not scale with goaded count \
+             (revert-failing: pre-fix grows as K)"
+        );
+    }
+
+    // --- Issue #2514: crackback_damage blocker reuse (CR 509.1) ---
+
+    #[test]
+    fn crackback_blocker_not_consumed_by_unblockable_attacker() {
+        // A ground wall that can't block a flyer must remain available to block a
+        // ground attacker. The old shared cursor discarded the wall after it
+        // failed to block the (higher-power) flyer, over-counting crackback.
+        let mut state = setup();
+        // AI (P0) has only a 0/5 ground wall.
+        add_creature(&mut state, PlayerId(0), "Wall", 0, 5, vec![]);
+        // Opponent (P1): a 5/5 flyer (sorted first by power) and a 4/4 ground.
+        add_creature(
+            &mut state,
+            PlayerId(1),
+            "Flyer",
+            5,
+            5,
+            vec![Keyword::Flying],
+        );
+        add_creature(&mut state, PlayerId(1), "Ground", 4, 4, vec![]);
+
+        let cb = crackback_damage(&state, PlayerId(0), &[PlayerId(1)], &[], None);
+        // The wall blocks the 4/4; only the 5/5 flyer is unblocked.
+        assert_eq!(
+            cb, 5,
+            "wall must block the ground 4/4, leaving only the flyer's 5"
+        );
+    }
+
+    #[test]
+    fn crackback_uses_all_legal_pairings() {
+        // Two ground walls + (flyer, two ground attackers): both walls block the
+        // ground attackers; only the flyer is unblocked.
+        let mut state = setup();
+        add_creature(&mut state, PlayerId(0), "Wall A", 0, 5, vec![]);
+        add_creature(&mut state, PlayerId(0), "Wall B", 0, 4, vec![]);
+        add_creature(
+            &mut state,
+            PlayerId(1),
+            "Flyer",
+            5,
+            5,
+            vec![Keyword::Flying],
+        );
+        add_creature(&mut state, PlayerId(1), "Ground A", 3, 3, vec![]);
+        add_creature(&mut state, PlayerId(1), "Ground B", 2, 2, vec![]);
+
+        let cb = crackback_damage(&state, PlayerId(0), &[PlayerId(1)], &[], None);
+        assert_eq!(
+            cb, 5,
+            "both walls block the ground attackers; flyer unblocked"
+        );
+    }
+
+    #[test]
+    fn crackback_trample_counts_only_excess() {
+        // A trampler blocked by a smaller creature contributes only the excess.
+        let mut state = setup();
+        add_creature(&mut state, PlayerId(0), "Blocker", 2, 2, vec![]);
+        add_creature(
+            &mut state,
+            PlayerId(1),
+            "Trampler",
+            5,
+            5,
+            vec![Keyword::Trample],
+        );
+
+        let cb = crackback_damage(&state, PlayerId(0), &[PlayerId(1)], &[], None);
+        // 5 power - 2 toughness blocker = 3 trample-through.
+        assert_eq!(cb, 3, "only the trample excess (5-2) is counted");
+    }
+
+    #[test]
+    fn crackback_projection_drives_block_legality() {
+        let mut state = setup();
+        add_creature(&mut state, PlayerId(0), "Wall", 0, 5, vec![]);
+        let attacker = add_creature(&mut state, PlayerId(1), "Projected Flyer", 4, 4, vec![]);
+
+        let mut projected = state.clone();
+        projected
+            .objects
+            .get_mut(&attacker)
+            .unwrap()
+            .keywords
+            .push(Keyword::Flying);
+        let projection = Projection {
+            horizon_reached: ProjectionHorizon::OpponentAttackersDeclared,
+            state: projected,
+            snapshots: Vec::new(),
+            confidence: crate::projection::Confidence::Exact,
+            target_opponent: PlayerId(1),
+        };
+
+        let cb = crackback_damage(&state, PlayerId(0), &[PlayerId(1)], &[], Some(&projection));
+        assert_eq!(cb, 4, "projected flying must make the attacker unblocked");
+    }
+
+    /// Battlefield planeswalker for `owner` with the given starting loyalty.
+    /// Used to drive the planeswalker-attack redirect through the real engine
+    /// path: `get_valid_attack_targets` classifies it as an attackable PW.
+    fn add_planeswalker(state: &mut GameState, owner: PlayerId, loyalty: u32) -> ObjectId {
+        let id = create_object(
+            state,
+            CardId(state.next_object_id),
+            owner,
+            "Planeswalker".to_string(),
+            Zone::Battlefield,
+        );
+        let obj = state.objects.get_mut(&id).unwrap();
+        obj.card_types.core_types.push(CoreType::Planeswalker);
+        obj.loyalty = Some(loyalty);
+        obj.entered_battlefield_turn = Some(1);
+        id
+    }
+
+    /// Engine-derived legal attack targets — the same list the live
+    /// `WaitingFor::DeclareAttackers` carries. Deriving from the engine (rather
+    /// than hand-building) proves the engine offers the PW and the AI consumes
+    /// it, not just that the AI routes to a target we injected.
+    fn valid_targets(state: &GameState) -> Vec<AttackTarget> {
+        engine::game::combat::get_valid_attack_targets(state)
     }
 
     /// Issue #484 (P0) — E2E: a goaded creature the value heuristic would skip
@@ -1627,6 +2165,78 @@ mod tests {
         );
     }
 
+    /// A 1/1 that would normally NOT attack into a 5/5 blocker is still chosen
+    /// when it carries an unblockable static — the `is_unblockable` short-circuit
+    /// fires before `defender_best_block`. This guards that the hoisted
+    /// `BlockLegalitySlices` path leaves the unblockable-attacker decision
+    /// byte-for-byte identical to the pre-hoist behavior. Reverted-fix
+    /// discrimination: if the slices threading broke the unblockable detection or
+    /// the block sweep, this attacker would be (wrongly) skipped like the plain
+    /// 1/1 in `skips_unprofitable_attack`.
+    #[test]
+    fn unblockable_attacker_still_chosen_with_static_restriction() {
+        use engine::types::ability::StaticDefinition;
+
+        let mut state = setup();
+        let small = add_creature(&mut state, PlayerId(0), "Squirrel", 1, 1, vec![]);
+        state
+            .objects
+            .get_mut(&small)
+            .unwrap()
+            .static_definitions
+            .push(StaticDefinition::new(StaticMode::CantBeBlocked));
+        add_creature(&mut state, PlayerId(1), "Giant", 5, 5, vec![]);
+
+        let attackers = choose_attackers(&state, PlayerId(0));
+        assert!(
+            attackers.contains(&small),
+            "an unblockable 1/1 must still attack into a 5/5 blocker"
+        );
+    }
+
+    /// Regression (gamestate1): the AI must evaluate an attack against the
+    /// defender's *best* block, not its cheapest creature. A 2/2 attacker faces a
+    /// 1/1 chump (which it would profitably eat) and a 3/3 (which kills it for
+    /// free). The old min-value-blocker model picked the 1/1, saw "free damage,"
+    /// and attacked — but the defender blocks with the 3/3 and the 2/2 dies for
+    /// nothing. The live bug was the first-strike variant (1/1 land into a 2/1
+    /// first-striker); a larger body is the same "kills and survives" class and
+    /// makes a value-independent, deterministic test.
+    #[test]
+    fn does_not_attack_when_a_better_blocker_kills_for_free() {
+        let mut state = setup();
+        let attacker = add_creature(&mut state, PlayerId(0), "Bear", 2, 2, vec![]);
+        // Cheapest blocker: a 1/1 the attacker would profitably trade up against.
+        add_creature(&mut state, PlayerId(1), "Squirrel", 1, 1, vec![]);
+        // Best blocker: a 3/3 that kills the 2/2 and survives — a free kill.
+        add_creature(&mut state, PlayerId(1), "Centaur", 3, 3, vec![]);
+
+        let attackers = choose_attackers(&state, PlayerId(0));
+        assert!(
+            !attackers.contains(&attacker),
+            "AI must not attack a 2/2 when the defender holds a 3/3 that eats it \
+             for free, even though a 1/1 chump is also available"
+        );
+    }
+
+    /// Companion to the regression above: when the defender's *best* block is
+    /// still a losing chump (a 1/1 in front of a 4/4), the attack is correctly
+    /// declared — the rational-defender model must not become so pessimistic that
+    /// it refuses profitable swings.
+    #[test]
+    fn attacks_when_best_block_is_only_a_chump() {
+        let mut state = setup();
+        let attacker = add_creature(&mut state, PlayerId(0), "Rhino", 4, 4, vec![]);
+        add_creature(&mut state, PlayerId(1), "Squirrel", 1, 1, vec![]);
+        add_creature(&mut state, PlayerId(1), "Goblin", 1, 1, vec![]);
+
+        let attackers = choose_attackers(&state, PlayerId(0));
+        assert!(
+            attackers.contains(&attacker),
+            "AI should attack a 4/4 when every available block is a chump it survives"
+        );
+    }
+
     #[test]
     fn lethal_objective_does_not_ignore_available_blockers() {
         let mut state = setup();
@@ -1671,6 +2281,37 @@ mod tests {
             blocked_target,
             Some(big),
             "Deathtouch should block highest-value attacker"
+        );
+    }
+
+    #[test]
+    fn valuable_blocker_does_not_trade_down_into_small_deathtouch_attacker() {
+        let mut state = setup();
+        state.players[1].life = 20;
+        let snake = add_creature(
+            &mut state,
+            PlayerId(0),
+            "Snake Token",
+            1,
+            1,
+            vec![Keyword::Deathtouch],
+        );
+        let sam = add_creature(
+            &mut state,
+            PlayerId(1),
+            "Sam, Loyal Attendant",
+            3,
+            3,
+            vec![],
+        );
+
+        let blockers = choose_blockers(&state, PlayerId(1), &[snake]);
+
+        assert!(
+            !blockers
+                .iter()
+                .any(|&(blocker, attacker)| blocker == sam && attacker == snake),
+            "AI should not trade a valuable blocker down into a 1/1 deathtouch attacker at 20 life"
         );
     }
 
@@ -2422,6 +3063,7 @@ mod tests {
                     },
                     target: TargetFilter::Controller,
                     damage_source: None,
+                    excess: None,
                 },
             ))
             .valid_card(TargetFilter::SelfRef)
@@ -2468,6 +3110,7 @@ mod tests {
                     },
                     target: TargetFilter::Controller,
                     damage_source: None,
+                    excess: None,
                 },
             ))
             .valid_card(TargetFilter::SelfRef)
@@ -2646,6 +3289,442 @@ mod tests {
         assert!(
             !blockers.is_empty(),
             "5/5 wall must block 3/3 bear; got empty assignment"
+        );
+    }
+
+    /// CR 509.1 + CR 510.1c: `block_is_futile` must reserve the LARGEST-toughness
+    /// blockers to soak tramplers and chump with the smallest, since chumping a
+    /// non-trample attacker absorbs its full power regardless of the blocker's
+    /// toughness. A survivable assignment here (chump the 1/1 with the 1/1, block
+    /// the 5/5 trampler with the 10-toughness wall → 0 trample-through) must NOT
+    /// be reported as futile. The bug reserved the SMALLEST blockers for trample,
+    /// under-counting absorption and conceding survivable boards to lethal.
+    #[test]
+    fn block_is_futile_reserves_largest_blockers_for_trample() {
+        let mut state = setup();
+        state.players[1].life = 2;
+        let wall = add_creature(&mut state, PlayerId(1), "Wall", 0, 10, vec![]);
+        let small = add_creature(&mut state, PlayerId(1), "Small", 1, 1, vec![]);
+        let trampler = add_creature(
+            &mut state,
+            PlayerId(0),
+            "Trampler",
+            5,
+            5,
+            vec![Keyword::Trample],
+        );
+        let bear = add_creature(&mut state, PlayerId(0), "Bear", 1, 1, vec![]);
+        assert!(
+            !block_is_futile(&state, PlayerId(1), &[trampler, bear], &[wall, small]),
+            "Wall absorbs the trampler and Small chumps the Bear (residual 0 < life 2); not futile"
+        );
+    }
+
+    /// CR 509.1 + CR 510.1c: `block_is_futile` must not assume chumping every
+    /// possible attacker maximizes absorption. Chumping a low-power attacker
+    /// consumes a blocker that could have soaked more trample damage. Here the
+    /// optimum is to gang-block the 6/6 trampler with BOTH 0/3 walls (absorb 6 →
+    /// 0 tramples through) and take 1 from the unblocked 1/1: residual 1 == life,
+    /// not > life, so the board is survivable and must NOT be reported futile.
+    /// The bug forced `chump_count = min(chumpables, blockers)` (always chump the
+    /// 1/1), leaving only one wall (toughness 3) for trample → 3 tramples through,
+    /// wrongly conceding the game.
+    #[test]
+    fn block_is_futile_skips_chump_to_soak_more_trample() {
+        let mut state = setup();
+        state.players[1].life = 1;
+        let wall_a = add_creature(&mut state, PlayerId(1), "WallA", 0, 3, vec![]);
+        let wall_b = add_creature(&mut state, PlayerId(1), "WallB", 0, 3, vec![]);
+        let trampler = add_creature(
+            &mut state,
+            PlayerId(0),
+            "Trampler",
+            6,
+            6,
+            vec![Keyword::Trample],
+        );
+        let goblin = add_creature(&mut state, PlayerId(0), "Goblin", 1, 1, vec![]);
+        assert!(
+            !block_is_futile(&state, PlayerId(1), &[trampler, goblin], &[wall_a, wall_b]),
+            "both walls should soak the trampler (residual 1 == life) instead of chumping the 1/1"
+        );
+    }
+
+    // ───────────────────────── #8 lifelink block correctness ─────────────────
+
+    /// #8: a lifelinker must NOT attack into a pure loss (it dies, the blocker
+    /// lives, no kill) just for the life swing. Discriminating: reverting the
+    /// `(free_damage || favorable_trade || attacker_survives)` gate in
+    /// `should_attack_given_objective` flips this — the old code attacked.
+    #[test]
+    fn lifelink_does_not_attack_into_pure_loss() {
+        let mut state = setup();
+        let lifelinker = add_creature(
+            &mut state,
+            PlayerId(0),
+            "Vamp",
+            2,
+            2,
+            vec![Keyword::Lifelink],
+        );
+        // 3/4 wall: kills the 2/2, survives (2 < 4). Pure loss.
+        add_creature(&mut state, PlayerId(1), "Wall", 3, 4, vec![]);
+
+        let attacks = choose_attackers_with_targets(&state, PlayerId(0));
+        assert!(
+            !attacks.iter().any(|(id, _)| *id == lifelinker),
+            "lifelinker must not be thrown into a pure-loss block for life gain"
+        );
+    }
+
+    /// #8 guard (don't over-correct): a lifelinker that SURVIVES the block (2/5
+    /// into a 3/3 — survives, deals 2, gains 2) should still attack. Confirms
+    /// the gate only suppresses pure losses, not all lifelink swings.
+    #[test]
+    fn lifelink_still_attacks_when_surviving() {
+        let mut state = setup();
+        let lifelinker = add_creature(
+            &mut state,
+            PlayerId(0),
+            "Vamp",
+            2,
+            5,
+            vec![Keyword::Lifelink],
+        );
+        add_creature(&mut state, PlayerId(1), "Bear", 3, 3, vec![]);
+
+        let attacks = choose_attackers_with_targets(&state, PlayerId(0));
+        assert!(
+            attacks.iter().any(|(id, _)| *id == lifelinker),
+            "a surviving lifelinker should still attack"
+        );
+    }
+
+    // ───────────────────────── #6 commander trade avoidance ──────────────────
+
+    /// #6: the AI must not trade its commander into an even block (both die),
+    /// forcing commander tax — while a vanilla creature in the same spot SHOULD
+    /// trade. Discriminating: removing the commander gate makes the commander
+    /// attack (the 3/3-vs-3/3 is a `favorable_trade`).
+    #[test]
+    fn commander_does_not_trade_into_equal_block() {
+        let mut state = setup();
+        let commander = add_creature(&mut state, PlayerId(0), "General", 3, 3, vec![]);
+        state.objects.get_mut(&commander).unwrap().is_commander = true;
+        let bear = add_creature(&mut state, PlayerId(0), "Bear", 3, 3, vec![]);
+        add_creature(&mut state, PlayerId(1), "Blocker", 3, 3, vec![]);
+
+        let attacks = choose_attackers_with_targets(&state, PlayerId(0));
+        assert!(
+            !attacks.iter().any(|(id, _)| *id == commander),
+            "commander must not trade into an equal block"
+        );
+        assert!(
+            attacks.iter().any(|(id, _)| *id == bear),
+            "a vanilla creature in the same spot should still trade"
+        );
+    }
+
+    /// B1 regression: the commander must also be excluded from the desperation
+    /// ALPHA-STRIKE fallback (which re-adds the whole candidate set). A swarm of
+    /// bears still alpha-strikes; the commander stays home. Discriminating:
+    /// reverting to `attacking_ids = candidates.clone()` re-adds the commander.
+    #[test]
+    fn commander_excluded_from_alpha_strike() {
+        let mut state = setup();
+        let commander = add_creature(&mut state, PlayerId(0), "General", 2, 2, vec![]);
+        state.objects.get_mut(&commander).unwrap().is_commander = true;
+        // Five 3/3 bears: enough excess unblocked power to justify the
+        // alpha-strike even after the single 0/4 wall "blocks" one body.
+        let mut bears = Vec::new();
+        for _ in 0..5 {
+            bears.push(add_creature(&mut state, PlayerId(0), "Bear", 3, 3, vec![]));
+        }
+        add_creature(&mut state, PlayerId(1), "Wall", 0, 4, vec![]);
+
+        let attacks = choose_attackers_with_targets(&state, PlayerId(0));
+        assert!(
+            !attacks.iter().any(|(id, _)| *id == commander),
+            "commander must be excluded from the alpha-strike swing"
+        );
+        assert!(
+            bears.iter().any(|b| attacks.iter().any(|(id, _)| id == b)),
+            "the bear swarm should still alpha-strike (the swing fires without the commander)"
+        );
+    }
+
+    // ───────────────────────── #5 attacking planeswalkers ────────────────────
+
+    /// #5: with no lethal/near-lethal at the face, redirect the FEWEST large
+    /// attackers needed to kill the opp planeswalker (largest-power-first),
+    /// leaving the rest on the player. PW + targets derived from the engine.
+    #[test]
+    fn redirects_fewest_bodies_to_planeswalker() {
+        let mut state = setup();
+        let big = add_creature(&mut state, PlayerId(0), "Ogre", 5, 5, vec![]);
+        let small_a = add_creature(&mut state, PlayerId(0), "Cub", 2, 2, vec![]);
+        let small_b = add_creature(&mut state, PlayerId(0), "Cub", 2, 2, vec![]);
+        let pw = add_planeswalker(&mut state, PlayerId(1), 3);
+        let targets = valid_targets(&state);
+
+        let attacks = choose_attackers_with_targets_with_profile(
+            &state,
+            PlayerId(0),
+            &AiProfile::default(),
+            false,
+            None,
+            Some(&targets),
+            None,
+        );
+
+        // The lone 5/5 (>= loyalty 3) goes at the planeswalker; the 2/2s at the player.
+        assert_eq!(
+            attacks.iter().find(|(id, _)| *id == big).map(|(_, t)| *t),
+            Some(AttackTarget::Planeswalker(pw)),
+            "the fewest-bodies killing subset (the 5/5) should hit the planeswalker"
+        );
+        for cub in [small_a, small_b] {
+            assert_eq!(
+                attacks.iter().find(|(id, _)| *id == cub).map(|(_, t)| *t),
+                Some(AttackTarget::Player(PlayerId(1))),
+                "spare attackers stay on the player"
+            );
+        }
+    }
+
+    /// #5 guard: if the swing can't KILL the planeswalker, don't dribble — send
+    /// everyone at the player.
+    #[test]
+    fn does_not_redirect_when_cannot_kill_pw() {
+        let mut state = setup();
+        add_creature(&mut state, PlayerId(0), "Cub", 2, 2, vec![]);
+        add_creature(&mut state, PlayerId(0), "Cub", 2, 2, vec![]);
+        add_planeswalker(&mut state, PlayerId(1), 6); // 4 total power < 6 loyalty
+        let targets = valid_targets(&state);
+
+        let attacks = choose_attackers_with_targets_with_profile(
+            &state,
+            PlayerId(0),
+            &AiProfile::default(),
+            false,
+            None,
+            Some(&targets),
+            None,
+        );
+        assert!(
+            attacks
+                .iter()
+                .all(|(_, t)| matches!(t, AttackTarget::Player(_))),
+            "can't-kill planeswalker → no dribble, all at player"
+        );
+    }
+
+    /// #5 guard: never empty the face — a lone attacker that could kill the PW
+    /// still goes at the player.
+    #[test]
+    fn does_not_redirect_when_would_empty_face() {
+        let mut state = setup();
+        add_creature(&mut state, PlayerId(0), "Ogre", 5, 5, vec![]);
+        add_planeswalker(&mut state, PlayerId(1), 3);
+        let targets = valid_targets(&state);
+
+        let attacks = choose_attackers_with_targets_with_profile(
+            &state,
+            PlayerId(0),
+            &AiProfile::default(),
+            false,
+            None,
+            Some(&targets),
+            None,
+        );
+        assert!(
+            attacks
+                .iter()
+                .all(|(_, t)| matches!(t, AttackTarget::Player(_))),
+            "redirecting the only attacker would empty the face → stay on player"
+        );
+    }
+
+    /// #5 guard: don't dilute a near-lethal swing (raw power >= opp life) into a
+    /// planeswalker, even when not formally PushLethal (a blocker is present).
+    #[test]
+    fn does_not_redirect_when_near_lethal() {
+        let mut state = setup();
+        state.players[1].life = 6;
+        add_creature(&mut state, PlayerId(0), "Brute", 4, 4, vec![]);
+        add_creature(&mut state, PlayerId(0), "Brute", 4, 4, vec![]);
+        add_creature(&mut state, PlayerId(1), "Chump", 0, 1, vec![]); // blocker → not PushLethal
+        add_planeswalker(&mut state, PlayerId(1), 3);
+        let targets = valid_targets(&state);
+
+        let attacks = choose_attackers_with_targets_with_profile(
+            &state,
+            PlayerId(0),
+            &AiProfile::default(),
+            false,
+            None,
+            Some(&targets),
+            None,
+        );
+        assert!(
+            attacks
+                .iter()
+                .any(|(_, t)| matches!(t, AttackTarget::Player(PlayerId(1)))),
+            "near-lethal swing should pressure the player, not the planeswalker"
+        );
+        assert!(
+            !attacks
+                .iter()
+                .any(|(_, t)| matches!(t, AttackTarget::Planeswalker(_))),
+            "no attacker should be diverted to the planeswalker when near-lethal"
+        );
+    }
+
+    /// #5 regression: no planeswalker present → targeting is unchanged (player).
+    #[test]
+    fn no_pw_target_single_opponent_unchanged() {
+        let mut state = setup();
+        let bear = add_creature(&mut state, PlayerId(0), "Bear", 3, 3, vec![]);
+        let targets = valid_targets(&state);
+
+        let attacks = choose_attackers_with_targets_with_profile(
+            &state,
+            PlayerId(0),
+            &AiProfile::default(),
+            false,
+            None,
+            Some(&targets),
+            None,
+        );
+        assert_eq!(
+            attacks.iter().find(|(id, _)| *id == bear).map(|(_, t)| *t),
+            Some(AttackTarget::Player(PlayerId(1))),
+        );
+    }
+
+    // --- Session projection routing (perf pipeline 3) ---
+
+    /// Deterministic "already-at-horizon" fixture: the opponent (P1) is the
+    /// active player, sitting at priority with an attacker already declared and
+    /// an empty stack, so `project_to`'s already-at-horizon short-circuit
+    /// returns `Confidence::Exact` with no simulation and no wall-clock
+    /// dependence. P0 has a lone 2-power attacker (etb turn 1 ⇒ can_attack) and
+    /// P1 has no untapped blockers, so the entry point reaches the crackback
+    /// projection block (opponent_blockers empty ⇒ attacker pushed ⇒ objective
+    /// is not PushLethal).
+    fn session_projection_fixture() -> GameState {
+        let mut state = setup();
+        state.active_player = PlayerId(1);
+        let attacker = add_creature(&mut state, PlayerId(0), "Bear", 2, 2, vec![]);
+        // creatures_attacked_this_turn is a HashSet — reached_horizon only
+        // checks it is non-empty, so any ObjectId satisfies the predicate.
+        state.creatures_attacked_this_turn.insert(attacker);
+        state.stack.clear();
+        state.waiting_for = WaitingFor::Priority {
+            player: PlayerId(1),
+        };
+        state.players[1].life = 20;
+        state
+    }
+
+    /// Test A (revert-failing): with `combat_lookahead` on and a session
+    /// present, the combat projection is routed through `get_or_project`, which
+    /// populates the per-game cache under the exact turn-scoped key. Reverting
+    /// to the free `project_to` leaves the cache empty and flips both asserts.
+    #[test]
+    fn session_projection_populates_cache_with_exact_key() {
+        let state = session_projection_fixture();
+        let session = AiSession::empty();
+        let profile = AiProfile::default();
+
+        let _ = choose_attackers_with_targets_with_profile(
+            &state,
+            PlayerId(0),
+            &profile,
+            /* combat_lookahead = */ true,
+            None,
+            None,
+            Some(&session),
+        );
+
+        let expected = ProjectionKey {
+            state_hash: quick_state_hash(&state),
+            turn_number: state.turn_number,
+            active_player: state.active_player,
+            ai_player: PlayerId(0),
+            target_opponent: PlayerId(1),
+            horizon: ProjectionHorizon::OpponentAttackersDeclared,
+        };
+        let cache = session.projection_cache.read().unwrap();
+        assert_eq!(
+            cache.len(),
+            1,
+            "combat_lookahead projection must populate exactly one cache entry \
+             (revert-failing: free project_to caches nothing)"
+        );
+        assert!(
+            cache.contains_key(&expected),
+            "the cached projection must be keyed by the exact turn-scoped ProjectionKey"
+        );
+    }
+
+    /// Test A2 (positive reach-guard for Test A): the session is consulted
+    /// only when `combat_lookahead` is on. With it off, the same fixture leaves
+    /// the cache empty — proving Test A's non-empty cache is caused by the
+    /// lookahead routing, not by any incidental fixture side effect.
+    #[test]
+    fn session_projection_skipped_when_lookahead_off() {
+        let state = session_projection_fixture();
+        let session = AiSession::empty();
+        let profile = AiProfile::default();
+
+        let _ = choose_attackers_with_targets_with_profile(
+            &state,
+            PlayerId(0),
+            &profile,
+            /* combat_lookahead = */ false,
+            None,
+            None,
+            Some(&session),
+        );
+
+        assert!(
+            session.projection_cache.read().unwrap().is_empty(),
+            "with combat_lookahead off, no projection is taken and the cache stays empty"
+        );
+    }
+
+    /// Test B (behavior-neutral): routing the combat projection through the
+    /// session cache produces the identical attacker decision as the free
+    /// `project_to` path. This passes on reverted code too — by design — and
+    /// guards against a semantic drift in the caching refactor.
+    #[test]
+    fn session_projection_decision_neutral_vs_free() {
+        let state = session_projection_fixture();
+        let profile = AiProfile::default();
+
+        let with_session = choose_attackers_with_targets_with_profile(
+            &state,
+            PlayerId(0),
+            &profile,
+            /* combat_lookahead = */ true,
+            None,
+            None,
+            Some(&AiSession::empty()),
+        );
+        let without_session = choose_attackers_with_targets_with_profile(
+            &state,
+            PlayerId(0),
+            &profile,
+            /* combat_lookahead = */ true,
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(
+            with_session, without_session,
+            "session-cached projection must yield the identical attacker decision as the free path"
         );
     }
 }

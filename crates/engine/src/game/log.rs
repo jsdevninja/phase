@@ -87,8 +87,15 @@ fn categorize(event: &GameEvent) -> LogCategory {
     match event {
         GameEvent::GameStarted
         | GameEvent::GameOver { .. }
+        // CR 732.2: a halted runaway resolution is game-flow control, grouped
+        // with GameOver under `Game` rather than object-state `State`.
+        | GameEvent::ResolutionHalted { .. }
         | GameEvent::PlayerLost { .. }
         | GameEvent::PlayerEliminated { .. }
+        // CR 103.1: grouped with the setup event MulliganStarted under `Game`
+        // (not `Special` like in-game DieRolled) — it is game setup, not a
+        // CR 706 die-roll log entry.
+        | GameEvent::StartingPlayerContest { .. }
         | GameEvent::MulliganStarted => LogCategory::Game,
 
         GameEvent::TurnStarted { .. }
@@ -106,6 +113,9 @@ fn categorize(event: &GameEvent) -> LogCategory {
 
         GameEvent::AttackersDeclared { .. }
         | GameEvent::BlockersDeclared { .. }
+        | GameEvent::AttackerBecameBlockedByEffect { .. }
+        | GameEvent::CreatureExerted { .. }
+        | GameEvent::CreatureEnlisted { .. }
         | GameEvent::CombatDamageDealtToPlayer { .. } => LogCategory::Combat,
 
         GameEvent::DamageDealt { is_combat, .. } => {
@@ -124,7 +134,9 @@ fn categorize(event: &GameEvent) -> LogCategory {
         | GameEvent::CardsDrawn { .. }
         | GameEvent::Discarded { .. }
         | GameEvent::Cycled { .. }
-        | GameEvent::CardsRevealed { .. } => LogCategory::Zone,
+        | GameEvent::CardsRevealed { .. }
+        | GameEvent::Foretold { .. }
+        | GameEvent::BecameForetold { .. } => LogCategory::Zone,
 
         GameEvent::LifeChanged { .. } => LogCategory::Life,
 
@@ -141,12 +153,16 @@ fn categorize(event: &GameEvent) -> LogCategory {
         | GameEvent::PlayerPhasedIn { .. }
         | GameEvent::DamageCleared { .. }
         | GameEvent::CounterAdded { .. }
+        | GameEvent::ObjectIntensified { .. }
         | GameEvent::Evolved { .. }
         | GameEvent::CounterRemoved { .. }
+        | GameEvent::ControllerChanged { .. }
         | GameEvent::Transformed { .. }
         | GameEvent::TurnedFaceUp { .. }
+        | GameEvent::TurnedFaceDown { .. }
         | GameEvent::Regenerated { .. }
         | GameEvent::CreatureSuspected { .. }
+        | GameEvent::CreatureNoLongerSuspected { .. }
         | GameEvent::Detained { .. }
         | GameEvent::BecamePrepared { .. }
         | GameEvent::BecameUnprepared { .. }
@@ -157,9 +173,13 @@ fn categorize(event: &GameEvent) -> LogCategory {
         | GameEvent::VehicleCrewed { .. }
         | GameEvent::Stationed { .. }
         | GameEvent::Saddled { .. }
+        // CR 702.140c + CR 730.2: a mutating creature spell merged with a permanent.
+        | GameEvent::Mutated { .. }
+        // Unstable Host/Augment: a card with augment combined with a Host creature.
+        | GameEvent::Augmented { .. }
         | GameEvent::BecomesPlotted { .. } => LogCategory::State,
 
-        GameEvent::SpeedChanged { .. } => LogCategory::Special,
+        GameEvent::SpeedChanged { .. } | GameEvent::ArmyAmassed { .. } => LogCategory::Special,
 
         GameEvent::TokenCreated { .. } | GameEvent::ObjectConjured { .. } => LogCategory::Token,
 
@@ -173,6 +193,11 @@ fn categorize(event: &GameEvent) -> LogCategory {
         GameEvent::CreatureDestroyed { .. } | GameEvent::PermanentSacrificed { .. } => {
             LogCategory::Destroy
         }
+
+        GameEvent::CardPredicateGuessMade { .. }
+        | GameEvent::DebugActionUsed { .. }
+        | GameEvent::DebugPermissionGranted { .. }
+        | GameEvent::DebugPermissionRevoked { .. } => LogCategory::Debug,
 
         GameEvent::MonarchChanged { .. }
         | GameEvent::CityBlessingGained { .. }
@@ -193,7 +218,19 @@ fn categorize(event: &GameEvent) -> LogCategory {
         | GameEvent::RoomEntered { .. }
         | GameEvent::RoomDoorUnlocked { .. }
         | GameEvent::DungeonCompleted { .. }
+        | GameEvent::Planeswalked { .. }
+        | GameEvent::ChaosEnsued { .. }
+        | GameEvent::PlanarDieRolled { .. }
+        | GameEvent::SchemeSetInMotion { .. }
+        | GameEvent::SchemeAbandoned { .. }
         | GameEvent::InitiativeTaken { .. }
+        | GameEvent::AttractionOpened { .. }
+        | GameEvent::ContraptionAssembled { .. }
+        | GameEvent::StickerPlaced { .. }
+        | GameEvent::AttractionsRolledToVisit { .. }
+        | GameEvent::AttractionVisited { .. }
+        | GameEvent::ContraptionCranked { .. }
+        | GameEvent::Specialized { .. }
         | GameEvent::Clash { .. }
         | GameEvent::VoteCast { .. }
         | GameEvent::VoteResolved { .. }
@@ -201,10 +238,6 @@ fn categorize(event: &GameEvent) -> LogCategory {
         GameEvent::CombatTaxPaid { .. } | GameEvent::CombatTaxDeclined { .. } => {
             LogCategory::Combat
         }
-
-        GameEvent::DebugActionUsed { .. }
-        | GameEvent::DebugPermissionGranted { .. }
-        | GameEvent::DebugPermissionRevoked { .. } => LogCategory::Special,
     }
 }
 
@@ -236,6 +269,22 @@ fn format_segments(event: &GameEvent, state: &GameState) -> Vec<LogSegment> {
             text(" performed action "),
             text(&format!("{action:?}")),
         ],
+        GameEvent::CardPredicateGuessMade {
+            player_id,
+            source_id,
+            choice,
+        } => {
+            let mut segments = vec![
+                player_seg(state, *player_id),
+                text(" guesses "),
+                text(choice),
+            ];
+            if let Some(source_id) = source_id {
+                segments.push(text(" for "));
+                segments.push(card_seg(state, *source_id));
+            }
+            segments
+        }
 
         GameEvent::SpellCast {
             controller,
@@ -260,6 +309,7 @@ fn format_segments(event: &GameEvent, state: &GameState) -> Vec<LogSegment> {
         GameEvent::AbilityActivated {
             player_id,
             source_id,
+            ..
         } => vec![
             player_seg(state, *player_id),
             text(" activates ability: "),
@@ -286,6 +336,17 @@ fn format_segments(event: &GameEvent, state: &GameState) -> Vec<LogSegment> {
                 AbilityTag::Evolve => " activates evolve: ",
                 AbilityTag::Exhaust => " activates exhaust: ",
                 AbilityTag::Outlast => " activates outlast: ",
+                // CR 702.29c: Cycling emits a dedicated `GameEvent::Cycled`, not a
+                // `KeywordAbilityActivated` event, so this arm is unreachable.
+                AbilityTag::Cycling => " activates cycling: ",
+                // CR 702.165a: Backup is a triggered ability — it never emits a
+                // `KeywordAbilityActivated` event, so this arm is unreachable.
+                AbilityTag::Backup => " activates backup: ",
+                // CR 602.5b: Power-up activation.
+                AbilityTag::PowerUp => " activates power-up: ",
+                // CR 702.6a: Equip activation.
+                AbilityTag::Equip => " activates equip: ",
+                AbilityTag::Augment => " activates augment: ",
             };
             vec![
                 player_seg(state, *player_id),
@@ -303,6 +364,22 @@ fn format_segments(event: &GameEvent, state: &GameState) -> Vec<LogSegment> {
             player_seg(state, *player_id),
         ],
 
+        GameEvent::CreatureExerted { object_id } => {
+            vec![card_seg(state, *object_id), text(" is exerted")]
+        }
+
+        GameEvent::CreatureEnlisted {
+            attacker, tapped, ..
+        } => vec![
+            card_seg(state, *attacker),
+            text(" enlists "),
+            card_seg(state, *tapped),
+        ],
+
+        GameEvent::ArmyAmassed { object_id, .. } => {
+            vec![card_seg(state, *object_id), text(" is amassed")]
+        }
+
         GameEvent::StackPushed { object_id } => {
             vec![card_seg(state, *object_id), text(" added to stack")]
         }
@@ -314,6 +391,7 @@ fn format_segments(event: &GameEvent, state: &GameState) -> Vec<LogSegment> {
         GameEvent::SpellCountered {
             object_id,
             countered_by,
+            ..
         } => vec![
             card_seg(state, *countered_by),
             text(" counters "),
@@ -386,6 +464,7 @@ fn format_segments(event: &GameEvent, state: &GameState) -> Vec<LogSegment> {
         GameEvent::Discarded {
             player_id,
             object_id,
+            ..
         } => vec![
             player_seg(state, *player_id),
             text(" discards "),
@@ -521,13 +600,19 @@ fn format_segments(event: &GameEvent, state: &GameState) -> Vec<LogSegment> {
             segs
         }
 
+        // CR 509.1h: an effect made an attacker become blocked (no blockers).
+        GameEvent::AttackerBecameBlockedByEffect { attacker } => {
+            vec![card_seg(state, *attacker), text(" becomes blocked")]
+        }
+
         GameEvent::CombatDamageDealtToPlayer {
             player_id,
-            source_ids,
+            source_amounts,
+            ..
         } => vec![
             player_seg(state, *player_id),
             text(" is dealt combat damage by "),
-            num(source_ids.len() as i32),
+            num(source_amounts.len() as i32),
             text(" creature(s)"),
         ],
 
@@ -610,6 +695,12 @@ fn format_segments(event: &GameEvent, state: &GameState) -> Vec<LogSegment> {
             card_seg(state, *object_id),
         ],
 
+        GameEvent::ObjectIntensified { object_id, amount } => vec![
+            card_seg(state, *object_id),
+            text(" intensified by "),
+            num(*amount as i32),
+        ],
+
         GameEvent::Evolved { object_id } => {
             vec![card_seg(state, *object_id), text(" evolved")]
         }
@@ -630,8 +721,40 @@ fn format_segments(event: &GameEvent, state: &GameState) -> Vec<LogSegment> {
             vec![card_seg(state, *object_id), text(" transforms")]
         }
 
+        GameEvent::Specialized { object_id, color } => {
+            vec![
+                card_seg(state, *object_id),
+                text(&format!(" specializes ({color:?})")),
+            ]
+        }
+
+        // CR 702.140c + CR 730.2: a mutating creature spell merged with a permanent.
+        GameEvent::Mutated {
+            merged_id,
+            merging_id,
+            ..
+        } => vec![
+            card_seg(state, *merging_id),
+            text(" mutates onto "),
+            card_seg(state, *merged_id),
+        ],
+
+        GameEvent::Augmented {
+            merged_id,
+            augmenting_id,
+            ..
+        } => vec![
+            card_seg(state, *augmenting_id),
+            text(" augments "),
+            card_seg(state, *merged_id),
+        ],
+
         GameEvent::TurnedFaceUp { object_id } => {
             vec![card_seg(state, *object_id), text(" is turned face up")]
+        }
+
+        GameEvent::TurnedFaceDown { object_id } => {
+            vec![card_seg(state, *object_id), text(" is turned face down")]
         }
 
         GameEvent::Regenerated { object_id } => {
@@ -640,6 +763,10 @@ fn format_segments(event: &GameEvent, state: &GameState) -> Vec<LogSegment> {
 
         GameEvent::CreatureSuspected { object_id } => {
             vec![card_seg(state, *object_id), text(" becomes suspected")]
+        }
+
+        GameEvent::CreatureNoLongerSuspected { object_id } => {
+            vec![card_seg(state, *object_id), text(" is no longer suspected")]
         }
 
         GameEvent::Detained { object_id } => {
@@ -668,7 +795,9 @@ fn format_segments(event: &GameEvent, state: &GameState) -> Vec<LogSegment> {
             vec![text("Day/Night changed to "), text(new_state)]
         }
 
-        GameEvent::TokenCreated { object_id, name } => vec![
+        GameEvent::TokenCreated {
+            object_id, name, ..
+        } => vec![
             text("Token created: "),
             LogSegment::CardName {
                 name: name.clone(),
@@ -695,6 +824,18 @@ fn format_segments(event: &GameEvent, state: &GameState) -> Vec<LogSegment> {
             player_seg(state, *player_id),
             text(" sacrifices "),
             card_seg(state, *object_id),
+        ],
+
+        GameEvent::ControllerChanged {
+            object_id,
+            old_controller,
+            new_controller,
+        } => vec![
+            card_seg(state, *object_id),
+            text(" changed controller from "),
+            player_seg(state, *old_controller),
+            text(" to "),
+            player_seg(state, *new_controller),
         ],
 
         GameEvent::EffectResolved { kind, source_id } => vec![
@@ -737,6 +878,13 @@ fn format_segments(event: &GameEvent, state: &GameState) -> Vec<LogSegment> {
 
         GameEvent::MulliganStarted => vec![text("Mulligan phase begins")],
 
+        // CR 103.1: concise one-line summary of the starting-player roll-off;
+        // round-by-round detail lives in the structured event for the UI.
+        GameEvent::StartingPlayerContest { winner, .. } => vec![
+            player_seg(state, *winner),
+            text(" wins the roll to take the first turn"),
+        ],
+
         GameEvent::GameOver { winner } => match winner {
             Some(pid) => vec![
                 text("Game over — "),
@@ -745,6 +893,12 @@ fn format_segments(event: &GameEvent, state: &GameState) -> Vec<LogSegment> {
             ],
             None => vec![text("Game over — Draw")],
         },
+
+        // CR 732.2: engine-authored game-flow message — raw text, not t()-wrapped
+        // (the i18n boundary keeps engine/log pass-through strings raw).
+        GameEvent::ResolutionHalted { .. } => {
+            vec![text("Resolution halted — possible mandatory loop")]
+        }
 
         GameEvent::MonarchChanged { player_id } => {
             vec![player_seg(state, *player_id), text(" becomes the monarch")]
@@ -761,13 +915,18 @@ fn format_segments(event: &GameEvent, state: &GameState) -> Vec<LogSegment> {
             player_id,
             sides,
             result,
-        } => vec![
-            player_seg(state, *player_id),
-            text(" rolls a d"),
-            num(*sides as i32),
-            text(": "),
-            num(*result as i32),
-        ],
+        } => match result {
+            // CR 706: a numeric die roll renders its face value.
+            Some(r) => vec![
+                player_seg(state, *player_id),
+                text(" rolls a d"),
+                num(*sides as i32),
+                text(": "),
+                num(*r as i32),
+            ],
+            // CR 901.9d / CR 706.7: the symbolic planar die has no numeric face.
+            None => vec![player_seg(state, *player_id), text(" rolls the planar die")],
+        },
 
         GameEvent::CoinFlipped { player_id, won } => vec![
             player_seg(state, *player_id),
@@ -957,7 +1116,69 @@ fn format_segments(event: &GameEvent, state: &GameState) -> Vec<LogSegment> {
         GameEvent::RoomEntered { .. } => vec![text("Room entered")],
         GameEvent::RoomDoorUnlocked { .. } => vec![text("Room door unlocked")],
         GameEvent::DungeonCompleted { .. } => vec![text("Dungeon completed")],
+        GameEvent::Planeswalked { .. } => vec![text("Planeswalked")],
+        GameEvent::ChaosEnsued { .. } => vec![text("Chaos ensues")],
+        GameEvent::PlanarDieRolled { face, .. } => {
+            vec![text(&format!("Rolled the planar die: {face:?}"))]
+        }
+        GameEvent::SchemeSetInMotion { scheme_id, .. } => {
+            vec![text("Set scheme in motion: "), card_seg(state, *scheme_id)]
+        }
+        GameEvent::SchemeAbandoned { scheme_id, .. } => {
+            vec![text("Abandoned scheme: "), card_seg(state, *scheme_id)]
+        }
         GameEvent::InitiativeTaken { .. } => vec![text("Initiative taken")],
+        GameEvent::AttractionOpened { object_id, .. } => {
+            vec![text("Opened Attraction "), card_seg(state, *object_id)]
+        }
+        GameEvent::ContraptionAssembled {
+            object_id,
+            sprocket,
+            ..
+        } => vec![
+            text("Assembled Contraption "),
+            card_seg(state, *object_id),
+            text(" onto sprocket "),
+            text(&sprocket.to_string()),
+        ],
+        GameEvent::StickerPlaced {
+            object_id, kind, ..
+        } => vec![
+            text("Placed "),
+            text(&format!("{kind:?}").to_lowercase()),
+            text(" sticker on "),
+            card_seg(state, *object_id),
+        ],
+        GameEvent::AttractionsRolledToVisit { roll, .. } => {
+            vec![
+                text("Rolled "),
+                text(&roll.to_string()),
+                text(" to visit Attractions"),
+            ]
+        }
+        GameEvent::AttractionVisited {
+            attraction_id,
+            roll,
+            ..
+        } => {
+            vec![
+                text("Visited Attraction "),
+                card_seg(state, *attraction_id),
+                text(" (rolled "),
+                text(&roll.to_string()),
+                text(")"),
+            ]
+        }
+        GameEvent::ContraptionCranked {
+            contraption_id,
+            sprocket,
+            ..
+        } => vec![
+            text("Cranked Contraption "),
+            card_seg(state, *contraption_id),
+            text(" on sprocket "),
+            text(&sprocket.to_string()),
+        ],
         GameEvent::Clash { .. } => vec![text("Clash")],
         GameEvent::VoteCast { voter, choice, .. } => {
             vec![player_seg(state, *voter), text(" voted "), text(choice)]
@@ -1021,6 +1242,19 @@ fn format_segments(event: &GameEvent, state: &GameState) -> Vec<LogSegment> {
             text(" revoked debug actions from "),
             player_seg(state, *player_id),
         ],
+        GameEvent::Foretold {
+            player_id,
+            object_id,
+        } => vec![
+            player_seg(state, *player_id),
+            text(" foretold "),
+            card_seg(state, *object_id),
+        ],
+        // CR 702.143d: an effect made an exiled card foretold (no foretelling
+        // player — the card itself became foretold).
+        GameEvent::BecameForetold { object_id } => {
+            vec![card_seg(state, *object_id), text(" becomes foretold")]
+        }
         // CR 106.12a: `TappedForMana` is the per-resolution trigger event for
         // `TapsForMana` matchers. The per-unit `ManaAdded` events already
         // produce the user-facing "adds X mana" log lines, so this event is
@@ -1091,6 +1325,41 @@ mod tests {
     }
 
     #[test]
+    fn named_choice_guess_logs_as_debug_with_source() {
+        let mut state = GameState::new_two_player(42);
+        let source_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Gollum, Scheming Guide".to_string(),
+            crate::types::zones::Zone::Battlefield,
+        );
+        let event = GameEvent::CardPredicateGuessMade {
+            player_id: PlayerId(1),
+            source_id: Some(source_id),
+            choice: "Nonland".to_string(),
+        };
+        let entries = resolve_log_entries(&[event], &state);
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].category, LogCategory::Debug);
+        assert!(matches!(
+            entries[0].segments.as_slice(),
+            [
+                LogSegment::PlayerName { player_id, .. },
+                LogSegment::Text(guesses),
+                LogSegment::Text(choice),
+                LogSegment::Text(for_text),
+                LogSegment::CardName { name, .. },
+            ] if *player_id == PlayerId(1)
+                && guesses == " guesses "
+                && choice == "Nonland"
+                && for_text == " for "
+                && name == "Gollum, Scheming Guide"
+        ));
+    }
+
+    #[test]
     fn player_name_defaults_to_player_n() {
         let state = GameState::new_two_player(42);
         let name = resolve_player_name(&state, PlayerId(0));
@@ -1119,6 +1388,7 @@ mod tests {
             ObjectId(42),
             crate::types::game_state::LKISnapshot {
                 name: "Grizzly Bears".to_string(),
+                token_image_ref: None,
                 power: Some(2),
                 toughness: Some(2),
                 base_power: Some(2),
@@ -1131,7 +1401,10 @@ mod tests {
                 supertypes: vec![],
                 keywords: vec![],
                 colors: vec![],
+                chosen_attributes: Vec::new(),
                 counters: HashMap::new(),
+                tapped: false,
+                is_suspected: false,
             },
         );
         assert_eq!(resolve_object_name(&state, ObjectId(42)), "Grizzly Bears");
@@ -1201,7 +1474,13 @@ mod tests {
             GameEvent::DieRolled {
                 player_id: PlayerId(0),
                 sides: 20,
-                result: 17,
+                result: Some(17),
+            },
+            GameEvent::StartingPlayerContest {
+                rounds: vec![crate::types::events::ContestRound {
+                    rolls: vec![(PlayerId(0), 17), (PlayerId(1), 5)],
+                }],
+                winner: PlayerId(0),
             },
             GameEvent::CoinFlipped {
                 player_id: PlayerId(0),
@@ -1219,6 +1498,7 @@ mod tests {
             GameEvent::TokenCreated {
                 object_id: ObjectId(1),
                 name: "Zombie".to_string(),
+                source_id: ObjectId(0),
             },
             GameEvent::PowerToughnessChanged {
                 object_id: ObjectId(1),

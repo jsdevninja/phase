@@ -3,21 +3,31 @@ import { useTranslation } from "react-i18next";
 
 import type { GameAction, GameObject } from "../../adapter/types.ts";
 import { CardImage } from "../card/CardImage.tsx";
+import { objectImageProps } from "../../services/cardImageLookup.ts";
 import { ModalPanelShell } from "../ui/ModalPanelShell.tsx";
 import { ScrollableCardStrip } from "../modal/ChoiceOverlay.tsx";
 import { useLongPress } from "../../hooks/useLongPress.ts";
 import { useInspectHoverProps } from "../../hooks/useInspectHoverProps.ts";
 import { useGameStore } from "../../stores/gameStore.ts";
 import { useUiStore } from "../../stores/uiStore.ts";
-import { useCanActForWaitingState, usePerspectivePlayerId } from "../../hooks/usePlayerId.ts";
+import { useCanActForWaitingState, usePlayerId } from "../../hooks/usePlayerId.ts";
 import { useGameDispatch } from "../../hooks/useGameDispatch.ts";
-import { getPlayerZoneIds, getWaitingForObjectChoiceIds } from "../../viewmodel/gameStateView.ts";
-import { CASTABLE_AFFORDANCE_ACTIVE, CASTABLE_AFFORDANCE_IDLE } from "../../viewmodel/castableAffordance.ts";
-import { playOrCastActionsForObject } from "../../viewmodel/cardActionChoice.ts";
-import { abilityChoiceLabel } from "../../viewmodel/costLabel.ts";
+import {
+  getPlayerZoneIds,
+  getWaitingForObjectChoiceIds,
+  isFaceDownExileCardVisibleToViewer,
+  isLibraryCardRevealedToViewer,
+} from "../../viewmodel/gameStateView.ts";
+import { CASTABLE_AFFORDANCE_ACTIVE } from "../../viewmodel/castableAffordance.ts";
+import {
+  collectObjectActions,
+  isManaObjectAction,
+  playOrCastActionsForObject,
+  resolveSingleActionDispatch,
+} from "../../viewmodel/cardActionChoice.ts";
 
 interface ZoneViewerProps {
-  zone: "graveyard" | "exile";
+  zone: "graveyard" | "exile" | "library";
   playerId: number;
   onClose: () => void;
 }
@@ -25,11 +35,13 @@ interface ZoneViewerProps {
 const ZONE_TITLE_KEYS: Record<string, string> = {
   graveyard: "zone.graveyard",
   exile: "zone.exile",
+  library: "zone.library",
 };
 
 const ZONE_TITLE_LOWER_KEYS: Record<string, string> = {
   graveyard: "zone.graveyardLower",
   exile: "zone.exileLower",
+  library: "zone.libraryLower",
 };
 
 export function ZoneViewer({ zone, playerId, onClose }: ZoneViewerProps) {
@@ -39,9 +51,11 @@ export function ZoneViewer({ zone, playerId, onClose }: ZoneViewerProps) {
   const waitingFor = useGameStore((s) => s.waitingFor);
   const dispatch = useGameStore((s) => s.dispatch);
   const legalActionsByObject = useGameStore((s) => s.legalActionsByObject);
+  const inspectObject = useUiStore((s) => s.inspectObject);
+  const setPendingAbilityChoice = useUiStore((s) => s.setPendingAbilityChoice);
   const dispatchAction = useGameDispatch();
-  const currentPlayerId = usePerspectivePlayerId();
   const canActForWaitingState = useCanActForWaitingState();
+  const viewerId = usePlayerId();
   const zoneIds = useMemo(
     () => getPlayerZoneIds(gameState, zone, playerId),
     [gameState, playerId, zone],
@@ -49,11 +63,40 @@ export function ZoneViewer({ zone, playerId, onClose }: ZoneViewerProps) {
 
   const cards = useMemo(() => {
     if (!objects) return [];
-    return zoneIds.map((id) => objects[id]).filter(Boolean);
-  }, [objects, zoneIds]);
+    const resolved = zoneIds.map((id) => objects[id]).filter(Boolean) as GameObject[];
+    // CR 701.20: the library viewer shows only the cards the engine has revealed
+    // to this viewer (top-of-library reveals + private looks), top-first.
+    // Unrevealed cards are omitted entirely — visibility is gated on the engine's
+    // reveal sets, never inferred from name redaction (single-player renders the
+    // raw, unredacted state).
+    if (zone === "library") {
+      // The "look at the top card of your library" capability (Future Sight,
+      // Bolas's Citadel, Oracle of Mul Daya) is a continuous static that exposes
+      // the OWNER's own top card without adding it to revealed_cards/private_look
+      // — mirror LibraryPile's `peek` clause so that top still shows (and stays
+      // castable) through the modal.
+      const ownTopId =
+        viewerId === playerId &&
+        (gameState?.players[playerId]?.can_look_at_top_of_library ?? false)
+          ? gameState?.players[playerId]?.library?.[0]
+          : undefined;
+      return resolved.filter(
+        (obj) =>
+          isLibraryCardRevealedToViewer(gameState, obj.id, viewerId) ||
+          obj.id === ownTopId,
+      );
+    }
+    return resolved;
+  }, [objects, zoneIds, zone, gameState, viewerId, playerId]);
 
-  const isMyZone = playerId === currentPlayerId;
   const hasPriority = waitingFor?.type === "Priority" && canActForWaitingState;
+
+  const canDelveFromGraveyard =
+    zone === "graveyard"
+    && playerId === viewerId
+    && canActForWaitingState
+    && waitingFor?.type === "ManaPayment"
+    && waitingFor.data.convoke_mode === "Delve";
 
   const currentLegalTargets = useMemo(() => {
     const targets = new Set<number>();
@@ -64,12 +107,35 @@ export function ZoneViewer({ zone, playerId, onClose }: ZoneViewerProps) {
     return targets;
   }, [canActForWaitingState, waitingFor]);
 
+  // Click-to-cast mirrors ZoneHand: a lone non-confirming action dispatches
+  // immediately, otherwise the shared ability-choice modal opens. Closing the
+  // viewer surfaces that modal (DialogHost z-40) which would otherwise sit
+  // behind the ZoneViewer panel (z-50), and matches Arena dismissing the zone
+  // view once a cast begins. resolveSingleActionDispatch is the single
+  // auto-vs-confirm authority — never re-decided inline here.
+  const handleCast = useCallback(
+    (target: GameObject, actions: GameAction[]) => {
+      inspectObject(null);
+      const auto = resolveSingleActionDispatch(actions, target);
+      if (auto) {
+        dispatch(auto);
+      } else {
+        setPendingAbilityChoice({ objectId: target.id, actions });
+      }
+      onClose();
+    },
+    [dispatch, inspectObject, setPendingAbilityChoice, onClose],
+  );
+
+  const zoneLabel = t(ZONE_TITLE_KEYS[zone]);
+
   return (
     <ModalPanelShell
       title={t("zone.zoneTitle", { zone: t(ZONE_TITLE_KEYS[zone]), count: cards.length })}
       onClose={onClose}
       maxWidthClassName="max-w-5xl"
       bodyClassName="flex min-h-0 flex-col"
+      overlayClassName="z-[60]"
     >
       <div className="min-h-0 flex-1 px-2 pb-2 lg:px-6 lg:pb-6">
         {cards.length === 0 ? (
@@ -84,21 +150,61 @@ export function ZoneViewer({ zone, playerId, onClose }: ZoneViewerProps) {
             {cards.map((obj) => {
               // CR 702.81a + CR 702.143a + CR 715.3a + CR 702.62a + CR 702.170d + CR 702.185a:
               // Engine surfaces a CastSpell-family action for every legally
-              // castable owner-viewed graveyard/exile card (Retrace, Adventure,
-              // Foretell, Suspend, Plot, Warp, etc.). The zone viewer surfaces
-              // whatever the engine reports — no per-mechanic permission inspection.
-              const castActions = (zone === "graveyard" || zone === "exile") && isMyZone && hasPriority
+              // castable graveyard/exile card (Retrace, Adventure, Foretell,
+              // Suspend, Plot, Warp, etc.). The zone viewer surfaces whatever
+              // the engine reports — no per-mechanic permission inspection.
+              //
+              // CR 401.5 + CR 118.9: for `library`, the engine only surfaces a
+              // play/cast action on the top card when a TopOfLibraryCastPermission
+              // (Future Sight, Bolas's Citadel, Mystic Forge, …) is active, so
+              // the playable affordance naturally lands on the revealed top.
+              //
+              // CR 715.3d / CR 400.7i: this includes opponent-OWNED cards in
+              // exile the viewer was granted permission to play (Hostage Taker,
+              // Gonti, Thief of Sanity). Those live in the owner's exile pile,
+              // so castability must NOT be gated on the pile belonging to the
+              // viewer — `legalActionsByObject` (engine authority, keyed to the
+              // player the permission was granted to) is the sole gate.
+              const castActions = hasPriority
                 ? playOrCastActionsForObject(legalActionsByObject, obj.id)
                 : [];
+              const delveActions = canDelveFromGraveyard
+                ? collectObjectActions(legalActionsByObject, obj.id).filter((action) =>
+                    isManaObjectAction(action, obj),
+                  )
+                : [];
               const isValidTarget = currentLegalTargets.has(obj.id);
+              // CR 406.3 + CR 702.75a + CR 702.143e: a face-down card sitting
+              // in the shared exile pile (Hideaway, Foretell) carries its real
+              // name/printed_ref in the raw single-player state regardless of
+              // viewer — `isFaceDownExileCardVisibleToViewer` is the client
+              // half of the engine's look-permission gate, so an opponent's
+              // hidden exile renders as a face-down placeholder instead of
+              // leaking its identity.
+              const isHiddenFromViewer =
+                zone === "exile" && obj.face_down && !isFaceDownExileCardVisibleToViewer(gameState, obj, viewerId);
               return (
                 <ZoneCard
                   key={obj.id}
                   obj={obj}
                   isValidTarget={isValidTarget}
-                  castActions={castActions}
+                  canCast={castActions.length > 0}
+                  castTitle={t("zone.castFromZone", {
+                    zone: zoneLabel,
+                    name: isHiddenFromViewer ? t("card.faceDownName") : obj.name,
+                  })}
+                  hiddenFromViewer={isHiddenFromViewer}
+                  canDelve={delveActions.length > 0}
+                  onDelve={() => {
+                    const auto = resolveSingleActionDispatch(delveActions, obj);
+                    if (auto) {
+                      dispatchAction(auto);
+                    } else {
+                      setPendingAbilityChoice({ objectId: obj.id, actions: delveActions });
+                    }
+                  }}
                   onTarget={() => dispatchAction({ type: "ChooseTarget", data: { target: { Object: obj.id } } })}
-                  onCast={(action) => dispatch(action)}
+                  onCast={() => handleCast(obj, castActions)}
                 />
               );
             })}
@@ -112,15 +218,23 @@ export function ZoneViewer({ zone, playerId, onClose }: ZoneViewerProps) {
 function ZoneCard({
   obj,
   isValidTarget,
-  castActions,
+  canCast,
+  canDelve,
+  castTitle,
+  hiddenFromViewer,
   onTarget,
   onCast,
+  onDelve,
 }: {
   obj: GameObject;
   isValidTarget: boolean;
-  castActions: GameAction[];
+  canCast: boolean;
+  canDelve: boolean;
+  castTitle: string;
+  hiddenFromViewer: boolean;
   onTarget: () => void;
-  onCast: (action: GameAction) => void;
+  onCast: () => void;
+  onDelve: () => void;
 }) {
   const inspectObject = useUiStore((s) => s.inspectObject);
   const setPreviewSticky = useUiStore((s) => s.setPreviewSticky);
@@ -139,40 +253,48 @@ function ZoneCard({
       useUiStore.getState().openDebugContextMenu({ objectId: obj.id, x: e.clientX, y: e.clientY });
       return;
     }
-    if (isValidTarget) onTarget();
-  }, [obj.id, isValidTarget, onTarget, longPressFired]);
+    if (isValidTarget) { onTarget(); return; }
+    if (canDelve) { onDelve(); return; }
+    if (canCast) onCast();
+  }, [obj.id, isValidTarget, canDelve, canCast, onTarget, onDelve, onCast, longPressFired]);
 
-  const canCast = castActions.length > 0;
   return (
     <div
-      className={`shrink-0 cursor-pointer rounded transition-colors ${
+      className={`group relative inline-flex shrink-0 cursor-pointer rounded-lg transition-transform ${
         isValidTarget
           ? CASTABLE_AFFORDANCE_ACTIVE
+          : canDelve
+            ? "ring-2 ring-cyan-400 shadow-[0_0_14px_4px_rgba(34,211,238,0.55)]"
           : canCast
-            ? CASTABLE_AFFORDANCE_IDLE
+            ? "hover:scale-[1.03]"
             : "hover:ring-1 hover:ring-white/20"
       }`}
-      data-card-hover
+      title={canCast && !isValidTarget ? castTitle : undefined}
       {...hoverProps(obj.id)}
       onClick={handleClick}
       {...longPressHandlers}
     >
-      <CardImage cardName={obj.name} size="normal" />
+      {/* Resolve the image via the engine's printed_ref (oracle_id + face)
+          like every other object-rendering modal — name-only lookup fails for
+          DFC / transformed / back-face cards (e.g. a transformed planeswalker),
+          which then falls back to the broken-image div. In the zone strip that
+          fallback is sized up to ~560px, so a failed image rendered "huge" with
+          text instead of art. `faceDown` overrides all of that with the shared
+          card-back placeholder (CardImage.tsx) whenever this viewer has no
+          look-permission on a face-down exile (see `hiddenFromViewer` above) —
+          it must NOT be the raw `obj.face_down`, which is also true for the
+          legitimate Hideaway/Foretell controller who the engine intends to
+          let see the real card. */}
+      <CardImage {...objectImageProps(obj)} size="normal" faceDown={hiddenFromViewer} />
       {canCast && !isValidTarget && (
-        <div className="mt-1 flex flex-col gap-1">
-          {castActions.map((action, i) => {
-            const { label } = abilityChoiceLabel(action, obj);
-            return (
-              <button
-                key={i}
-                onClick={() => onCast(action)}
-                className="w-full rounded-md bg-amber-600/80 px-2 py-1 text-xs font-semibold text-white transition hover:bg-amber-500"
-              >
-                {label}
-              </button>
-            );
-          })}
-        </div>
+        <>
+          {/* Arena-style purple "playable" affordance — same treatment as the
+              ZoneHand castable stack, replacing the per-card "Cast/Play" button
+              so castable cards keep their natural size. pointer-events-none lets
+              clicks fall through to the card's own onClick (handleCast). */}
+          <div className="pointer-events-none absolute inset-0 rounded-lg bg-purple-600/30 transition-colors group-hover:bg-purple-600/10" />
+          <div className="pointer-events-none absolute inset-0 rounded-lg ring-2 ring-purple-400/70 shadow-[0_0_12px_3px_rgba(147,51,234,0.5)]" />
+        </>
       )}
     </div>
   );

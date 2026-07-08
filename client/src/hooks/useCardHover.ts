@@ -1,6 +1,7 @@
 import { useCallback } from "react";
 
 import { useLongPress } from "./useLongPress.ts";
+import { useCanHover } from "./useCanHover.ts";
 import { useIsMobile } from "./useIsMobile.ts";
 import { useUiStore } from "../stores/uiStore.ts";
 
@@ -18,11 +19,15 @@ export function useCardHover(objectId: number | null) {
   const inspectObject = useUiStore((s) => s.inspectObject);
   const setPreviewSticky = useUiStore((s) => s.setPreviewSticky);
   const isMobile = useIsMobile();
+  const canHover = useCanHover();
 
   const { handlers: longPressHandlers, firedRef } = useLongPress(
     useCallback(() => {
       if (objectId != null) {
-        inspectObject(objectId);
+        // Long-press is an explicit-intent gesture (already a 400ms hold), so it
+        // bypasses the configurable hover latency and shows the sticky preview now
+        // — and setting it synchronously avoids orphaning previewSticky.
+        inspectObject(objectId, undefined, "immediate");
         setPreviewSticky(true);
       }
     }, [inspectObject, setPreviewSticky, objectId]),
@@ -36,7 +41,7 @@ export function useCardHover(objectId: number | null) {
     inspectObject(null);
   }, [inspectObject]);
 
-  // On mobile, skip mouse events — synthesized mouseenter from touch fires
+  // On touch-only devices, skip mouse events — synthesized mouseenter from touch fires
   // the preview every time the user touches a card, creating an
   // un-dismissable loop. Long-press is the only mobile preview trigger.
   //
@@ -46,7 +51,7 @@ export function useCardHover(objectId: number | null) {
   // useCardHover consumer is tagged by construction, so new callsites can't
   // silently regress the invariant by forgetting the manual annotation.
   return {
-    handlers: isMobile
+    handlers: isMobile || !canHover
       ? { ...longPressHandlers, "data-card-hover": true }
       : { onMouseEnter, onMouseLeave, ...longPressHandlers, "data-card-hover": true },
     firedRef,

@@ -1,13 +1,13 @@
 use crate::game::effects::destroy::{self, DestroyOutcome};
 use crate::game::static_abilities::{check_static_ability, StaticCheckContext};
 use crate::game::targeting;
-use crate::game::zones;
+use crate::game::zone_pipeline::{self, ZoneMoveRequest, ZoneMoveResult};
 use crate::types::ability::{
     CounterSourceRider, Duration, Effect, EffectError, EffectKind, ResolvedAbility,
-    StaticDefinition, TargetFilter, TargetRef,
+    SpellStackToGraveyardReplacement, StaticDefinition, TargetFilter, TargetRef,
 };
 use crate::types::events::GameEvent;
-use crate::types::game_state::{GameState, StackEntryKind};
+use crate::types::game_state::{CastingVariant, GameState, StackEntryKind};
 use crate::types::identifiers::ObjectId;
 use crate::types::statics::StaticMode;
 use crate::types::zones::Zone;
@@ -38,6 +38,18 @@ pub fn resolve(
 ) -> Result<(), EffectError> {
     let source_rider = match &ability.effect {
         Effect::Counter { source_rider, .. } => source_rider.clone(),
+        _ => None,
+    };
+
+    // CR 701.6a + CR 614.1a: "if that spell is countered this way, put it
+    // <zone> instead of into that player's graveyard" — a destination redirect
+    // on the countered *spell* (Memory Lapse, Remand, Spell Crumple). `None`
+    // keeps the default CR 701.6a graveyard rule.
+    let countered_spell_zone = match &ability.effect {
+        Effect::Counter {
+            countered_spell_zone,
+            ..
+        } => countered_spell_zone.clone(),
         _ => None,
     };
 
@@ -117,26 +129,96 @@ pub fn resolve(
                 // Aftermath, and Harmonize exile when leaving the stack for
                 // any reason, including when countered. Escape (CR 702.138)
                 // has no such clause — countered escape spells go to graveyard.
-                let exiles_on_counter = match &state.stack[idx].kind {
+                let casting_variant = match &state.stack[idx].kind {
                     StackEntryKind::Spell {
                         casting_variant, ..
-                    } => casting_variant.replaces_stack_to_graveyard_with_exile(),
-                    _ => false,
+                    } => *casting_variant,
+                    _ => CastingVariant::Normal,
                 };
+                let exiles_on_counter = casting_variant.replaces_stack_to_graveyard_with_exile();
                 let source_permanent_id = state.stack[idx].source_id;
                 let removed_entry_id = state.stack[idx].id;
                 state.stack.remove(idx);
                 state.stack_paid_facts.remove(&removed_entry_id);
 
+                // CR 701.6a: removal from the stack IS the counter; emit the
+                // event now (before the consequent zone move) so a pause on a
+                // graveyard-redirect during delivery does not drop it.
+                events.push(GameEvent::SpellCountered {
+                    object_id: obj_id,
+                    countered_by: ability.source_id,
+                    countered_by_controller: ability.controller,
+                });
+
                 if is_spell {
-                    // CR 608.2b: Countered spells go to graveyard, unless cast via an
-                    // alt-cost keyword that exiles on leaving the stack (Flashback, Harmonize).
-                    let dest = if exiles_on_counter {
+                    // CR 701.6a: A countered spell is put into its owner's
+                    // graveyard — unless cast via an alt-cost keyword that
+                    // exiles on leaving the stack (Flashback, Harmonize), or
+                    // the counter ability carries a CR 614.1a "exile it instead
+                    // of putting it into its owner's graveyard" rider (Force
+                    // of Negation, No More Lies, Defabricate).
+                    // CR 702.34a / CR 702.127a / CR 702.180a: the exile destination
+                    // is a static destination rule (not a replacement), so it is
+                    // selected here, before the pipeline consult.
+                    let exile_instead_of_graveyard_on_counter = ability
+                        .sub_ability
+                        .as_deref()
+                        .is_some_and(super::cast_from_zone::is_graveyard_exile_rider_subability);
+                    // CR 701.6a + CR 614.1a: choose the countered spell's
+                    // destination. Exile precedence (alt-cost keyword exile-on-
+                    // stack-exit, or the graveyard-exile sub-ability rider) wins
+                    // over the library/hand redirect, which itself wins over the
+                    // default graveyard rule. `library_position` carries the
+                    // top/bottom placement so the pipeline routes through
+                    // `move_to_library_at_index` (no auto-shuffle).
+                    let mut library_position = None;
+                    let dest = if exiles_on_counter || exile_instead_of_graveyard_on_counter {
                         Zone::Exile
                     } else {
-                        Zone::Graveyard
+                        match &countered_spell_zone {
+                            Some(SpellStackToGraveyardReplacement::Hand) => Zone::Hand,
+                            Some(SpellStackToGraveyardReplacement::Library { position }) => {
+                                library_position = Some(position.clone());
+                                Zone::Library
+                            }
+                            // CR 614.1a: `Exile` is a member of the shared
+                            // destination type (cast-this-way rider), but the
+                            // COUNTER parser never emits it — exile-on-counter is
+                            // handled by the `exile_instead_of_graveyard_on_counter`
+                            // branch above, so reaching here would mean a redundant
+                            // (not double) exile. Kept as an explicit arm to keep
+                            // the match exhaustive without a wildcard.
+                            Some(SpellStackToGraveyardReplacement::Exile) => Zone::Exile,
+                            None => Zone::Graveyard,
+                        }
                     };
-                    zones::move_to_zone(state, obj_id, dest, events);
+                    if casting_variant.restores_front_face_after_stack_exit() {
+                        super::super::stack::restore_alternative_spell_normal_face(state, obj_id);
+                    }
+                    // CR 701.6a + CR 614.6: route the stack -> graveyard/exile
+                    // move through the zone-change pipeline so `Moved` redirects
+                    // ("if a card would be put into a graveyard from anywhere,
+                    // exile it instead" — Rest in Peace / Leyline of the Void)
+                    // fire on the countered spell. The raw `move_to_zone` never
+                    // proposed the inner ZoneChange, silently dropping those
+                    // redirects (PLAN §8 Risk #3 — confirmed bug). A CR 616.1
+                    // ordering choice (two simultaneous redirects) is parked by
+                    // `move_object` itself (centralized park at its
+                    // `replace_event` NeedsChoice arm); the spell is already off
+                    // the stack (countered), so bail before `EffectResolved` and
+                    // let the replacement-choice resume path deliver it.
+                    let mut req = ZoneMoveRequest::effect(obj_id, dest, ability.source_id);
+                    if let Some(position) = library_position {
+                        // CR 701.6a + CR 614.1a: place at the named library
+                        // position (Memory Lapse top / Spell Crumple bottom)
+                        // rather than shuffling in.
+                        req = req.at_library_position(position);
+                    }
+                    match zone_pipeline::move_object(state, req, events) {
+                        ZoneMoveResult::Done => {}
+                        ZoneMoveResult::NeedsChoice(_)
+                        | ZoneMoveResult::NeedsAuraAttachmentChoice => return Ok(()),
+                    }
                 } else {
                     // CR 110.1 / CR 701.8a: An ability was countered, so its
                     // source is a permanent the rider can act on. Defer the
@@ -144,11 +226,6 @@ pub fn resolve(
                     // any WaitingFor a replacement choice may set.
                     countered_ability_source = Some(source_permanent_id);
                 }
-
-                events.push(GameEvent::SpellCountered {
-                    object_id: obj_id,
-                    countered_by: ability.source_id,
-                });
             }
         }
     }
@@ -275,33 +352,59 @@ pub fn resolve_all(
         // CR 702.34a / CR 702.127a / CR 702.180a: Flashback / Aftermath /
         // Harmonize exile on leaving the stack for any reason, including
         // counter. Escape (CR 702.138) has no such clause.
-        let exiles_on_counter = match &state.stack[idx].kind {
+        let casting_variant = match &state.stack[idx].kind {
             StackEntryKind::Spell {
                 casting_variant, ..
-            } => casting_variant.replaces_stack_to_graveyard_with_exile(),
-            _ => false,
+            } => *casting_variant,
+            _ => CastingVariant::Normal,
         };
+        let exiles_on_counter = casting_variant.replaces_stack_to_graveyard_with_exile();
         let removed_entry_id = state.stack[idx].id;
         state.stack.remove(idx);
         state.stack_paid_facts.remove(&removed_entry_id);
 
+        // CR 701.6a: removal from the stack IS the counter; emit the event
+        // before any consequent zone move.
+        events.push(GameEvent::SpellCountered {
+            object_id: obj_id,
+            countered_by: ability.source_id,
+            countered_by_controller: ability.controller,
+        });
+
         if is_spell {
-            // CR 608.2b: Countered spells go to graveyard, unless cast via an
-            // alt-cost keyword that exiles on leaving the stack.
+            // CR 701.6a: A countered spell is put into its owner's graveyard —
+            // unless cast via an alt-cost keyword that exiles on leaving the stack.
             let dest = if exiles_on_counter {
                 Zone::Exile
             } else {
                 Zone::Graveyard
             };
-            zones::move_to_zone(state, obj_id, dest, events);
+            if casting_variant.restores_front_face_after_stack_exit() {
+                super::super::stack::restore_alternative_spell_normal_face(state, obj_id);
+            }
+            // CR 701.6a + CR 614.6: route through the pipeline so graveyard
+            // redirects (Rest in Peace / Leyline of the Void) fire — same
+            // bug-fix as the single-target path (PLAN §8 Risk #3). A single
+            // applicable redirect never prompts; only two simultaneous
+            // redirects produce a CR 616.1 ordering choice, which `move_object`
+            // parks (centralized park). Bail on the parked pause: the paused
+            // spell delivers via the replacement-choice resume path, but stack
+            // entries after it in this mass counter are not yet processed and
+            // are abandoned — the destination varies per spell
+            // (exiles_on_counter), so the single-destination
+            // `PendingBatchDeliveries` continuation does not fit; no parsed
+            // card combines mass counter with a double graveyard redirect, so
+            // this residual gap is documented rather than built for.
+            let req = ZoneMoveRequest::effect(obj_id, dest, ability.source_id);
+            match zone_pipeline::move_object(state, req, events) {
+                ZoneMoveResult::Done => {}
+                ZoneMoveResult::NeedsChoice(_) | ZoneMoveResult::NeedsAuraAttachmentChoice => {
+                    return Ok(())
+                }
+            }
         }
         // For abilities, removing the stack entry above is sufficient — they
         // aren't cards and have no zone to move to.
-
-        events.push(GameEvent::SpellCountered {
-            object_id: obj_id,
-            countered_by: ability.source_id,
-        });
     }
 
     events.push(GameEvent::EffectResolved {
@@ -360,6 +463,112 @@ mod tests {
     use crate::types::player::PlayerId;
     use crate::types::statics::StaticMode;
 
+    /// CR 614.6: a graveyard→exile `Moved` redirect (Rest in Peace / Leyline of
+    /// the Void class): "if a card would be put into a graveyard from anywhere,
+    /// exile it instead."
+    fn graveyard_exile_redirect() -> crate::types::ability::ReplacementDefinition {
+        use crate::types::ability::{AbilityDefinition, AbilityKind, ReplacementDefinition};
+        use crate::types::replacements::ReplacementEvent;
+        use crate::types::zones::EtbTapState;
+        ReplacementDefinition::new(ReplacementEvent::Moved)
+            .destination_zone(Zone::Graveyard)
+            .execute(AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::ChangeZone {
+                    destination: Zone::Exile,
+                    origin: None,
+                    target: TargetFilter::SelfRef,
+                    owner_library: false,
+                    enter_transformed: false,
+                    enters_under: None,
+                    enter_tapped: EtbTapState::Unspecified,
+                    enters_attacking: false,
+                    up_to: false,
+                    enter_with_counters: vec![],
+                    conditional_enter_with_counters: vec![],
+                    face_down_profile: None,
+                    enters_modified_if: None,
+                },
+            ))
+            .description("If a card would be put into a graveyard, exile it instead.".to_string())
+    }
+
+    /// C3 discriminating test (PLAN §8 Risk #3): a countered spell now leaves the
+    /// stack through the zone-change pipeline, so a graveyard→exile `Moved`
+    /// redirect (Rest in Peace) fires on it — the countered spell ends in EXILE,
+    /// not the graveyard.
+    ///
+    /// FAILS on the pre-C3 raw `move_to_zone(state, obj_id, Zone::Graveyard, ..)`
+    /// delivery: that never proposed the inner ZoneChange, so the redirect was
+    /// silently dropped and the spell reached the graveyard.
+    #[test]
+    fn countered_spell_honors_rest_in_peace_graveyard_to_exile_redirect() {
+        let mut state = GameState::new_two_player(42);
+
+        // Rest in Peace on the battlefield: a global graveyard→exile redirect.
+        let rip = create_object(
+            &mut state,
+            CardId(500),
+            PlayerId(0),
+            "Rest in Peace".to_string(),
+            Zone::Battlefield,
+        );
+        state.objects.get_mut(&rip).unwrap().replacement_definitions =
+            vec![graveyard_exile_redirect()].into();
+
+        let obj_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(1),
+            "Doomed Spell".to_string(),
+            Zone::Stack,
+        );
+        state.stack.push_back(StackEntry {
+            id: obj_id,
+            source_id: obj_id,
+            controller: PlayerId(1),
+            kind: StackEntryKind::Spell {
+                card_id: CardId(1),
+                ability: None,
+                casting_variant: CastingVariant::Normal,
+                actual_mana_spent: 0,
+            },
+        });
+
+        let ability = ResolvedAbility::new(
+            Effect::Counter {
+                target: TargetFilter::Any,
+                source_rider: None,
+                countered_spell_zone: None,
+            },
+            vec![TargetRef::Object(obj_id)],
+            ObjectId(100),
+            PlayerId(0),
+        );
+        let mut events = Vec::new();
+
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        assert!(state.stack.is_empty(), "spell countered (off the stack)");
+        // The discriminating assertions: the redirect sent it to exile, NOT the
+        // graveyard.
+        assert_eq!(
+            state.objects[&obj_id].zone,
+            Zone::Exile,
+            "Rest in Peace must redirect the countered spell to exile"
+        );
+        assert!(
+            !state.players[1].graveyard.contains(&obj_id),
+            "the countered spell must NOT reach the graveyard under Rest in Peace"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, GameEvent::SpellCountered { .. })),
+            "a SpellCountered event must still fire"
+        );
+    }
+
     #[test]
     fn counter_removes_from_stack_and_moves_to_graveyard() {
         let mut state = GameState::new_two_player(42);
@@ -386,6 +595,7 @@ mod tests {
             Effect::Counter {
                 target: TargetFilter::Any,
                 source_rider: None,
+                countered_spell_zone: None,
             },
             vec![TargetRef::Object(obj_id)],
             ObjectId(100),
@@ -433,6 +643,7 @@ mod tests {
             Effect::Counter {
                 target: TargetFilter::Any,
                 source_rider: None,
+                countered_spell_zone: None,
             },
             vec![TargetRef::Object(obj_id)],
             ObjectId(100),
@@ -444,6 +655,68 @@ mod tests {
 
         assert!(state.stack.is_empty());
         assert!(state.exile.contains(&obj_id));
+        assert!(!state.players[1].graveyard.contains(&obj_id));
+    }
+
+    #[test]
+    fn counter_exile_rider_exiles_countered_spell_without_graveyard() {
+        let mut state = GameState::new_two_player(42);
+        let obj_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(1),
+            "Countered Spell".to_string(),
+            Zone::Stack,
+        );
+        state.stack.push_back(StackEntry {
+            id: obj_id,
+            source_id: obj_id,
+            controller: PlayerId(1),
+            kind: StackEntryKind::Spell {
+                card_id: CardId(1),
+                ability: None,
+                casting_variant: CastingVariant::Normal,
+                actual_mana_spent: 0,
+            },
+        });
+
+        let exile_rider = ResolvedAbility::new(
+            Effect::ChangeZone {
+                destination: Zone::Exile,
+                origin: Some(Zone::Graveyard),
+                target: TargetFilter::ParentTarget,
+                owner_library: false,
+                enter_transformed: false,
+                enters_under: None,
+                enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+                enters_attacking: false,
+                up_to: false,
+                enter_with_counters: vec![],
+                conditional_enter_with_counters: vec![],
+                face_down_profile: None,
+                enters_modified_if: None,
+            },
+            vec![],
+            ObjectId(100),
+            PlayerId(0),
+        );
+        let mut ability = ResolvedAbility::new(
+            Effect::Counter {
+                target: TargetFilter::Any,
+                source_rider: None,
+                countered_spell_zone: None,
+            },
+            vec![TargetRef::Object(obj_id)],
+            ObjectId(100),
+            PlayerId(0),
+        );
+        ability.sub_ability = Some(Box::new(exile_rider));
+        let mut events = Vec::new();
+
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        assert!(state.stack.is_empty());
+        assert_eq!(state.objects[&obj_id].zone, Zone::Exile);
         assert!(!state.players[1].graveyard.contains(&obj_id));
     }
 
@@ -480,6 +753,7 @@ mod tests {
             Effect::Counter {
                 target: TargetFilter::Any,
                 source_rider: None,
+                countered_spell_zone: None,
             },
             vec![TargetRef::Object(obj_id)],
             ObjectId(100),
@@ -540,6 +814,7 @@ mod tests {
                 description: None,
                 source_name: String::new(),
                 subject_match_count: None,
+                die_result: None,
             },
         });
 
@@ -548,10 +823,15 @@ mod tests {
 
         let counter_ability = ResolvedAbility::new(
             Effect::Counter {
-                target: TargetFilter::StackAbility { controller: None },
+                target: TargetFilter::StackAbility {
+                    controller: None,
+                    tag: None,
+                    kind: None,
+                },
                 source_rider: Some(CounterSourceRider::LosesAbilities {
                     static_def: Box::new(source_static),
                 }),
+                countered_spell_zone: None,
             },
             vec![TargetRef::Object(ability_on_stack)],
             tidebinder,
@@ -632,6 +912,7 @@ mod tests {
                 source_rider: Some(CounterSourceRider::LosesAbilities {
                     static_def: Box::new(source_static),
                 }),
+                countered_spell_zone: None,
             },
             vec![TargetRef::Object(spell_id)],
             tidebinder,
@@ -694,13 +975,19 @@ mod tests {
                 description: None,
                 source_name: String::new(),
                 subject_match_count: None,
+                die_result: None,
             },
         });
 
         let counter_ability = ResolvedAbility::new(
             Effect::Counter {
-                target: TargetFilter::StackAbility { controller: None },
+                target: TargetFilter::StackAbility {
+                    controller: None,
+                    tag: None,
+                    kind: None,
+                },
                 source_rider: Some(CounterSourceRider::Destroy),
+                countered_spell_zone: None,
             },
             vec![TargetRef::Object(ability_on_stack)],
             counter_source,
@@ -784,6 +1071,7 @@ mod tests {
             Effect::Counter {
                 target: TargetFilter::Any,
                 source_rider: Some(CounterSourceRider::Destroy),
+                countered_spell_zone: None,
             },
             vec![TargetRef::Object(spell_id)],
             counter_source,
@@ -837,6 +1125,7 @@ mod tests {
             Effect::Counter {
                 target: TargetFilter::Any,
                 source_rider: None,
+                countered_spell_zone: None,
             },
             vec![TargetRef::Object(obj_id)],
             ObjectId(100),
@@ -851,6 +1140,52 @@ mod tests {
             state.objects[&obj_id].zone,
             Zone::Exile,
             "Flashback spell should be exiled when countered"
+        );
+    }
+
+    #[test]
+    fn jumpstart_spell_exiles_when_countered() {
+        let mut state = GameState::new_two_player(42);
+        let obj_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(1),
+            "Jump-start Spell".to_string(),
+            Zone::Stack,
+        );
+        state.stack.push_back(StackEntry {
+            id: obj_id,
+            source_id: obj_id,
+            controller: PlayerId(1),
+            kind: StackEntryKind::Spell {
+                card_id: CardId(1),
+                ability: None,
+                casting_variant: CastingVariant::JumpStart,
+                actual_mana_spent: 0,
+            },
+        });
+
+        let counter_ability = ResolvedAbility::new(
+            Effect::Counter {
+                target: TargetFilter::Any,
+                source_rider: None,
+                countered_spell_zone: None,
+            },
+            vec![TargetRef::Object(obj_id)],
+            ObjectId(100),
+            PlayerId(0),
+        );
+
+        let mut events = Vec::new();
+        resolve(&mut state, &counter_ability, &mut events).unwrap();
+
+        // CR 702.133a: "exile this card instead of putting it anywhere else any
+        // time it would leave the stack" — a countered jump-started spell exiles,
+        // it does not go to the graveyard.
+        assert_eq!(
+            state.objects[&obj_id].zone,
+            Zone::Exile,
+            "Jump-start spell should be exiled when countered, not put in the graveyard"
         );
     }
 
@@ -890,6 +1225,7 @@ mod tests {
             Effect::Counter {
                 target: TargetFilter::Any,
                 source_rider: None,
+                countered_spell_zone: None,
             },
             vec![TargetRef::Object(obj_id)],
             ObjectId(100),
@@ -985,6 +1321,7 @@ mod tests {
                 description: None,
                 source_name: String::new(),
                 subject_match_count: None,
+                die_result: None,
             },
         });
 
@@ -1121,7 +1458,7 @@ mod tests {
 
     /// CR 113.3 + CR 405.1: "Counter all abilities" — the resolver matches
     /// every activated/triggered ability on the stack, including keyword actions, via
-    /// `TargetFilter::StackAbility { controller: None }` and removes the entry without moving any
+    /// `TargetFilter::StackAbility { controller: None, tag: None, kind: None }` and removes the entry without moving any
     /// card to a graveyard (abilities aren't cards).
     #[test]
     fn test_counter_all_abilities_removes_ability_entries() {
@@ -1168,6 +1505,7 @@ mod tests {
                     description: None,
                     source_name: String::new(),
                     subject_match_count: None,
+                    die_result: None,
                 },
             });
         }
@@ -1213,7 +1551,11 @@ mod tests {
 
         let ability = ResolvedAbility::new(
             Effect::CounterAll {
-                target: TargetFilter::StackAbility { controller: None },
+                target: TargetFilter::StackAbility {
+                    controller: None,
+                    tag: None,
+                    kind: None,
+                },
             },
             vec![],
             ObjectId(999),
@@ -1281,6 +1623,7 @@ mod tests {
                     description: None,
                     source_name: String::new(),
                     subject_match_count: None,
+                    die_result: None,
                 },
             });
         }
@@ -1289,6 +1632,8 @@ mod tests {
             Effect::CounterAll {
                 target: TargetFilter::StackAbility {
                     controller: Some(ControllerRef::Opponent),
+                    tag: None,
+                    kind: None,
                 },
             },
             vec![],

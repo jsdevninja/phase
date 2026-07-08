@@ -2,6 +2,7 @@ import type {
   GameFormat,
   TokenCharacteristics,
   TokenImageRef,
+  TokenPtProvenance,
 } from "../adapter/types";
 import {
   buildLocalSearchCard,
@@ -217,6 +218,43 @@ export async function isCardCommanderEligibleForFormat(
 }
 
 /**
+ * CR 702.124: Of `candidates`, which can legally pair with `firstCommander` as a
+ * co-commander? The engine is the single authority for the partner family
+ * (Partner, Partner with [Name], Friends Forever, Character Select, Doctor's
+ * Companion, Choose a Background) — the frontend never re-derives these rules.
+ */
+export async function commanderPartnerCandidates(
+  firstCommander: string,
+  candidates: string[],
+): Promise<string[]> {
+  await ensureCardDatabase();
+  const engine = await loadEngineModule();
+  return engine.commanderPartnerCandidates(firstCommander, candidates) as string[];
+}
+
+/**
+ * CR 100.2a / CR 903.5b: A card's per-card deck-construction copy-limit override
+ * as a discriminated union, or `null` when the default four-of / singleton limit
+ * applies. `Unlimited` is a unit variant with no `data` field — switch on `type`,
+ * never destructure `data` unconditionally. The engine is the single authority;
+ * the frontend never re-parses Oracle text.
+ */
+export type DeckCopyLimit =
+  | { type: "Unlimited" }
+  | { type: "UpTo"; data: number };
+
+/**
+ * Query the engine for a card's deck-construction copy-limit override. Returns
+ * `null` when the format-default limit applies. The frontend must not infer
+ * this from Oracle text — the engine owns the rule.
+ */
+export async function deckCopyLimit(name: string): Promise<DeckCopyLimit | null> {
+  await ensureCardDatabase();
+  const engine = await loadEngineModule();
+  return engine.deckCopyLimit(name) as DeckCopyLimit | null;
+}
+
+/**
  * CR 100.4a: Per-format sideboard policy as a discriminated union.
  *
  * `Forbidden` and `Unlimited` are unit variants and do not carry a `data`
@@ -272,6 +310,7 @@ export interface TokenPreset {
   id: string;
   category: TokenCategory;
   fidelity: PresetFidelity;
+  pt_provenance?: TokenPtProvenance;
   body: TokenCharacteristics;
   source_card_names?: string[];
   source_card_refs?: Array<{

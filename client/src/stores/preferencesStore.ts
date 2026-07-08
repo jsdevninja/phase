@@ -1,8 +1,9 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
 
-import type { GameFormat, MatchType, Phase } from "../adapter/types";
+import type { GameFormat, MatchType, PhaseStop } from "../adapter/types";
 import type { CommanderBracket } from "../types/bracket";
+import type { SortKey } from "../components/modal/cardChoice/gridSelection";
 import {
   ANIMATION_SPEED_DEFAULT,
   ANIMATION_SPEED_MAX,
@@ -50,9 +51,38 @@ export interface CardArtOverride {
 }
 
 export type CardSizePreference = "small" | "medium" | "large";
+/** How the hover card-preview behaves on desktop.
+ *  "follow" = the preview tracks the cursor (prior fixed behavior, default).
+ *  "side"   = the preview docks to the screen edge so it never covers the board.
+ *  "shift"  = the preview only appears while the Shift key is held (Tabletop
+ *             Simulator style), letting the player read the board uninterrupted. */
+export type CardPreviewMode = "follow" | "side" | "shift";
+/** Card-preview hover latency bounds (milliseconds). `0` = instant (the
+ *  default — the preview appears the moment the cursor lands on a card). The
+ *  upper bound keeps the slider meaningful; a delay longer than ~1s defeats the
+ *  purpose of an at-a-glance preview. Only applies to the hover-driven preview
+ *  modes ("follow"/"side"); the "shift" bind-key mode shows immediately on
+ *  keypress, so the latency is mutually exclusive with it. */
+export const CARD_PREVIEW_HOVER_DELAY_MIN = 0;
+export const CARD_PREVIEW_HOVER_DELAY_MAX = 1000;
+export const CARD_PREVIEW_HOVER_DELAY_STEP = 50;
 export type HudLayout = "inline" | "floating";
 export type LogDefaultState = "open" | "closed";
 export type BattlefieldCardDisplay = "art_crop" | "full_card";
+/** How the command zone (commander card, tax, emblems, commander damage) is laid
+ *  out. "inline" = a bounded always-visible corner dock; "compact" = a collapsed
+ *  pile that expands to a popover on hover; "auto" = pick by viewport at use-site
+ *  (compact on short/narrow screens, inline otherwise). Resolved via
+ *  {@link useResolvedCommandZoneDisplay}, mirroring the `boardBackground`
+ *  "auto-wubrg" resolve-at-use-site precedent. */
+export type CommandZoneDisplay = "compact" | "inline" | "auto";
+/** Whether a battlefield sub-row (lands / support) collapses into its summary
+ *  tile. "auto" = collapse once the row exceeds the crowding threshold (the
+ *  prior fixed behavior); "on" = always collapse into the tile; "off" = never
+ *  collapse (always show the full row). Resolved at the use-site in
+ *  {@link BattlefieldZoneOverflow}, mirroring the `commandZoneDisplay`
+ *  tri-state "auto" precedent. Lands and support each carry their own value. */
+export type ZoneCollapseMode = "auto" | "on" | "off";
 export type TapRotation = "mtga" | "classic";
 export type SpellPaymentMode = "auto" | "manual";
 /** Which screen edge the resolving-stack panel docks to (and collapses toward).
@@ -64,12 +94,139 @@ export type StackDockSide = "left" | "right";
  *  a single thin row (small avatar + name + life) that trades the breakdown for
  *  vertical real-estate. Player-toggleable from the rail. */
 export type OpponentHudDensity = "comfortable" | "compact";
+export type MultiplayerBoardLayout = "focused" | "split";
 /** "auto-wubrg" picks a random battlefield matching the dominant mana color.
  *  "random" picks a random battlefield each game regardless of color.
  *  "none" disables the background image.
  *  "custom" uses the URL stored in `customBackgroundUrl`.
  *  Any other string is a battlefield or plain-color ID. */
 export type BoardBackground = "auto-wubrg" | "random" | "none" | "custom" | (string & {});
+
+// ── Flex layout ──────────────────────────────────────────────────────────────
+/** A pixel delta from a widget's docked default position. The *absence* of an
+ *  entry means the widget sits exactly where it does today, so a fresh store and
+ *  every legacy store render byte-identically (zero-regression default). */
+export interface WidgetOffset {
+  dx: number;
+  dy: number;
+}
+/** Draggable widgets whose position is shared across all table sizes. The
+ *  opponent HUD is intentionally absent here — it's the one element whose
+ *  structure differs by table size, so it's keyed separately (see
+ *  {@link FlexTableSize}). */
+export type FlexWidgetKey =
+  | "playerHud"
+  | "stackPanel"
+  | "logPanel"
+  | "actionRail"
+  | "playerPiles"
+  | "opponentPiles";
+/** The three reorderable cells of the battlefield middle row. Stored as an
+ *  order so the user can permute them (drag-to-reorder); flexbox reflows. */
+export type MiddleCell = "lands" | "support" | "command";
+/** Default left-to-right order — reproduces today's lands · support · command. */
+export const DEFAULT_MIDDLE_ROW_ORDER: readonly MiddleCell[] = ["lands", "support", "command"];
+/** Table sizes the opponent HUD position is keyed by: 1v1 renders a single pill,
+ *  multiplayer a tab strip, so a shared offset wouldn't fit both. */
+export type FlexTableSize = "oneVsOne" | "multiplayer";
+/** A board grid row capped at `min(pct%, pxCap px)` — mirrors today's
+ *  `minmax(0,min(12%,100px))` track. The middle (battlefield) row is always
+ *  `1fr` and absorbs the remainder, so only the top/bottom bands are stored. */
+export interface CappedTrack {
+  pct: number;
+  pxCap: number;
+}
+export interface GridBands {
+  top: CappedTrack;
+  bottom: CappedTrack;
+}
+/** Preset ids are intentionally neutral ("Layout N"): the alternative layouts
+ *  carry no principled design rationale, so naming them by use-case ("Streamer")
+ *  would overclaim. `default` is load-bearing — it is the {@link defaultFlexLayout}
+ *  seed and the Reset target — so only the two editorial slots are neutralized. */
+export type FlexPresetId = "default" | "layout2" | "layout3" | "custom";
+/** An aspect-preserving size multiplier. Two flavours share one map:
+ *  content-scales — `stack` (the stack's cards, over the viewport
+ *  `responsiveScale`) and `summaryTile` (the collapsed lands/support overflow
+ *  pills) — and widget box-scales — `actionRail` and `playerPiles` — applied as
+ *  a `transform: scale()` on the whole `DraggableWidget`. Absent ⇒ 1. */
+export type FlexScaleKey = "stack" | "summaryTile" | "actionRail" | "playerPiles";
+/** Content alignment within a middle-row cell — maps to flexbox `justify-*`. */
+export type CellAlign = "start" | "center" | "end";
+/** Per-cell default alignment, reproducing the prior hardcoded layout: lands hug
+ *  the left, support the right, command centered. Absent key ⇒ this. */
+export const DEFAULT_CELL_ALIGN: Record<MiddleCell, CellAlign> = {
+  lands: "start",
+  support: "end",
+  command: "center",
+};
+/** Persisted board layout. One shared global config; only the opponent HUD is
+ *  table-size-keyed. Presets are authoritative — applying one replaces every
+ *  field wholesale. Any manual edit flips `activePreset` to "custom".
+ *
+ *  `landSupportRatio` and `scales` are optional so a config persisted before
+ *  they existed (or cloud-synced from an older client) reads as the neutral
+ *  default rather than `undefined`; consumers apply `?? 0.5` / `?? 1`. */
+export interface FlexLayoutConfig {
+  gridBands: GridBands;
+  /** Lands' share of the lands↔support middle row, 0..1. Support takes the
+   *  remainder (`1 - ratio`). Absent ⇒ 0.5 (the prior equal `flex-1` split). */
+  landSupportRatio?: number;
+  /** Left-to-right order of the middle-row cells. Absent ⇒
+   *  {@link DEFAULT_MIDDLE_ROW_ORDER} (lands · support · command). */
+  middleRowOrder?: MiddleCell[];
+  /** Per-zone aspect-preserving size multipliers. Absent key ⇒ 1.0. */
+  scales?: Partial<Record<FlexScaleKey, number>>;
+  /** Per-cell content alignment. Absent key ⇒ {@link DEFAULT_CELL_ALIGN}. */
+  cellAlign?: Partial<Record<MiddleCell, CellAlign>>;
+  widgets: Partial<Record<FlexWidgetKey, WidgetOffset>>;
+  opponentHudByTableSize: Partial<Record<FlexTableSize, WidgetOffset>>;
+  activePreset: FlexPresetId;
+}
+
+/** Neutral default for the lands↔support split — equal halves, matching the
+ *  prior hardcoded `flex-1` / `flex-1`. */
+export const DEFAULT_LAND_SUPPORT_RATIO = 0.5;
+
+/** Factory for the default layout. This IS the "default" preset baseline and the
+ *  reset target; `presets.ts` imports it rather than redefining it. The band
+ *  values reproduce today's desktop `gridTemplateRows` exactly (see
+ *  {@link useResolvedGridRows}). Returned as a function so nested objects are
+ *  never shared between the store and the defaults snapshot. */
+export function defaultFlexLayout(): FlexLayoutConfig {
+  return {
+    gridBands: { top: { pct: 12, pxCap: 100 }, bottom: { pct: 18, pxCap: 150 } },
+    landSupportRatio: DEFAULT_LAND_SUPPORT_RATIO,
+    middleRowOrder: [...DEFAULT_MIDDLE_ROW_ORDER],
+    scales: {},
+    cellAlign: {},
+    widgets: {},
+    opponentHudByTableSize: {},
+    activePreset: "default",
+  };
+}
+
+/** Deep-clone a layout config so applying a preset constant can never let a
+ *  later in-store mutation corrupt the shared preset object. */
+function cloneFlexLayout(config: FlexLayoutConfig): FlexLayoutConfig {
+  return {
+    gridBands: {
+      top: { ...config.gridBands.top },
+      bottom: { ...config.gridBands.bottom },
+    },
+    landSupportRatio: config.landSupportRatio,
+    middleRowOrder: config.middleRowOrder ? [...config.middleRowOrder] : undefined,
+    scales: { ...config.scales },
+    cellAlign: { ...config.cellAlign },
+    widgets: Object.fromEntries(
+      Object.entries(config.widgets).map(([k, v]) => [k, { ...v }]),
+    ),
+    opponentHudByTableSize: Object.fromEntries(
+      Object.entries(config.opponentHudByTableSize).map(([k, v]) => [k, { ...v }]),
+    ),
+    activePreset: config.activePreset,
+  };
+}
 
 function defaultAiSeat(): AiSeatPref {
   return { difficulty: DEFAULT_AI_DIFFICULTY, deckId: AI_DECK_RANDOM };
@@ -124,12 +281,21 @@ function buildDefaultPreferences(): PreferencesState {
     audioThemeId: "planeswalker",
     customThemeUrls: [],
     battlefieldCardDisplay: "art_crop",
+    collapsedFolderIds: [],
+    lastSeenChangelogId: undefined,
+    commandZoneDisplay: "auto",
+    collapseLands: "auto",
+    collapseSupport: "auto",
     tapRotation: "mtga",
     spellPaymentMode: "auto",
+    handSort: "none",
     showKeywordStrip: true,
     battlefieldPeekOnHover: true,
+    cardPreviewMode: "follow",
+    cardPreviewHoverDelayMs: 0,
     stackDockSide: "right",
     opponentHudDensity: "comfortable",
+    multiplayerBoardLayout: "focused",
     aiSeats: [defaultAiSeat()],
     cedhMode: false,
     aiArchetypeFilter: "Any",
@@ -140,8 +306,11 @@ function buildDefaultPreferences(): PreferencesState {
     lastPlayerCount: 2,
     dismissedFlowHelpNudge: false,
     dismissedSandboxToolsNudge: false,
+    dismissedReportCardNudge: false,
     artChain: [] as ArtChainEntry[],
     artOverrides: {} as Record<string, CardArtOverride>,
+    flexLayout: defaultFlexLayout(),
+    telemetryEnabled: true,
   };
 }
 
@@ -165,7 +334,7 @@ interface PreferencesState {
    *  for the full list. Each event's category is resolved via `eventCategory()`
    *  and the matching multiplier scales its base duration. */
   pacingMultipliers: Record<PacingCategory, number>;
-  phaseStops: Phase[];
+  phaseStops: PhaseStop[];
   masterVolume: number;
   sfxVolume: number;
   musicVolume: number;
@@ -175,17 +344,45 @@ interface PreferencesState {
   audioThemeId: string;
   customThemeUrls: Array<{ id: string; url: string }>;
   battlefieldCardDisplay: BattlefieldCardDisplay;
+  /** Ids of deck-library folders the user has collapsed (id present = collapsed).
+   * Also holds the sentinel ids for the virtual Starred/Unfiled sections. */
+  collapsedFolderIds: string[];
+  /** Highest changelog entry id the user has seen ("What's New" watermark).
+   * Undefined for first-run / freshly-upgraded users — the changelog hook
+   * silently seeds it to the current latest so they get no unread dot for
+   * entries that predate their first visit. */
+  lastSeenChangelogId?: number;
+  /** Command-zone layout mode (inline dock / compact pile / auto-by-viewport). */
+  commandZoneDisplay: CommandZoneDisplay;
+  /** Whether the lands sub-row collapses into its summary tile (auto/on/off). */
+  collapseLands: ZoneCollapseMode;
+  /** Whether the support sub-row collapses into its summary tile (auto/on/off). */
+  collapseSupport: ZoneCollapseMode;
   tapRotation: TapRotation;
   spellPaymentMode: SpellPaymentMode;
+  /** Persisted sort order for the player's own hand (display-only — never
+   *  reorders `player.hand`). Mirrors the discard grid's `SortKey`; defaults to
+   *  "none" (insertion order, the prior behavior). The hide-filter is kept
+   *  ephemeral per-game in `uiStore.handFilter`. */
+  handSort: SortKey;
   showKeywordStrip: boolean;
   /** When true, hovering an unfocused opponent's tab opens a small popover
    *  previewing that opponent's nonland permanents. Disable for a quieter
    *  HUD — focus is still reachable via tab click. */
   battlefieldPeekOnHover: boolean;
+  /** Desktop hover card-preview behavior — follow cursor, dock to the side, or
+   *  only show while Shift is held. See {@link CardPreviewMode}. */
+  cardPreviewMode: CardPreviewMode;
+  /** Latency (ms) before the hover preview appears in the "follow"/"side"
+   *  modes. `0` = instant (default). Ignored in "shift" mode, which is
+   *  keypress-triggered. See {@link CARD_PREVIEW_HOVER_DELAY_MAX}. */
+  cardPreviewHoverDelayMs: number;
   /** Screen edge the stack panel docks to and collapses toward. */
   stackDockSide: StackDockSide;
   /** Density of the multi-opponent HUD rail (comfortable two-row vs compact thin row). */
   opponentHudDensity: OpponentHudDensity;
+  /** Multiplayer board presentation: one focused opponent, or all opponent seats. */
+  multiplayerBoardLayout: MultiplayerBoardLayout;
   aiSeats: AiSeatPref[];
   /** Table-wide cEDH toggle. When true, every AI opponent plays at cEDH
    *  (bracket 5) regardless of its per-seat difficulty, and the AI/human deck
@@ -200,8 +397,17 @@ interface PreferencesState {
   lastPlayerCount: number;
   dismissedFlowHelpNudge: boolean;
   dismissedSandboxToolsNudge: boolean;
+  dismissedReportCardNudge: boolean;
   artChain: ArtChainEntry[];
   artOverrides: Record<string, CardArtOverride>;
+  /** Persisted board layout (grid bands + per-widget offsets + active preset).
+   *  See {@link FlexLayoutConfig}. Edited only in Flex Layout mode. */
+  flexLayout: FlexLayoutConfig;
+  /** Whether anonymous, identity-free crash & usage telemetry may be sent.
+   *  Default on. Gates every send at enqueue time so a mid-session toggle takes
+   *  effect immediately. Builds without a `__TELEMETRY_URL__` define never send
+   *  regardless. See `services/telemetry.ts`. */
+  telemetryEnabled: boolean;
 }
 
 interface PreferencesActions {
@@ -211,6 +417,7 @@ interface PreferencesActions {
   setFollowActiveOpponent: (enabled: boolean) => void;
   setStackDockSide: (side: StackDockSide) => void;
   setOpponentHudDensity: (density: OpponentHudDensity) => void;
+  setMultiplayerBoardLayout: (layout: MultiplayerBoardLayout) => void;
   setLogDefaultState: (state: LogDefaultState) => void;
   setBoardBackground: (bg: BoardBackground) => void;
   setCustomBackgroundUrl: (url: string) => void;
@@ -223,7 +430,7 @@ interface PreferencesActions {
    *  audio levels, board background — everything except persisted multiplayer
    *  reconnect state, which is owned by `multiplayerStore`. */
   resetAllPreferences: () => void;
-  setPhaseStops: (stops: Phase[]) => void;
+  setPhaseStops: (stops: PhaseStop[]) => void;
   setMasterVolume: (vol: number) => void;
   setSfxVolume: (vol: number) => void;
   setMusicVolume: (vol: number) => void;
@@ -234,10 +441,19 @@ interface PreferencesActions {
   addCustomThemeUrl: (id: string, url: string) => void;
   removeCustomThemeUrl: (id: string) => void;
   setBattlefieldCardDisplay: (display: BattlefieldCardDisplay) => void;
+  toggleFolderCollapsed: (id: string) => void;
+  setCollapsedFolderIds: (ids: string[]) => void;
+  setLastSeenChangelogId: (id: number) => void;
+  setCommandZoneDisplay: (display: CommandZoneDisplay) => void;
+  setCollapseLands: (mode: ZoneCollapseMode) => void;
+  setCollapseSupport: (mode: ZoneCollapseMode) => void;
   setTapRotation: (rotation: TapRotation) => void;
   setSpellPaymentMode: (mode: SpellPaymentMode) => void;
+  setHandSort: (sort: SortKey) => void;
   setShowKeywordStrip: (show: boolean) => void;
   setBattlefieldPeekOnHover: (enabled: boolean) => void;
+  setCardPreviewMode: (mode: CardPreviewMode) => void;
+  setCardPreviewHoverDelayMs: (ms: number) => void;
   setAiSeatDifficulty: (index: number, difficulty: AIDifficulty) => void;
   setAiSeatDeckId: (index: number, id: AiDeckSelection) => void;
   /** Grow or shrink `aiSeats` to `count` slots. New slots inherit defaults;
@@ -254,6 +470,7 @@ interface PreferencesActions {
   setLastPlayerCount: (count: number) => void;
   setDismissedFlowHelpNudge: (dismissed: boolean) => void;
   setDismissedSandboxToolsNudge: (dismissed: boolean) => void;
+  setDismissedReportCardNudge: (dismissed: boolean) => void;
   addArtChainEntry: (entry: ArtChainEntry) => void;
   removeArtChainEntry: (index: number) => void;
   moveArtChainEntry: (fromIndex: number, toIndex: number) => void;
@@ -261,6 +478,34 @@ interface PreferencesActions {
   setArtOverride: (oracleId: string, override: CardArtOverride) => void;
   clearArtOverride: (oracleId: string) => void;
   clearAllArtOverrides: () => void;
+  /** Resize one board grid band (top or bottom); the `1fr` middle absorbs the
+   *  change. Flips `activePreset` to "custom". */
+  setFlexBand: (side: "top" | "bottom", track: CappedTrack) => void;
+  /** Reposition a shared-global widget. Flips `activePreset` to "custom". */
+  setFlexWidgetOffset: (key: FlexWidgetKey, offset: WidgetOffset) => void;
+  /** Reposition the opponent HUD for the current table size only (so 1v1 and
+   *  multiplayer keep distinct spots). Flips `activePreset` to "custom". */
+  setFlexOpponentHudOffset: (tableSize: FlexTableSize, offset: WidgetOffset) => void;
+  /** Set the lands↔support split (lands' share, clamped 0..1). The support
+   *  column takes the remainder. Flips `activePreset` to "custom". */
+  setFlexLandSupportRatio: (ratio: number) => void;
+  /** Set the left-to-right order of the middle-row cells (drag-to-reorder).
+   *  Flips `activePreset` to "custom". */
+  setFlexMiddleRowOrder: (order: MiddleCell[]) => void;
+  /** Set a zone's aspect-preserving size multiplier. Flips `activePreset` to
+   *  "custom". */
+  setFlexScale: (key: FlexScaleKey, scale: number) => void;
+  /** Set a middle-row cell's content alignment. Flips `activePreset` to
+   *  "custom". */
+  setFlexCellAlign: (cell: MiddleCell, align: CellAlign) => void;
+  /** Apply a preset wholesale — replaces every field, including the opponent
+   *  HUD, and sets `activePreset` to the preset's id. Caller resolves the id to
+   *  a config (from `presets.ts`) to keep the store free of a preset import. */
+  applyFlexPreset: (config: FlexLayoutConfig) => void;
+  /** Reset the layout to the default preset (clears all offsets). */
+  resetFlexLayout: () => void;
+  /** Toggle anonymous crash & usage telemetry. */
+  setTelemetryEnabled: (enabled: boolean) => void;
 }
 
 type LegacyFlatAiPrefs = Partial<{
@@ -308,6 +553,7 @@ export const usePreferencesStore = create<PreferencesState & PreferencesActions>
       setFollowActiveOpponent: (enabled) => set({ followActiveOpponent: enabled }),
       setStackDockSide: (side) => set({ stackDockSide: side }),
       setOpponentHudDensity: (density) => set({ opponentHudDensity: density }),
+      setMultiplayerBoardLayout: (layout) => set({ multiplayerBoardLayout: layout }),
       setLogDefaultState: (state) => set({ logDefaultState: state }),
       setBoardBackground: (bg) => set({ boardBackground: bg }),
       setCustomBackgroundUrl: (url) => set({ customBackgroundUrl: url.trim() }),
@@ -345,10 +591,31 @@ export const usePreferencesStore = create<PreferencesState & PreferencesActions>
           ...(state.audioThemeId === id ? { audioThemeId: "planeswalker" } : {}),
         })),
       setBattlefieldCardDisplay: (display) => set({ battlefieldCardDisplay: display }),
+      toggleFolderCollapsed: (id) =>
+        set((state) => ({
+          collapsedFolderIds: state.collapsedFolderIds.includes(id)
+            ? state.collapsedFolderIds.filter((existing) => existing !== id)
+            : [...state.collapsedFolderIds, id],
+        })),
+      setCollapsedFolderIds: (ids) => set({ collapsedFolderIds: ids }),
+      setLastSeenChangelogId: (id) => set({ lastSeenChangelogId: id }),
+      setCommandZoneDisplay: (display) => set({ commandZoneDisplay: display }),
+      setCollapseLands: (mode) => set({ collapseLands: mode }),
+      setCollapseSupport: (mode) => set({ collapseSupport: mode }),
       setTapRotation: (rotation) => set({ tapRotation: rotation }),
       setSpellPaymentMode: (mode) => set({ spellPaymentMode: mode }),
+      setHandSort: (sort) => set({ handSort: sort }),
       setShowKeywordStrip: (show) => set({ showKeywordStrip: show }),
       setBattlefieldPeekOnHover: (enabled) => set({ battlefieldPeekOnHover: enabled }),
+      setCardPreviewMode: (mode) => set({ cardPreviewMode: mode }),
+      setCardPreviewHoverDelayMs: (ms) =>
+        set({
+          cardPreviewHoverDelayMs: clamp(
+            ms,
+            CARD_PREVIEW_HOVER_DELAY_MIN,
+            CARD_PREVIEW_HOVER_DELAY_MAX,
+          ),
+        }),
       setAiSeatDifficulty: (index, difficulty) =>
         set((state) => {
           if (index < 0 || index >= state.aiSeats.length) return state;
@@ -386,6 +653,7 @@ export const usePreferencesStore = create<PreferencesState & PreferencesActions>
       setLastPlayerCount: (count) => set({ lastPlayerCount: count }),
       setDismissedFlowHelpNudge: (dismissed) => set({ dismissedFlowHelpNudge: dismissed }),
       setDismissedSandboxToolsNudge: (dismissed) => set({ dismissedSandboxToolsNudge: dismissed }),
+      setDismissedReportCardNudge: (dismissed) => set({ dismissedReportCardNudge: dismissed }),
       addArtChainEntry: (entry) =>
         set((state) => {
           const isDuplicate = state.artChain.some((e) =>
@@ -429,10 +697,74 @@ export const usePreferencesStore = create<PreferencesState & PreferencesActions>
           return { artOverrides: rest };
         }),
       clearAllArtOverrides: () => set({ artOverrides: {} }),
+      setFlexBand: (side, track) =>
+        set((state) => ({
+          flexLayout: {
+            ...state.flexLayout,
+            gridBands: { ...state.flexLayout.gridBands, [side]: track },
+            activePreset: "custom",
+          },
+        })),
+      setFlexWidgetOffset: (key, offset) =>
+        set((state) => ({
+          flexLayout: {
+            ...state.flexLayout,
+            widgets: { ...state.flexLayout.widgets, [key]: offset },
+            activePreset: "custom",
+          },
+        })),
+      setFlexOpponentHudOffset: (tableSize, offset) =>
+        set((state) => ({
+          flexLayout: {
+            ...state.flexLayout,
+            opponentHudByTableSize: {
+              ...state.flexLayout.opponentHudByTableSize,
+              [tableSize]: offset,
+            },
+            activePreset: "custom",
+          },
+        })),
+      setFlexLandSupportRatio: (ratio) =>
+        set((state) => ({
+          flexLayout: {
+            ...state.flexLayout,
+            // Clamp so neither column starves (each keeps ≥20% of the row).
+            landSupportRatio: Math.min(0.8, Math.max(0.2, ratio)),
+            activePreset: "custom",
+          },
+        })),
+      setFlexMiddleRowOrder: (order) =>
+        set((state) => ({
+          flexLayout: {
+            ...state.flexLayout,
+            middleRowOrder: order,
+            activePreset: "custom",
+          },
+        })),
+      setFlexScale: (key, scale) =>
+        set((state) => ({
+          flexLayout: {
+            ...state.flexLayout,
+            // Clamp to a sane, readable range (half to double the auto-size).
+            scales: { ...state.flexLayout.scales, [key]: Math.min(2, Math.max(0.5, scale)) },
+            activePreset: "custom",
+          },
+        })),
+      setFlexCellAlign: (cell, align) =>
+        set((state) => ({
+          flexLayout: {
+            ...state.flexLayout,
+            cellAlign: { ...state.flexLayout.cellAlign, [cell]: align },
+            activePreset: "custom",
+          },
+        })),
+      applyFlexPreset: (config) => set({ flexLayout: cloneFlexLayout(config) }),
+      resetFlexLayout: () => set({ flexLayout: defaultFlexLayout() }),
+      setTelemetryEnabled: (enabled) => set({ telemetryEnabled: enabled }),
     }),
     {
       name: "phase-preferences",
-      version: 12,
+      version: 24,
       // v0 → v1: flat aiDifficulty + aiDeckName become aiSeats[0].
       // v1 → v2: discrete animationSpeed/combatPacing enums become numeric
       //          animationSpeedMultiplier/combatPacingMultiplier.
@@ -451,6 +783,38 @@ export const usePreferencesStore = create<PreferencesState & PreferencesActions>
       //          browser-detected default so existing users keep their locale.
       // v9 → v10: Add stackDockSide; legacy stores default to right (the prior
       //          fixed behavior).
+      // v12 → v13: Add cardPreviewMode; legacy stores default to "follow" (the
+      //          prior fixed cursor-following behavior) via the shallow merge.
+      // v13 → v14: Add cardPreviewHoverDelayMs; legacy stores default to 0
+      //          (instant — the prior behavior) via the shallow merge.
+      // v14 → v15: Add commandZoneDisplay; legacy stores default to "auto"
+      //          via the shallow merge.
+      // v15 → v16: Add flexLayout; legacy stores default to defaultFlexLayout()
+      //          via the shallow merge. The default bands reproduce today's
+      //          gridTemplateRows exactly, so this is a zero-regression seed —
+      //          no explicit migration block needed.
+      // v16 → v17: Add collapsedFolderIds; legacy stores default to [] (nothing
+      //          collapsed — the prior behavior) via the shallow merge.
+      // v17 → v18: Add lastSeenChangelogId; legacy stores default to undefined
+      //          via the shallow merge. The changelog hook then silently seeds
+      //          it to the current latest on first load, so existing users get
+      //          no unread dot for entries that predate this upgrade.
+      // v18 → v19: Add handSort; legacy stores default to "none" (insertion
+      //          order — the prior hand behavior) via the shallow merge.
+      // v19 → v20: Add collapseLands/collapseSupport; legacy stores default to
+      //          "auto" (the prior threshold-driven collapse) via the shallow
+      //          merge, so existing users see no behavior change.
+      // v20 → v21: Add multiplayerBoardLayout; legacy stores default to
+      //          "focused", preserving the current focused-opponent layout.
+      // v21 → v22: Add telemetryEnabled; legacy stores default to `true` (opt-out,
+      //          identity-free crash & usage telemetry) via the shallow merge —
+      //          no explicit migration block needed (see flexLayout precedent).
+      // v22 → v23: phaseStops gained a turn-direction scope; each legacy bare
+      //          Phase string maps to a scoped stop defaulting to "AllTurns"
+      //          (fire on every turn = the old behavior).
+      // v23 → v24: Add dismissedReportCardNudge; legacy stores default to `false`
+      //          (nudge not yet dismissed) via the shallow merge — no explicit
+      //          migration block needed (see telemetryEnabled precedent).
       migrate: (persisted: unknown, version: number) => {
         if (!persisted || typeof persisted !== "object") return persisted;
         let migrated = persisted as Record<string, unknown>;
@@ -584,6 +948,23 @@ export const usePreferencesStore = create<PreferencesState & PreferencesActions>
                 ? { ...s, difficulty: DEFAULT_AI_DIFFICULTY }
                 : s,
             ),
+          };
+        }
+
+        if (version < 21) {
+          migrated = { ...migrated, multiplayerBoardLayout: "focused" };
+        }
+
+        // v22 → v23: phase stops gained a turn-direction scope. Map each legacy
+        // bare Phase string to a scoped stop defaulting to "AllTurns" (fire on
+        // every turn = the old behavior). Non-array values reset to [].
+        if (version < 23) {
+          const legacy = (migrated as { phaseStops?: unknown }).phaseStops;
+          migrated = {
+            ...migrated,
+            phaseStops: Array.isArray(legacy)
+              ? legacy.map((p) => (typeof p === "string" ? { phase: p, scope: "AllTurns" } : p))
+              : [],
           };
         }
 

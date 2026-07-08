@@ -14,7 +14,7 @@
 
 use lobby_broker::{
     parse_lobby_client_message, Broker, BrokerEnv, ConnState, LobbyClientMessage,
-    LobbyServerMessage, Outbound, ParsedFrame,
+    LobbyServerMessage, Outbound, ParsedFrame, PROTOCOL_VERSION,
 };
 use rand::Rng;
 use serde::Serialize;
@@ -36,13 +36,17 @@ impl BrokerEnv for WorkerEnv {
 
     fn new_token(&self) -> String {
         let mut rng = rand::rng();
-        (0..32).map(|_| format!("{:x}", rng.random_range(0u8..16))).collect()
+        (0..32)
+            .map(|_| format!("{:x}", rng.random_range(0u8..16)))
+            .collect()
     }
 
     fn new_game_code(&self) -> String {
         let mut rng = rand::rng();
         let chars: Vec<char> = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789".chars().collect();
-        (0..6).map(|_| chars[rng.random_range(0..chars.len())]).collect()
+        (0..6)
+            .map(|_| chars[rng.random_range(0..chars.len())])
+            .collect()
     }
 }
 
@@ -75,6 +79,17 @@ impl From<Outbound> for OutboundDto {
 
 fn to_dtos(outs: Vec<Outbound>) -> Vec<OutboundDto> {
     outs.into_iter().map(OutboundDto::from).collect()
+}
+
+/// Single `Error` reply for a frame rejected at the parse/validation boundary.
+/// Sent to the originating socket so the client's pending RPC fails fast rather
+/// than waiting out its timeout. Malformed/unknown frames never reach
+/// `Broker::handle`, so this boundary crate is the only place that can answer
+/// them.
+fn reject_reply(message: &str) -> Vec<Outbound> {
+    vec![Outbound::ToSelf(LobbyServerMessage::Error {
+        message: message.to_string(),
+    })]
 }
 
 /// Whether a client frame can mutate the shared `LobbyManager` (and therefore
@@ -125,7 +140,9 @@ impl WasmBroker {
     /// Fresh empty broker — cold start with no stored snapshot.
     #[wasm_bindgen(constructor)]
     pub fn new() -> WasmBroker {
-        WasmBroker { inner: Broker::new() }
+        WasmBroker {
+            inner: Broker::new(),
+        }
     }
 
     /// Restore from a DO-storage snapshot. Falls back to an empty broker if the
@@ -134,7 +151,9 @@ impl WasmBroker {
     pub fn from_snapshot(json: &str) -> WasmBroker {
         match serde_json::from_str::<Broker>(json) {
             Ok(inner) => WasmBroker { inner },
-            Err(_) => WasmBroker { inner: Broker::new() },
+            Err(_) => WasmBroker {
+                inner: Broker::new(),
+            },
         }
     }
 
@@ -150,24 +169,49 @@ impl WasmBroker {
         self.inner.lobby().is_empty()
     }
 
+    /// Number of currently registered lobby entries (games waiting for players).
+    /// Read-only, so the shell need not re-snapshot after calling — this is the
+    /// live "active games" gauge surfaced by the `/stats` endpoint.
+    pub fn active_games(&self) -> usize {
+        self.inner.lobby().len()
+    }
+
     /// Handle one raw client frame (the exact JSON the client sent over the
     /// WebSocket). Parsing + dispatch happen in Rust; the shell never inspects
     /// the protocol. `conn_json` is the per-socket [`ConnState`] from the WS
     /// attachment, `now_ms` is JS `Date.now()`. Returns a [`CallResult`] as JSON.
     pub fn handle(&mut self, conn_json: &str, raw_frame: &str, now_ms: f64) -> String {
         let mut conn: ConnState = serde_json::from_str(conn_json).unwrap_or_default();
-        let env = WorkerEnv { now_ms: now_ms as u64 };
+        let env = WorkerEnv {
+            now_ms: now_ms as u64,
+        };
 
         let (outbounds, dirty, reject) = match parse_lobby_client_message(raw_frame) {
             ParsedFrame::Message(msg) => {
                 let dirty = mutates_lobby(&msg);
                 (self.inner.handle(&mut conn, *msg, &env), dirty, None)
             }
-            ParsedFrame::UnknownTag(tag) => (Vec::new(), false, Some(format!("unknown tag: {tag}"))),
-            ParsedFrame::Malformed(e) => (Vec::new(), false, Some(format!("malformed frame: {e}"))),
+            // A frame the parser couldn't accept — an unknown tag or a field
+            // that failed validation (e.g. a blank display_name). Reply with an
+            // `Error` so the client's pending RPC resolves immediately instead
+            // of hanging until its timeout, and still flag `reject` so the shell
+            // logs it and skips the state snapshot (nothing mutated).
+            ParsedFrame::UnknownTag(tag) => {
+                let reason = format!("unknown tag: {tag}");
+                (reject_reply(&reason), false, Some(reason))
+            }
+            ParsedFrame::Malformed(e) => {
+                let reason = format!("malformed frame: {e}");
+                (reject_reply(&reason), false, Some(reason))
+            }
         };
 
-        result_json(CallResult { conn, outbounds: to_dtos(outbounds), dirty, reject })
+        result_json(CallResult {
+            conn,
+            outbounds: to_dtos(outbounds),
+            dirty,
+            reject,
+        })
     }
 
     /// Socket-close teardown: release the connection's seat reservations and
@@ -177,14 +221,21 @@ impl WasmBroker {
         let outbounds = self.inner.on_disconnect(&mut conn);
         // A close releases reservations / removes a hosted entry — treat as a
         // mutation so the shell snapshots (cheap: close is low-frequency).
-        result_json(CallResult { conn, outbounds: to_dtos(outbounds), dirty: true, reject: None })
+        result_json(CallResult {
+            conn,
+            outbounds: to_dtos(outbounds),
+            dirty: true,
+            reject: None,
+        })
     }
 
     /// Staleness reaper, driven by a DO alarm (a hibernated DO has no tokio
     /// interval). Returns the ordered `Outbound`s (a `LobbyGameRemoved` per
     /// reaped entry) as a JSON array — there is no connection scope here.
     pub fn reap_expired(&mut self, timeout_secs: f64, now_ms: f64) -> String {
-        let env = WorkerEnv { now_ms: now_ms as u64 };
+        let env = WorkerEnv {
+            now_ms: now_ms as u64,
+        };
         let outbounds = self.inner.reap_expired(timeout_secs as u64, &env);
         serde_json::to_string(&to_dtos(outbounds)).expect("outbounds always serialize")
     }
@@ -194,6 +245,14 @@ impl Default for WasmBroker {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// The shared phase.rs wire-protocol version. The Cloudflare Worker shell uses
+/// this for `ServerHello` and its pre-broker handshake gate, so it cannot drift
+/// from the Rust protocol constant.
+#[wasm_bindgen]
+pub fn protocol_version() -> u32 {
+    PROTOCOL_VERSION
 }
 
 fn result_json(r: CallResult) -> String {

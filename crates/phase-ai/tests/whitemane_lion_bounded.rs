@@ -38,6 +38,8 @@ use engine::types::game_state::{GameState, WaitingFor};
 use engine::types::player::PlayerId;
 use phase_ai::auto_play::run_ai_actions;
 use phase_ai::config::{create_config_for_players, AiDifficulty, Platform};
+use rand::rngs::SmallRng;
+use rand::SeedableRng;
 
 /// Comfortable headroom for natural-game-completion variance. Pre-fix runs hit
 /// 10,000 every game; post-fix this deck completes naturally well under 4,000.
@@ -86,13 +88,13 @@ fn whitemane_lion_self_bounce_does_not_infinite_loop() {
             main_deck: deck_whitemane_lion_stack(),
             sideboard: Vec::new(),
             commander: Vec::new(),
-            bracket_tier: Default::default(),
+            ..Default::default()
         },
         opponent: PlayerDeckList {
             main_deck: deck_whitemane_lion_stack(),
             sideboard: Vec::new(),
             commander: Vec::new(),
-            bracket_tier: Default::default(),
+            ..Default::default()
         },
         ai_decks: Vec::new(),
         ai_difficulties: Vec::new(),
@@ -111,8 +113,16 @@ fn whitemane_lion_self_bounce_does_not_infinite_loop() {
             .collect();
 
     let mut total_actions: usize = 0;
+    let mut ai_rng = SmallRng::seed_from_u64(1);
+    let ai_session = phase_ai::session::AiSession::arc_from_game(&state);
     loop {
-        let results = run_ai_actions(&mut state, &ai_players, &ai_configs);
+        let results = run_ai_actions(
+            &mut state,
+            &ai_players,
+            &ai_configs,
+            &mut ai_rng,
+            &ai_session,
+        );
         if results.is_empty() {
             break;
         }

@@ -47,16 +47,12 @@
 //! breaks integration coverage) and then drive each mode through the real
 //! `apply()` pipeline.
 
-use std::path::Path;
-use std::sync::OnceLock;
-
-use engine::database::card_db::CardDatabase;
 use engine::game::layers::evaluate_layers;
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::game::scenario_db::GameScenarioDbExt;
 use engine::types::ability::{ChoiceType, Effect};
 use engine::types::actions::GameAction;
-use engine::types::game_state::WaitingFor;
+use engine::types::game_state::{CastPaymentMode, WaitingFor};
 use engine::types::identifiers::ObjectId;
 use engine::types::keywords::Keyword;
 use engine::types::mana::{ManaType, ManaUnit};
@@ -67,14 +63,7 @@ use engine::types::zones::Zone;
 
 use super::rules::run_combat;
 
-fn load_db() -> Option<&'static CardDatabase> {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../client/public/card-data.json");
-    if !path.exists() {
-        return None;
-    }
-    static DB: OnceLock<CardDatabase> = OnceLock::new();
-    Some(DB.get_or_init(|| CardDatabase::from_export(&path).expect("export should load")))
-}
+use crate::support::shared_card_db as load_db;
 
 /// Drive the as-enters labeled choice for an already-placed Frostcliff Siege
 /// through the real `apply()` pipeline so `ChosenAttribute::Label(<chosen>)`
@@ -83,10 +72,9 @@ fn load_db() -> Option<&'static CardDatabase> {
 /// Poking `chosen_attributes` directly would bypass the very mapping under
 /// test.
 ///
-/// `add_real_card` to Battlefield (`scenario_db.rs`) bypasses the
-/// zone-change pipeline, so the as-enters replacement doesn't fire on its
-/// own — we drive the prompt manually here while still routing the answer
-/// through the production resolution choice handler.
+/// The scenario helper may already have raised the as-enters prompt; this
+/// helper still routes the answer through the production choice handler so the
+/// label persistence mapping stays under test.
 fn drive_siege_choice(
     runner: &mut engine::game::scenario::GameRunner,
     siege: ObjectId,
@@ -99,6 +87,7 @@ fn drive_siege_choice(
         },
         options: vec!["Jeskai".to_string(), "Temur".to_string()],
         source_id: Some(siege),
+        persist_player: None,
     };
     runner
         .act(GameAction::ChooseOption {
@@ -273,7 +262,7 @@ fn temur_mode_grants_plus_one_zero_trample_haste_to_creatures_you_control() {
     // explicitly so we read post-choice characteristics regardless.
     {
         let s = runner.state_mut();
-        s.layers_dirty = true;
+        s.layers_dirty.mark_full();
         evaluate_layers(s);
     }
 
@@ -336,6 +325,17 @@ fn no_choice_persisted_means_neither_linked_ability_functions() {
     let _f2 = scenario.add_real_card(P0, "Plains", Zone::Library, db);
     let mut runner = scenario.build();
 
+    // `add_real_card` models a pre-existing permanent and abandons any as-enters
+    // `NamedChoice` without persisting a label — the same shape as a copied Siege
+    // that never made the entry choice (CR 614.12c ruling quoted above).
+    assert!(
+        matches!(
+            runner.state().waiting_for,
+            WaitingFor::Priority { player } if player == P0
+        ),
+        "pre-existing battlefield setup must settle to priority without a label"
+    );
+
     // CR 614.12c precondition: NO `ChosenAttribute::Label` on the Siege
     // (simulating a copied/cloned permanent that never made the as-enters
     // choice).
@@ -348,7 +348,7 @@ fn no_choice_persisted_means_neither_linked_ability_functions() {
     // permissive when the label is absent.
     {
         let s = runner.state_mut();
-        s.layers_dirty = true;
+        s.layers_dirty.mark_full();
         evaluate_layers(s);
     }
 
@@ -409,7 +409,7 @@ fn jeskai_mode_does_not_grant_temur_anthem() {
 
     {
         let s = runner.state_mut();
-        s.layers_dirty = true;
+        s.layers_dirty.mark_full();
         evaluate_layers(s);
     }
 
@@ -489,6 +489,8 @@ fn cast_siege_from_hand(runner: &mut GameRunner, siege: ObjectId, chosen_label: 
             object_id: siege,
             card_id,
             targets: vec![],
+
+            payment_mode: CastPaymentMode::Auto,
         })
         .expect("P0 must be able to cast Frostcliff Siege from hand");
 
@@ -515,6 +517,7 @@ fn cast_siege_from_hand(runner: &mut GameRunner, siege: ObjectId, chosen_label: 
             choice_type,
             options,
             source_id,
+            ..
         } => {
             assert_eq!(
                 *player, P0,
@@ -777,6 +780,7 @@ fn anchor_word_sieges_load_with_no_parse_gaps() {
             Effect::Choose {
                 choice_type: ChoiceType::Labeled { options },
                 persist,
+                ..
             } => {
                 assert!(
                     *persist,

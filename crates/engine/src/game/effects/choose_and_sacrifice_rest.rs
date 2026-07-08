@@ -1,6 +1,8 @@
+use crate::game::filter::{matches_target_filter, FilterContext};
 use crate::game::players;
 use crate::types::ability::{
     CategoryChooserScope, Effect, EffectError, EffectKind, PlayerFilter, ResolvedAbility,
+    TargetFilter,
 };
 use crate::types::card_type::CoreType;
 use crate::types::events::GameEvent;
@@ -17,17 +19,27 @@ pub fn resolve(
     ability: &ResolvedAbility,
     events: &mut Vec<GameEvent>,
 ) -> Result<(), EffectError> {
-    let (categories, chooser_scope) = match &ability.effect {
-        Effect::ChooseAndSacrificeRest {
-            categories,
-            chooser_scope,
-        } => (categories.clone(), *chooser_scope),
-        _ => {
-            return Err(EffectError::MissingParam(
-                "ChooseAndSacrificeRest".to_string(),
-            ))
-        }
-    };
+    let (categories, chooser_scope, choose_filter, sacrifice_filter, total_power_cap) =
+        match &ability.effect {
+            Effect::ChooseAndSacrificeRest {
+                categories,
+                chooser_scope,
+                choose_filter,
+                sacrifice_filter,
+                total_power_cap,
+            } => (
+                categories.clone(),
+                *chooser_scope,
+                choose_filter.clone(),
+                sacrifice_filter.clone(),
+                total_power_cap.clone(),
+            ),
+            _ => {
+                return Err(EffectError::MissingParam(
+                    "ChooseAndSacrificeRest".to_string(),
+                ))
+            }
+        };
 
     // CR 101.4: Determine player order using APNAP.
     // CR 102.2 (two-player) / CR 102.3 (team multiplayer): An ability with
@@ -54,6 +66,31 @@ pub fn resolve(
         return Ok(());
     }
 
+    // CR 107.1c + CR 701.21a (Slaughter the Strong): total-power-capped keep mode —
+    // each player keeps a chosen subset whose combined power is at most the cap,
+    // instead of one permanent per category.
+    if let Some(cap_expr) = total_power_cap {
+        let cap = crate::game::quantity::resolve_quantity(
+            state,
+            &cap_expr,
+            ability.controller,
+            ability.source_id,
+        );
+        return step_total_power(
+            state,
+            ability.source_id,
+            ability.controller,
+            chooser_scope,
+            &player_order,
+            Vec::new(),
+            &choose_filter,
+            &sacrifice_filter,
+            cap,
+            &player_order,
+            events,
+        );
+    }
+
     // Start with the first player in APNAP order.
     let current_player = player_order[0];
     let remaining_players: Vec<PlayerId> = player_order[1..].to_vec();
@@ -64,11 +101,31 @@ pub fn resolve(
         CategoryChooserScope::ControllerForAll => ability.controller,
     };
 
-    let eligible = compute_eligible_per_category(state, current_player, &categories);
+    let filter_ctx = FilterContext::from_ability(ability);
+    let eligible = compute_eligible_per_category(
+        state,
+        current_player,
+        &categories,
+        &choose_filter,
+        &filter_ctx,
+    );
 
     // If all categories are empty for all players, skip directly to sacrifice.
     if eligible.iter().all(|e| e.is_empty()) && remaining_players.is_empty() {
-        sacrifice_unchosen(state, &[], &player_order, ability.source_id, events);
+        // CR 603.10a: the permanents this sweep sacrifices left the battlefield
+        // together — stamp the sub-slice so a co-departing leaves-the-battlefield
+        // observer among them observes the rest.
+        let before = events.len();
+        sacrifice_unchosen(
+            state,
+            &[],
+            &player_order,
+            &sacrifice_filter,
+            ability.source_id,
+            ability.controller,
+            events,
+        );
+        crate::game::zones::stamp_simultaneous_from_slice(state, &mut events[before..]);
         events.push(GameEvent::EffectResolved {
             kind: EffectKind::ChooseAndSacrificeRest,
             source_id: ability.source_id,
@@ -86,6 +143,8 @@ pub fn resolve(
             ability.source_id,
             &remaining_players,
             Vec::new(),
+            &choose_filter,
+            &sacrifice_filter,
             &player_order,
             events,
         );
@@ -95,7 +154,19 @@ pub fn resolve(
     if let Some(auto_choices) = try_auto_resolve(&eligible) {
         let kept: Vec<ObjectId> = auto_choices.iter().filter_map(|&opt| opt).collect();
         if remaining_players.is_empty() {
-            sacrifice_unchosen(state, &kept, &player_order, ability.source_id, events);
+            // CR 603.10a: co-departing observer among the sacrificed group
+            // observes the rest — stamp the sweep's sub-slice.
+            let before = events.len();
+            sacrifice_unchosen(
+                state,
+                &kept,
+                &player_order,
+                &sacrifice_filter,
+                ability.source_id,
+                ability.controller,
+                events,
+            );
+            crate::game::zones::stamp_simultaneous_from_slice(state, &mut events[before..]);
             events.push(GameEvent::EffectResolved {
                 kind: EffectKind::ChooseAndSacrificeRest,
                 source_id: ability.source_id,
@@ -110,6 +181,8 @@ pub fn resolve(
             ability.source_id,
             &remaining_players,
             kept,
+            &choose_filter,
+            &sacrifice_filter,
             &player_order,
             events,
         );
@@ -119,6 +192,10 @@ pub fn resolve(
         player: chooser,
         target_player: current_player,
         categories,
+        chooser_scope,
+        choose_filter,
+        sacrifice_filter,
+        source_controller: ability.controller,
         eligible_per_category: eligible,
         source_id: ability.source_id,
         remaining_players,
@@ -139,6 +216,8 @@ pub(crate) fn compute_eligible_per_category(
     state: &GameState,
     player: PlayerId,
     categories: &[CoreType],
+    choose_filter: &TargetFilter,
+    filter_ctx: &FilterContext<'_>,
 ) -> Vec<Vec<ObjectId>> {
     categories
         .iter()
@@ -152,6 +231,7 @@ pub(crate) fn compute_eligible_per_category(
                         obj.controller == player
                             && !obj.is_emblem
                             && obj.card_types.core_types.contains(core_type)
+                            && matches_target_filter(state, *id, choose_filter, filter_ctx)
                     })
                 })
                 .collect()
@@ -159,27 +239,139 @@ pub(crate) fn compute_eligible_per_category(
         .collect()
 }
 
-/// Try to auto-resolve when every category has at most one eligible permanent
-/// and no permanent appears in multiple categories.
+/// CR 701.21a: Eligible creatures for the total-power keep mode — `choose_filter`
+/// permanents controlled by `player`.
+pub(crate) fn compute_eligible_creatures(
+    state: &GameState,
+    player: PlayerId,
+    choose_filter: &TargetFilter,
+    filter_ctx: &FilterContext<'_>,
+) -> Vec<ObjectId> {
+    state
+        .battlefield
+        .iter()
+        .copied()
+        .filter(|id| {
+            state.objects.get(id).is_some_and(|obj| {
+                obj.controller == player
+                    && !obj.is_emblem
+                    && matches_target_filter(state, *id, choose_filter, filter_ctx)
+            })
+        })
+        .collect()
+}
+
+/// CR 208.3: Combined power of the given objects (treating absent/empty power as 0).
+pub(crate) fn total_power(state: &GameState, ids: &[ObjectId]) -> i32 {
+    ids.iter()
+        .filter_map(|id| state.objects.get(id))
+        .map(|obj| obj.power.unwrap_or(0))
+        .sum()
+}
+
+/// CR 107.1c + CR 701.21a: Process the next player in the total-power keep flow.
+/// Auto-keeps all eligible creatures when their combined power already fits the
+/// cap (or none are eligible); otherwise pauses for an interactive subset choice.
+/// When no players remain, sacrifices every non-kept `sacrifice_filter` permanent.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn step_total_power(
+    state: &mut GameState,
+    source_id: ObjectId,
+    source_controller: PlayerId,
+    chooser_scope: CategoryChooserScope,
+    players_remaining: &[PlayerId],
+    all_kept: Vec<ObjectId>,
+    choose_filter: &TargetFilter,
+    sacrifice_filter: &TargetFilter,
+    cap: i32,
+    scoped_players: &[PlayerId],
+    events: &mut Vec<GameEvent>,
+) -> Result<(), EffectError> {
+    let Some((&current_player, rest)) = players_remaining.split_first() else {
+        // CR 603.10a: all choices made — sacrifice the unchosen as one event so a
+        // co-departing leaves-the-battlefield observer among them sees the rest.
+        let before = events.len();
+        sacrifice_unchosen(
+            state,
+            &all_kept,
+            scoped_players,
+            sacrifice_filter,
+            source_id,
+            source_controller,
+            events,
+        );
+        crate::game::zones::stamp_simultaneous_from_slice(state, &mut events[before..]);
+        events.push(GameEvent::EffectResolved {
+            kind: EffectKind::ChooseAndSacrificeRest,
+            source_id,
+        });
+        return Ok(());
+    };
+
+    // CR 109.5: preserve the source-controller provenance (mirroring
+    // `advance_to_next_player`) so a controller-relative `choose_filter`
+    // evaluates eligibility against the spell's controller even on a
+    // resumed/serialized choice or when the source object is gone.
+    let filter_ctx = FilterContext::from_source_with_controller(source_id, source_controller);
+    let eligible = compute_eligible_creatures(state, current_player, choose_filter, &filter_ctx);
+
+    // CR 107.1c: "any number" includes zero — even when keeping every eligible
+    // creature already fits the cap, the player may choose to keep fewer (e.g. to
+    // sacrifice their own creatures). So only auto-resolve a truly empty eligible
+    // set; otherwise prompt (the UI/AI is free to default to keeping all).
+    if eligible.is_empty() {
+        let mut all_kept = all_kept;
+        all_kept.extend(eligible);
+        return step_total_power(
+            state,
+            source_id,
+            source_controller,
+            chooser_scope,
+            rest,
+            all_kept,
+            choose_filter,
+            sacrifice_filter,
+            cap,
+            scoped_players,
+            events,
+        );
+    }
+
+    // CR 101.4: the chooser is the affected player (EachPlayerSelf) or the source
+    // controller (ControllerForAll).
+    let chooser = match chooser_scope {
+        CategoryChooserScope::EachPlayerSelf => current_player,
+        CategoryChooserScope::ControllerForAll => source_controller,
+    };
+    state.waiting_for = WaitingFor::KeepWithinTotalPowerChoice {
+        player: chooser,
+        target_player: current_player,
+        eligible,
+        cap,
+        choose_filter: choose_filter.clone(),
+        sacrifice_filter: sacrifice_filter.clone(),
+        chooser_scope,
+        source_id,
+        source_controller,
+        remaining_players: rest.to_vec(),
+        all_kept,
+        scoped_players: scoped_players.to_vec(),
+    };
+    events.push(GameEvent::EffectResolved {
+        kind: EffectKind::ChooseAndSacrificeRest,
+        source_id,
+    });
+    Ok(())
+}
+
+/// Try to auto-resolve when every category has at most one eligible permanent.
 fn try_auto_resolve(eligible: &[Vec<ObjectId>]) -> Option<Vec<Option<ObjectId>>> {
     let mut choices: Vec<Option<ObjectId>> = Vec::with_capacity(eligible.len());
-    let mut used = Vec::new();
 
     for category_eligible in eligible {
-        // Filter out already-used objects.
-        let available: Vec<ObjectId> = category_eligible
-            .iter()
-            .copied()
-            .filter(|id| !used.contains(id))
-            .collect();
-
-        match available.len() {
-            0 => choices.push(None),
-            1 => {
-                let id = available[0];
-                used.push(id);
-                choices.push(Some(id));
-            }
+        match category_eligible.as_slice() {
+            [] => choices.push(None),
+            [id] => choices.push(Some(*id)),
             _ => return None, // Multiple choices — needs player input.
         }
     }
@@ -197,11 +389,26 @@ pub(crate) fn advance_to_next_player(
     source_id: ObjectId,
     remaining: &[PlayerId],
     mut all_kept: Vec<ObjectId>,
+    choose_filter: &TargetFilter,
+    sacrifice_filter: &TargetFilter,
     scoped_players: &[PlayerId],
     events: &mut Vec<GameEvent>,
 ) -> Result<(), EffectError> {
+    dedupe_object_ids(&mut all_kept);
     if remaining.is_empty() {
-        sacrifice_unchosen(state, &all_kept, scoped_players, source_id, events);
+        // CR 603.10a: terminal APNAP sweep — the sacrificed group left the
+        // battlefield together, so stamp this sub-slice for co-departing observers.
+        let before = events.len();
+        sacrifice_unchosen(
+            state,
+            &all_kept,
+            scoped_players,
+            sacrifice_filter,
+            source_id,
+            controller,
+            events,
+        );
+        crate::game::zones::stamp_simultaneous_from_slice(state, &mut events[before..]);
         events.push(GameEvent::EffectResolved {
             kind: EffectKind::ChooseAndSacrificeRest,
             source_id,
@@ -217,7 +424,9 @@ pub(crate) fn advance_to_next_player(
         CategoryChooserScope::ControllerForAll => controller,
     };
 
-    let eligible = compute_eligible_per_category(state, next_player, categories);
+    let filter_ctx = FilterContext::from_source_with_controller(source_id, controller);
+    let eligible =
+        compute_eligible_per_category(state, next_player, categories, choose_filter, &filter_ctx);
 
     // If all categories empty for this player, skip ahead.
     if eligible.iter().all(|e| e.is_empty()) {
@@ -229,6 +438,8 @@ pub(crate) fn advance_to_next_player(
             source_id,
             &next_remaining,
             all_kept,
+            choose_filter,
+            sacrifice_filter,
             scoped_players,
             events,
         );
@@ -238,6 +449,7 @@ pub(crate) fn advance_to_next_player(
     if let Some(auto_choices) = try_auto_resolve(&eligible) {
         let kept: Vec<ObjectId> = auto_choices.iter().filter_map(|&opt| opt).collect();
         all_kept.extend(kept);
+        dedupe_object_ids(&mut all_kept);
         return advance_to_next_player(
             state,
             categories,
@@ -246,6 +458,8 @@ pub(crate) fn advance_to_next_player(
             source_id,
             &next_remaining,
             all_kept,
+            choose_filter,
+            sacrifice_filter,
             scoped_players,
             events,
         );
@@ -255,6 +469,10 @@ pub(crate) fn advance_to_next_player(
         player: chooser,
         target_player: next_player,
         categories: categories.to_vec(),
+        chooser_scope,
+        choose_filter: choose_filter.clone(),
+        sacrifice_filter: sacrifice_filter.clone(),
+        source_controller: controller,
         eligible_per_category: eligible,
         source_id,
         remaining_players: next_remaining,
@@ -271,10 +489,20 @@ pub(crate) fn sacrifice_unchosen_from_handler(
     state: &mut GameState,
     kept: &[ObjectId],
     scoped_players: &[PlayerId],
+    sacrifice_filter: &TargetFilter,
     source_id: ObjectId,
+    source_controller: PlayerId,
     events: &mut Vec<GameEvent>,
 ) {
-    sacrifice_unchosen(state, kept, scoped_players, source_id, events);
+    sacrifice_unchosen(
+        state,
+        kept,
+        scoped_players,
+        sacrifice_filter,
+        source_id,
+        source_controller,
+        events,
+    );
 }
 
 /// CR 701.21a: Sacrifice all permanents on the battlefield that were not chosen.
@@ -282,7 +510,9 @@ fn sacrifice_unchosen(
     state: &mut GameState,
     kept: &[ObjectId],
     scoped_players: &[PlayerId],
+    sacrifice_filter: &TargetFilter,
     source_id: ObjectId,
+    source_controller: PlayerId,
     events: &mut Vec<GameEvent>,
 ) {
     // CR 701.21a: Sacrifice each permanent NOT chosen, restricted to the
@@ -303,6 +533,7 @@ fn sacrifice_unchosen(
     };
     // Collect all battlefield permanents not in the kept set, controlled by a
     // player within scope.
+    let filter_ctx = FilterContext::from_source_with_controller(source_id, source_controller);
     let to_sacrifice: Vec<ObjectId> = state
         .battlefield
         .iter()
@@ -313,6 +544,7 @@ fn sacrifice_unchosen(
                     .objects
                     .get(id)
                     .is_some_and(|obj| !obj.is_emblem && effective_scope.contains(&obj.controller))
+                && matches_target_filter(state, *id, sacrifice_filter, &filter_ctx)
         })
         .collect();
 
@@ -336,8 +568,18 @@ fn sacrifice_unchosen(
             }
         }
     }
+}
 
-    let _ = source_id; // used by caller for EffectResolved event
+fn dedupe_object_ids(ids: &mut Vec<ObjectId>) {
+    let mut seen = Vec::new();
+    ids.retain(|id| {
+        if seen.contains(id) {
+            false
+        } else {
+            seen.push(*id);
+            true
+        }
+    });
 }
 
 #[cfg(test)]
@@ -349,6 +591,22 @@ mod tests {
     use crate::types::player::PlayerId;
     use crate::types::zones::Zone;
 
+    fn permanent_filter() -> TargetFilter {
+        TargetFilter::Typed(crate::types::ability::TypedFilter::permanent())
+    }
+
+    fn nonland_permanent_filter() -> TargetFilter {
+        TargetFilter::Typed(crate::types::ability::TypedFilter::permanent().with_type(
+            crate::types::ability::TypeFilter::Non(Box::new(
+                crate::types::ability::TypeFilter::Land,
+            )),
+        ))
+    }
+
+    fn test_filter_ctx() -> FilterContext<'static> {
+        FilterContext::from_source_with_controller(ObjectId(100), PlayerId(0))
+    }
+
     fn make_ability(
         categories: Vec<CoreType>,
         chooser_scope: CategoryChooserScope,
@@ -357,6 +615,9 @@ mod tests {
             Effect::ChooseAndSacrificeRest {
                 categories,
                 chooser_scope,
+                choose_filter: permanent_filter(),
+                sacrifice_filter: permanent_filter(),
+                total_power_cap: None,
             },
             vec![],
             ObjectId(100),
@@ -374,6 +635,9 @@ mod tests {
             Effect::ChooseAndSacrificeRest {
                 categories,
                 chooser_scope,
+                choose_filter: permanent_filter(),
+                sacrifice_filter: permanent_filter(),
+                total_power_cap: None,
             },
             vec![],
             ObjectId(100),
@@ -490,6 +754,102 @@ mod tests {
     }
 
     #[test]
+    fn category_choice_rejects_none_for_nonempty_category() {
+        use crate::game::engine::apply;
+        use crate::types::actions::GameAction;
+
+        let mut state = setup_two_player();
+        let artifact = add_battlefield_permanent(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Sol Ring",
+            vec![CoreType::Artifact],
+        );
+        let creature = add_battlefield_permanent(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Bear",
+            vec![CoreType::Creature],
+        );
+        let _creature2 = add_battlefield_permanent(
+            &mut state,
+            CardId(3),
+            PlayerId(0),
+            "Lion",
+            vec![CoreType::Creature],
+        );
+
+        let ability = make_ability(
+            vec![CoreType::Artifact, CoreType::Creature],
+            CategoryChooserScope::EachPlayerSelf,
+        );
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        let err = apply(
+            &mut state,
+            PlayerId(0),
+            GameAction::SelectCategoryPermanents {
+                choices: vec![None, Some(creature)],
+            },
+        )
+        .expect_err("cannot decline a category with legal choices");
+        assert!(
+            format!("{err:?}").contains("Must choose a permanent"),
+            "unexpected error: {err:?}"
+        );
+        assert!(state.battlefield.contains(&artifact));
+        assert!(state.battlefield.contains(&creature));
+    }
+
+    #[test]
+    fn gearhulk_filter_keeps_duplicate_slot_permanent_and_spares_lands() {
+        let mut state = setup_two_player();
+        let artifact_creature = add_battlefield_permanent(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Steel Hellkite",
+            vec![CoreType::Artifact, CoreType::Creature],
+        );
+        let enchantment = add_battlefield_permanent(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Omen",
+            vec![CoreType::Enchantment],
+        );
+        let land = add_battlefield_permanent(
+            &mut state,
+            CardId(3),
+            PlayerId(0),
+            "Island",
+            vec![CoreType::Land],
+        );
+
+        let ability = ResolvedAbility::new(
+            Effect::ChooseAndSacrificeRest {
+                categories: vec![CoreType::Artifact, CoreType::Creature],
+                chooser_scope: CategoryChooserScope::EachPlayerSelf,
+                choose_filter: nonland_permanent_filter(),
+                sacrifice_filter: nonland_permanent_filter(),
+                total_power_cap: None,
+            },
+            vec![],
+            ObjectId(100),
+            PlayerId(0),
+        );
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        assert!(state.battlefield.contains(&artifact_creature));
+        assert!(!state.battlefield.contains(&enchantment));
+        assert!(state.battlefield.contains(&land));
+    }
+
+    #[test]
     fn controller_for_all_sets_correct_chooser() {
         let mut state = setup_two_player();
         // Player 1 has two creatures — needs a choice.
@@ -568,6 +928,8 @@ mod tests {
             &state,
             PlayerId(0),
             &[CoreType::Creature, CoreType::Artifact],
+            &permanent_filter(),
+            &test_filter_ctx(),
         );
 
         assert_eq!(eligible[0].len(), 1); // P0's creature
@@ -620,6 +982,9 @@ mod tests {
             Effect::ChooseAndSacrificeRest {
                 categories: vec![CoreType::Artifact, CoreType::Creature],
                 chooser_scope: CategoryChooserScope::EachPlayerSelf,
+                choose_filter: permanent_filter(),
+                sacrifice_filter: permanent_filter(),
+                total_power_cap: None,
             },
             vec![],
             ObjectId(100),
@@ -816,6 +1181,8 @@ mod tests {
             &state,
             PlayerId(0),
             &[CoreType::Artifact, CoreType::Creature],
+            &permanent_filter(),
+            &test_filter_ctx(),
         );
 
         // The artifact creature should appear in both categories.

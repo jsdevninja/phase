@@ -11,13 +11,15 @@ use engine::types::actions::GameAction;
 use engine::types::game_state::WaitingFor;
 
 use crate::policies::registry::DecisionKind;
+#[cfg(test)]
+use engine::types::game_state::CastPaymentMode;
 
 /// Classify a decision into the bucket the policy registry uses for routing.
 pub fn classify(waiting_for: &WaitingFor, action: &GameAction) -> DecisionKind {
     match waiting_for {
-        WaitingFor::MulliganDecision { .. }
-        | WaitingFor::MulliganBottomCards { .. }
-        | WaitingFor::OpeningHandBottomCards { .. } => DecisionKind::Mulligan,
+        WaitingFor::MulliganDecision { .. } | WaitingFor::OpeningHandBottomCards { .. } => {
+            DecisionKind::Mulligan
+        }
         WaitingFor::ManaPayment { .. } | WaitingFor::PhyrexianPayment { .. } => {
             DecisionKind::ManaPayment
         }
@@ -28,10 +30,20 @@ pub fn classify(waiting_for: &WaitingFor, action: &GameAction) -> DecisionKind {
         | WaitingFor::CopyRetarget { .. }
         | WaitingFor::RetargetChoice { .. }
         | WaitingFor::DistributeAmong { .. }
-        | WaitingFor::MoveCountersDistribution { .. } => DecisionKind::SelectTarget,
+        | WaitingFor::MoveCountersDistribution { .. }
+        | WaitingFor::RemoveCountersChoice { .. } => DecisionKind::SelectTarget,
         WaitingFor::DeclareAttackers { .. } => DecisionKind::DeclareAttackers,
         WaitingFor::DeclareBlockers { .. } => DecisionKind::DeclareBlockers,
         WaitingFor::UntapChoice { .. } => DecisionKind::ActivateAbility,
+        // CR 502.3: the bounded untap-subset selection under a MaxUntapPerType
+        // cap is a mechanical untap-step choice; route it to the same catch-all
+        // bucket as the optional-decline UntapChoice.
+        WaitingFor::ChooseUntapSubset { .. } => DecisionKind::ActivateAbility,
+        // CR 508.1g: exert-as-attack is part of the attack declaration; route it
+        // to the attack policy population.
+        WaitingFor::ExertChoice { .. } | WaitingFor::EnlistChoice { .. } => {
+            DecisionKind::DeclareAttackers
+        }
         // CR 508.1d + CR 509.1c: Combat tax — route by context so the attack-tax
         // policy sees `DeclareAttackers` candidates and the block-tax policy sees
         // `DeclareBlockers` candidates.
@@ -67,6 +79,9 @@ pub fn classify(waiting_for: &WaitingFor, action: &GameAction) -> DecisionKind {
         | WaitingFor::StationTarget { .. }
         | WaitingFor::SaddleMount { .. }
         | WaitingFor::ScryChoice { .. }
+        // CR 119.7 + CR 119.8: redistribute life totals is a forced mid-resolution
+        // selection; route to the ability catch-all bucket.
+        | WaitingFor::RedistributeLifeTotals { .. }
         | WaitingFor::DigChoice { .. }
         | WaitingFor::SurveilChoice { .. }
         | WaitingFor::RevealChoice { .. }
@@ -76,6 +91,7 @@ pub fn classify(waiting_for: &WaitingFor, action: &GameAction) -> DecisionKind {
         | WaitingFor::SearchPartitionChoice { .. }
         | WaitingFor::OutsideGameChoice { .. }
         | WaitingFor::ChooseFromZoneChoice { .. }
+        | WaitingFor::BeholdChoice { .. }
         | WaitingFor::ConniveDiscard { .. }
         | WaitingFor::DiscardChoice { .. }
         | WaitingFor::EffectZoneChoice { .. }
@@ -84,29 +100,30 @@ pub fn classify(waiting_for: &WaitingFor, action: &GameAction) -> DecisionKind {
         | WaitingFor::BetweenGamesSideboard { .. }
         | WaitingFor::BetweenGamesChoosePlayDraw { .. }
         | WaitingFor::NamedChoice { .. }
+        | WaitingFor::OpponentGuess { .. }
+        | WaitingFor::SpellbookDraft { .. }
         | WaitingFor::ModeChoice { .. }
         | WaitingFor::DiscardToHandSize { .. }
         | WaitingFor::OptionalCostChoice { .. }
+        | WaitingFor::SpliceOffer { .. }
         | WaitingFor::DefilerPayment { .. }
         | WaitingFor::AbilityModeChoice { .. }
-        | WaitingFor::AdventureCastChoice { .. }
+        // CR 715.3a + CR 702.94a + CR 702.35a + CR 702.85a + CR 701.57a + CR 702.xxx:
+        // Adventure / Miracle / Madness / Cascade / Discover / Paradigm cast
+        // offers are modeled as ability-style opt-in decisions.
+        | WaitingFor::CastOffer { .. }
         | WaitingFor::ModalFaceChoice { .. }
         | WaitingFor::AlternativeCastChoice { .. }
         | WaitingFor::CastingVariantChoice { .. }
         | WaitingFor::ChoosePermanentTypeSlot { .. }
         | WaitingFor::ChooseRingBearer { .. }
+        | WaitingFor::ChooseRoomDoor { .. }
         | WaitingFor::ChooseDungeon { .. }
         | WaitingFor::ChooseDungeonRoom { .. }
-        | WaitingFor::DiscardForCost { .. }
-        | WaitingFor::SacrificeForCost { .. }
-        | WaitingFor::ReturnToHandForCost { .. }
+        | WaitingFor::SpecializeColor { .. }
+        | WaitingFor::PayCost { .. }
         | WaitingFor::BlightChoice { .. }
-        | WaitingFor::BeholdForCost { .. }
-        | WaitingFor::TapCreaturesForSpellCost { .. }
-        | WaitingFor::TapCreaturesForManaAbility { .. }
         | WaitingFor::ChooseManaColor { .. }
-        | WaitingFor::ExileForCost { .. }
-        | WaitingFor::RemoveCounterForCost { .. }
         | WaitingFor::CollectEvidenceChoice { .. }
         | WaitingFor::HarmonizeTapChoice { .. }
         | WaitingFor::OptionalEffectChoice { .. }
@@ -118,12 +135,17 @@ pub fn classify(waiting_for: &WaitingFor, action: &GameAction) -> DecisionKind {
         | WaitingFor::WardDiscardChoice { .. }
         | WaitingFor::WardSacrificeChoice { .. }
         | WaitingFor::UnlessBounceChoice { .. }
-        | WaitingFor::DiscoverChoice { .. }
         | WaitingFor::RevealUntilKeptChoice { .. }
         | WaitingFor::RepeatDecision { .. }
-        | WaitingFor::CascadeChoice { .. }
         | WaitingFor::TopOrBottomChoice { .. }
+        // CR 702.140c + CR 730.2a: mutate top/bottom merge side — a forced
+        // mid-resolution choice; route to the ability catch-all.
+        | WaitingFor::MutateMergeChoice { .. }
+        // CR 702.99a: cipher encode-on-resolve — a mid-resolution selection;
+        // route to the same ability catch-all as the mutate merge choice.
+        | WaitingFor::CipherEncodeChoice { .. }
         | WaitingFor::PopulateChoice { .. }
+        | WaitingFor::ClashChooseOpponent { .. }
         | WaitingFor::ClashCardPlacement { .. }
         | WaitingFor::VoteChoice { .. }
         | WaitingFor::SeparatePilesPartition { .. }
@@ -133,27 +155,35 @@ pub fn classify(waiting_for: &WaitingFor, action: &GameAction) -> DecisionKind {
         | WaitingFor::CommanderZoneChoice { .. }
         | WaitingFor::BattleProtectorChoice { .. }
         | WaitingFor::ProliferateChoice { .. }
+        | WaitingFor::TimeTravelChoice { .. }
+        // CR 702.132a: Assist offer / payment — casting-payment-adjacent choices,
+        // routed to the ability catch-all bucket like the other opt-in cast steps.
+        | WaitingFor::AssistChoosePlayer { .. }
+        | WaitingFor::AssistPayment { .. }
         | WaitingFor::ChooseObjectsSelection { .. }
         | WaitingFor::CategoryChoice { .. }
+        | WaitingFor::EachPlayerCopyChosenSelection { .. }
+        | WaitingFor::KeepWithinTotalPowerChoice { .. }
         | WaitingFor::AssignCombatDamage { .. }
+        // CR 510.1d + CR 702.22k: active player divides a banded blocker's
+        // damage — a forced mid-combat choice, routed to the ability catch-all.
+        | WaitingFor::AssignBlockerDamage { .. }
         // CR 107.1c + CR 107.14: "Pay any amount of X" prompts are forced
         // mid-resolution choices; route to ActivateAbility as a catch-all.
         | WaitingFor::PayAmountChoice { .. }
         | WaitingFor::GameOver { .. }
-        // CR 702.xxx: Paradigm (Strixhaven) — modeled as an ability-style
-        // offer decision. Assign when WotC publishes SOS CR update.
-        | WaitingFor::ParadigmCastOffer { .. }
         // CR 702.94a: Miracle reveal — opt-in cast offer, routed to the
         // ability-offer bucket so activation policies evaluate the candidates.
         | WaitingFor::MiracleReveal { .. }
-        | WaitingFor::MiracleCastOffer { .. }
-        | WaitingFor::MadnessCastOffer { .. }
         | WaitingFor::ChooseOneOfBranch { .. }
-        | WaitingFor::DiscardForManaAbility { .. }
-        | WaitingFor::ExileForManaAbility { .. }
-        | WaitingFor::SacrificeForManaAbility { .. }
         | WaitingFor::PayManaAbilityMana { .. }
-        | WaitingFor::ActivationCostOneOfChoice { .. } => DecisionKind::ActivateAbility,
+        // CR 705.1 + CR 614.1a: Krark's Thumb keep choice is a forced
+        // mid-resolution selection; route to the ability catch-all.
+        | WaitingFor::CoinFlipKeepChoice { .. }
+        | WaitingFor::ActivationCostOneOfChoice { .. }
+        // CR 601.2b: choosing an additional cost's mode (e.g. behold a chosen
+        // creature type) is a casting-cost-phase step; route to the ability bucket.
+        | WaitingFor::CostTypeChoice { .. } => DecisionKind::ActivateAbility,
     }
 }
 
@@ -174,6 +204,8 @@ mod tests {
             object_id: ObjectId(0),
             card_id: CardId(0),
             targets: Vec::new(),
+
+            payment_mode: CastPaymentMode::Auto,
         };
 
         // Mulligan routing.
@@ -183,6 +215,7 @@ mod tests {
                     pending: vec![engine::types::game_state::MulliganDecisionEntry {
                         player: PlayerId(0),
                         mulligan_count: 0,
+                        phase: engine::types::game_state::MulliganDecisionPhase::Declare,
                     }],
                     free_first_mulligan: false,
                 },

@@ -2,7 +2,7 @@ use crate::game::zones;
 use crate::types::ability::{Effect, EffectError, EffectKind, ResolvedAbility};
 use crate::types::card_type::CoreType;
 use crate::types::events::GameEvent;
-use crate::types::game_state::{GameState, WaitingFor};
+use crate::types::game_state::{CastOfferKind, GameState, WaitingFor};
 use crate::types::identifiers::ObjectId;
 use crate::types::zones::Zone;
 
@@ -15,7 +15,8 @@ use crate::types::zones::Zone;
 ///
 /// The second MV check (resulting-spell MV) is enforced at cast time in
 /// `casting_costs::finalize_cast_with_phyrexian_choices` via the
-/// `CastPermissionConstraint::CascadeResultingMvBelow` predicate, because X
+/// `CastPermissionConstraint::ManaValue` predicate carried on the hit's
+/// cast-during-resolution `ExileWithAltCost` permission (CR 608.2g), because X
 /// and other variable costs are only resolved at that point.
 pub fn resolve(
     state: &mut GameState,
@@ -26,13 +27,18 @@ pub fn resolve(
         return Err(EffectError::InvalidParam("Expected Cascade".to_string()));
     }
 
-    // CR 202.3b + CR 702.85a: Read source MV from the stack spell object.
-    // `mana_cost.mana_value()` contributes 0 for {X} shards (CR 107.3b), so
-    // add `cost_x_paid` to reflect the chosen value of X on the stack.
+    // CR 202.3b + CR 202.3d + CR 202.3e + CR 702.85a + CR 702.102b: Read the source
+    // spell's mana value from the stack object through the split-aware authority.
+    // `spell_mana_value` returns the COMBINED value of both halves for a FUSED split
+    // spell (CR 202.3d + CR 702.102b) and otherwise the object's own cost with the
+    // chosen X included (`cost_x_paid`, CR 202.3e) — so a fused `Breaking // Entering`
+    // that gained cascade seeds the threshold from its combined MV (8), not the front
+    // half (2). Byte-identical to the prior `mana_value_with_x(zone, cost_x_paid)`
+    // read for every non-fused spell.
     let source_mv = state
         .objects
         .get(&ability.source_id)
-        .map(|obj| obj.mana_cost.mana_value() + obj.cost_x_paid.unwrap_or(0))
+        .map(|obj| obj.spell_mana_value())
         .unwrap_or(0);
 
     // CR 603.3a: Re-read the controller from the source spell at resolution
@@ -90,7 +96,10 @@ pub fn resolve(
 
         let is_hit = state.objects.get(&card_id).is_some_and(|obj| {
             let is_land = obj.card_types.core_types.contains(&CoreType::Land);
-            let mv = obj.mana_cost.mana_value();
+            // CR 202.3d + CR 709.4b: the exiled card is off the stack, so a split
+            // card's mana value is its combined halves (front-only would misjudge
+            // the < source_mv hit test). No-ops for single-face cards.
+            let mv = obj.effective_mana_value();
             !is_land && mv < source_mv
         });
 
@@ -114,11 +123,13 @@ pub fn resolve(
             // here because a rejection at cast time (X makes resulting MV
             // ineligible) must still bottom-shuffle them together with the
             // hit, and that path runs from `casting_costs`.
-            state.waiting_for = WaitingFor::CascadeChoice {
+            state.waiting_for = WaitingFor::CastOffer {
                 player: controller,
-                hit_card: hit,
-                exiled_misses,
-                source_mv,
+                kind: CastOfferKind::Cascade {
+                    hit_card: hit,
+                    exiled_misses,
+                    source_mv,
+                },
             };
         }
         None => {
@@ -222,10 +233,13 @@ mod tests {
         resolve(&mut state, &ability, &mut events).unwrap();
 
         match &state.waiting_for {
-            WaitingFor::CascadeChoice {
-                hit_card,
-                exiled_misses,
-                source_mv,
+            WaitingFor::CastOffer {
+                kind:
+                    CastOfferKind::Cascade {
+                        hit_card,
+                        exiled_misses,
+                        source_mv,
+                    },
                 ..
             } => {
                 assert_eq!(*hit_card, hit);
@@ -233,6 +247,73 @@ mod tests {
                 assert_eq!(*source_mv, 4);
             }
             other => panic!("Expected CascadeChoice, got {:?}", other),
+        }
+    }
+
+    /// CR 202.3d + CR 702.102b + CR 702.85a: A FUSED split spell that gained
+    /// cascade seeds the cascade threshold from its COMBINED mana value, not the
+    /// front half. Breaking // Entering combines to MV 8 (front Breaking {U}{B} = 2,
+    /// back Entering {4}{B}{R} = 6); a nonland whose MV (5) sits BETWEEN the front
+    /// half (2) and the combined value (8) must be a cascade HIT. Reverting the
+    /// resolver to the front-half read seeds `source_mv = 2`, so the MV-5 card is a
+    /// miss (5 !< 2) and the offered `source_mv`/`hit_card` both flip.
+    #[test]
+    fn fused_split_spell_cascades_from_combined_mana_value() {
+        use crate::game::scenario::{GameScenario, P0};
+        use crate::game::scenario_db::GameScenarioDbExt;
+
+        let db = crate::test_support::shared_card_db();
+        let mut sc = GameScenario::new();
+        let source = sc.add_real_card(P0, "Breaking", Zone::Battlefield, db);
+        {
+            let obj = sc.state.objects.get_mut(&source).unwrap();
+            assert_eq!(
+                obj.spell_mana_value(),
+                2,
+                "precondition: a non-fused Breaking reads the front-half MV 2"
+            );
+            obj.fused_split_spell = true;
+            obj.keywords.push(Keyword::Cascade);
+        }
+        assert_eq!(
+            sc.state.objects.get(&source).unwrap().spell_mana_value(),
+            8,
+            "a fused Breaking // Entering has combined MV 8"
+        );
+
+        let mut state = sc.state;
+        // A nonland whose MV (5) is strictly between the front half (2) and the
+        // combined value (8): a hit under threshold 8, a miss under threshold 2.
+        let hit = add_library_card(&mut state, PlayerId(0), "Mid MV", 5, false);
+        state.players[0].library = im::vector![hit];
+
+        let ability = ResolvedAbility::new(Effect::Cascade, vec![], source, PlayerId(0));
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        match &state.waiting_for {
+            WaitingFor::CastOffer {
+                kind:
+                    CastOfferKind::Cascade {
+                        hit_card,
+                        source_mv,
+                        ..
+                    },
+                ..
+            } => {
+                assert_eq!(
+                    *source_mv, 8,
+                    "cascade source MV is the combined value (8), not the front half (2)"
+                );
+                assert_eq!(
+                    *hit_card, hit,
+                    "the MV-5 card is a cascade hit under the combined threshold (8)"
+                );
+            }
+            other => panic!(
+                "expected a Cascade offer with the MV-5 hit, got {:?}",
+                other
+            ),
         }
     }
 
@@ -250,9 +331,13 @@ mod tests {
         resolve(&mut state, &ability, &mut events).unwrap();
 
         match &state.waiting_for {
-            WaitingFor::CascadeChoice {
-                hit_card,
-                exiled_misses,
+            WaitingFor::CastOffer {
+                kind:
+                    CastOfferKind::Cascade {
+                        hit_card,
+                        exiled_misses,
+                        ..
+                    },
                 ..
             } => {
                 assert_eq!(*hit_card, hit);
@@ -279,7 +364,13 @@ mod tests {
         // No CascadeChoice produced — waiting_for remains whatever the initial
         // state was (resolver leaves it alone when library is exhausted).
         assert!(
-            !matches!(state.waiting_for, WaitingFor::CascadeChoice { .. }),
+            !matches!(
+                state.waiting_for,
+                WaitingFor::CastOffer {
+                    kind: CastOfferKind::Cascade { .. },
+                    ..
+                }
+            ),
             "No CascadeChoice should be offered when nothing hits"
         );
 
@@ -314,7 +405,10 @@ mod tests {
         resolve(&mut state, &ability, &mut events).unwrap();
 
         match &state.waiting_for {
-            WaitingFor::CascadeChoice { source_mv, .. } => assert_eq!(*source_mv, 5),
+            WaitingFor::CastOffer {
+                kind: CastOfferKind::Cascade { source_mv, .. },
+                ..
+            } => assert_eq!(*source_mv, 5),
             other => panic!("Expected CascadeChoice, got {:?}", other),
         }
     }
@@ -331,7 +425,13 @@ mod tests {
         resolve(&mut state, &ability, &mut events).unwrap();
 
         assert!(
-            !matches!(state.waiting_for, WaitingFor::CascadeChoice { .. }),
+            !matches!(
+                state.waiting_for,
+                WaitingFor::CastOffer {
+                    kind: CastOfferKind::Cascade { .. },
+                    ..
+                }
+            ),
             "No CascadeChoice should be offered with an empty library"
         );
         let missed = events.iter().find_map(|e| match e {
@@ -365,7 +465,13 @@ mod tests {
         resolve(&mut state, &ability, &mut events).unwrap();
 
         assert!(
-            !matches!(state.waiting_for, WaitingFor::CascadeChoice { .. }),
+            !matches!(
+                state.waiting_for,
+                WaitingFor::CastOffer {
+                    kind: CastOfferKind::Cascade { .. },
+                    ..
+                }
+            ),
             "No CascadeChoice should be offered when no nonland is hit"
         );
         let missed = events.iter().find_map(|e| match e {
@@ -408,6 +514,12 @@ mod tests {
             obj.mana_cost = ManaCost::generic(5);
             obj.keywords.push(Keyword::Cascade);
             obj.keywords.push(Keyword::Cascade);
+            // CR 611.2f: the Cascade seam counts instances from the cast-time
+            // keyword snapshot (`cast_spell_keywords`) stamped by `finalize_cast`
+            // (`effective_spell_keyword_instances` preserves printed duplicates).
+            // This test bypasses finalize, so mirror the two printed instances.
+            obj.cast_spell_keywords.push(Keyword::Cascade);
+            obj.cast_spell_keywords.push(Keyword::Cascade);
         }
 
         // Drive the trigger synthesizer with a SpellCast event for spell_id.

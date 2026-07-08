@@ -1,13 +1,18 @@
+use std::collections::HashSet;
+
 use crate::game::combat::has_summoning_sickness;
 use crate::game::coverage::unimplemented_mechanics;
 use crate::game::devotion::count_devotion;
+use crate::game::functioning_abilities::game_active_statics;
 use crate::game::mana_abilities;
 use crate::game::mana_sources::display_land_mana_pips;
 use crate::game::static_abilities::{check_static_ability, StaticCheckContext};
 use crate::types::ability::StaticCondition;
 use crate::types::card_type::CoreType;
-use crate::types::game_state::GameState;
-use crate::types::statics::StaticMode;
+use crate::types::game_state::{GameState, WaitingFor};
+use crate::types::identifiers::ObjectId;
+use crate::types::player::PlayerId;
+use crate::types::statics::{ProhibitionScope, StaticMode};
 use crate::types::zones::Zone;
 
 /// Compute display-only derived fields (CR 302.6 summoning sickness, CR 700.5 devotion).
@@ -71,6 +76,12 @@ pub fn derive_display_state(state: &mut GameState) {
     // token never triggers this auto-tap sweep over every land.
     if dirty.mana_display_dirty || dirty.all_objects_dirty {
         let battlefield_ids: Vec<_> = state.battlefield.iter().copied().collect();
+        crate::game::perf_counters::record_mana_display_sweep(battlefield_ids.len());
+        // CR 604.1: hoist the activation-prohibition existence gates ONCE before
+        // the per-source readiness checks. Without this, each of the (up to N)
+        // mana sources re-scans the whole battlefield for City-of-Solitude-class
+        // statics, making this sweep O(N^2) on go-wide mana boards.
+        let activation_gates = mana_abilities::ManaActivationGates::compute(state);
         let mana_availability: Vec<(crate::types::identifiers::ObjectId, Option<usize>, _)> =
             battlefield_ids
                 .into_iter()
@@ -82,12 +93,13 @@ pub fn derive_display_state(state: &mut GameState) {
                         .enumerate()
                         .find(|(idx, ability)| {
                             mana_abilities::is_mana_ability(ability)
-                                && mana_abilities::can_activate_mana_ability_now(
+                                && mana_abilities::can_activate_mana_ability_now_gated(
                                     state,
                                     obj.controller,
                                     obj.id,
                                     *idx,
                                     ability,
+                                    &activation_gates,
                                 )
                         })
                         .map(|(idx, _)| idx);
@@ -229,7 +241,9 @@ pub fn derive_display_state(state: &mut GameState) {
 
     // Derive has_pending_cast so the frontend can read it directly
     // without maintaining a parallel list of casting-flow WaitingFor states.
-    state.has_pending_cast = state.waiting_for.has_pending_cast();
+    state.has_pending_cast = state.waiting_for.has_pending_cast()
+        || (matches!(state.waiting_for, WaitingFor::DistributeAmong { .. })
+            && state.pending_cast.is_some());
 
     // Invariant: the two storage sites for "am I mid-cast" must agree. If
     // `waiting_for` says we're mid-cast, `GameState::pending_cast` must be
@@ -244,6 +258,102 @@ pub fn derive_display_state(state: &mut GameState) {
         "has_pending_cast is true but no PendingCast is reachable — drift in {:?}",
         std::mem::discriminant(&state.waiting_for)
     );
+
+    // CR 400.2: Continuous "play with the top card of your library revealed"
+    // statics (Future Sight, Magus of the Future) must keep the library top in
+    // `revealed_cards` across action boundaries — `apply_action` clears
+    // momentary reveals at the start of each action, so re-sync here on every
+    // derive pass before the state is exported to clients.
+    sync_continuous_reveals(state);
+}
+
+/// CR 400.2 / CR 701.20a: Repopulate `revealed_cards` for every active
+/// continuous reveal static after action-boundary clears (`apply_action` wipes
+/// momentary reveals at the start of each action). One pass over
+/// `game_active_statics` dispatches BOTH the `RevealTopOfLibrary` ("play with
+/// the top card of your library revealed" — Future Sight, Magus of the Future)
+/// and `RevealHand` ("play with hands revealed") statics, so callers get the
+/// authoritative reveal set without scanning the statics twice.
+///
+/// Public because the AI determinizer (`phase-ai/determinize.rs`) calls it on
+/// its simulation clone to pin statically-revealed cards before resampling —
+/// the reveal rule is an engine visibility concern (CR 400.2) and stays owned
+/// here rather than being recomputed AI-side.
+pub fn sync_continuous_reveals(state: &mut GameState) {
+    let mut reveal_top_all = false;
+    let mut reveal_top_controllers = HashSet::<PlayerId>::new();
+    let mut reveal_hand_all = false;
+    let mut reveal_hand_controllers = HashSet::<PlayerId>::new();
+    let mut reveal_hand_opponents_of = HashSet::<PlayerId>::new();
+
+    for (source, def) in game_active_statics(state) {
+        match &def.mode {
+            StaticMode::RevealTopOfLibrary { all_players } => {
+                if *all_players {
+                    reveal_top_all = true;
+                } else {
+                    reveal_top_controllers.insert(source.controller);
+                }
+            }
+            StaticMode::RevealHand { who } => match who {
+                ProhibitionScope::AllPlayers => reveal_hand_all = true,
+                ProhibitionScope::Controller => {
+                    reveal_hand_controllers.insert(source.controller);
+                }
+                ProhibitionScope::Opponents => {
+                    reveal_hand_opponents_of.insert(source.controller);
+                }
+                ProhibitionScope::EnchantedCreatureController => {}
+            },
+            _ => {}
+        }
+    }
+
+    // Library-top reveals (collect owned Vec first so the immutable player read
+    // completes before the mutable `revealed_cards` write).
+    if reveal_top_all || !reveal_top_controllers.is_empty() {
+        let tops: Vec<ObjectId> = if reveal_top_all {
+            state
+                .players
+                .iter()
+                .filter_map(|player| player.library.front().copied())
+                .collect()
+        } else {
+            reveal_top_controllers
+                .into_iter()
+                .filter_map(|controller| {
+                    state
+                        .players
+                        .iter()
+                        .find(|player| player.id == controller)
+                        .and_then(|player| player.library.front().copied())
+                })
+                .collect()
+        };
+        for top in tops {
+            state.revealed_cards.insert(top);
+        }
+    }
+
+    // Hand reveals.
+    if reveal_hand_all
+        || !reveal_hand_controllers.is_empty()
+        || !reveal_hand_opponents_of.is_empty()
+    {
+        let hand_cards: Vec<ObjectId> = state
+            .players
+            .iter()
+            .filter(|player| {
+                reveal_hand_all
+                    || reveal_hand_controllers.contains(&player.id)
+                    || reveal_hand_opponents_of
+                        .iter()
+                        .any(|controller| player.id != *controller)
+            })
+            .flat_map(|player| player.hand.iter().copied())
+            .collect();
+        state.revealed_cards.extend(hand_cards);
+    }
 }
 
 /// Commander damage received by `victim`, grouped by the commander's
@@ -288,8 +398,10 @@ pub fn commander_damage_received(
 mod tests {
     use super::*;
     use crate::game::zones::create_object;
+    use crate::types::ability::StaticDefinition;
     use crate::types::identifiers::CardId;
     use crate::types::player::PlayerId;
+    use crate::types::statics::ProhibitionScope;
     use crate::types::zones::Zone;
 
     #[test]
@@ -360,6 +472,90 @@ mod tests {
         // Should have set the flag (false for a card with no mechanics)
         let obj = &state.objects[&id];
         assert!(obj.unimplemented_mechanics.is_empty());
+    }
+
+    #[test]
+    fn derive_reveals_opponents_hands_for_static_reveal_hand() {
+        let mut state = GameState::new_two_player(42);
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Telepathy".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&source)
+            .unwrap()
+            .static_definitions
+            .push(StaticDefinition::new(StaticMode::RevealHand {
+                who: ProhibitionScope::Opponents,
+            }));
+        let controller_card = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Controller Card".to_string(),
+            Zone::Hand,
+        );
+        let opponent_card = create_object(
+            &mut state,
+            CardId(3),
+            PlayerId(1),
+            "Opponent Card".to_string(),
+            Zone::Hand,
+        );
+
+        derive_display_state(&mut state);
+
+        assert!(
+            !state.revealed_cards.contains(&controller_card),
+            "Telepathy-style static must not reveal its controller's hand"
+        );
+        assert!(
+            state.revealed_cards.contains(&opponent_card),
+            "Telepathy-style static must reveal opponents' hands"
+        );
+    }
+
+    #[test]
+    fn derive_reveals_all_hands_for_static_reveal_hand() {
+        let mut state = GameState::new_two_player(42);
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Revelation".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&source)
+            .unwrap()
+            .static_definitions
+            .push(StaticDefinition::new(StaticMode::RevealHand {
+                who: ProhibitionScope::AllPlayers,
+            }));
+        let controller_card = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Controller Card".to_string(),
+            Zone::Hand,
+        );
+        let opponent_card = create_object(
+            &mut state,
+            CardId(3),
+            PlayerId(1),
+            "Opponent Card".to_string(),
+            Zone::Hand,
+        );
+
+        derive_display_state(&mut state);
+
+        assert!(state.revealed_cards.contains(&controller_card));
+        assert!(state.revealed_cards.contains(&opponent_card));
     }
 
     #[test]

@@ -7,7 +7,7 @@
 //!
 //! These tests pin the
 //! `PayCost { Life(Ref(Power { scope: CostPaidObject })) }`
-//! resolution enabled by the PaymentCost::Life → QuantityExpr widening. The
+//! resolution enabled by the PayCost life-cost → QuantityExpr widening. The
 //! `CostPaidObject` scope resolves (CR 608.2k) via cost-paid object →
 //! trigger-event source → effect-context object; with no cost-paid object
 //! these tests exercise the trigger-event-source (slot 2) fallback:
@@ -27,7 +27,7 @@
 use engine::game::effects;
 use engine::game::zones::create_object;
 use engine::types::ability::{
-    AbilityKind, Effect, ObjectScope, PaymentCost, QuantityExpr, QuantityRef, ResolvedAbility,
+    AbilityCost, AbilityKind, Effect, ObjectScope, QuantityExpr, QuantityRef, ResolvedAbility,
     TargetFilter,
 };
 use engine::types::card_type::CoreType;
@@ -57,13 +57,14 @@ use engine::types::zones::Zone;
 fn build_madame_null_pay_chain(source_id: ObjectId, controller: PlayerId) -> ResolvedAbility {
     let mut outer = ResolvedAbility::new(
         Effect::PayCost {
-            cost: PaymentCost::Life {
+            cost: AbilityCost::PayLife {
                 amount: QuantityExpr::Ref {
                     qty: QuantityRef::Power {
                         scope: ObjectScope::CostPaidObject,
                     },
                 },
             },
+            scale: None,
             payer: TargetFilter::Controller,
         },
         vec![],
@@ -98,11 +99,19 @@ fn set_etb_event(state: &mut GameState, entering: ObjectId) {
             controller: PlayerId(0),
             owner: PlayerId(0),
             from_zone: Some(Zone::Hand),
+            cast_from_zone: None,
+            played_from_zone: None,
             to_zone: Zone::Battlefield,
             attachments: Vec::new(),
             linked_exile_snapshot: Vec::new(),
             is_token: false,
             combat_status: Default::default(),
+            trigger_definitions: Vec::new(),
+            co_departed: Vec::new(),
+            attached_to: None,
+            entered_incarnation: None,
+            turn_zone_change_index: 0,
+            is_suspected: false,
         }),
     });
 }
@@ -199,6 +208,7 @@ fn lki_fallback_resolves_source_power_after_zone_change() {
         dead_id,
         LKISnapshot {
             name: "Bounced Bear".to_string(),
+            token_image_ref: None,
             power: Some(4),
             toughness: Some(4),
             base_power: Some(4),
@@ -211,7 +221,10 @@ fn lki_fallback_resolves_source_power_after_zone_change() {
             supertypes: vec![],
             keywords: vec![],
             colors: vec![],
+            chosen_attributes: Vec::new(),
             counters: HashMap::new(),
+            tapped: false,
+            is_suspected: false,
         },
     );
     set_etb_event(&mut state, dead_id);

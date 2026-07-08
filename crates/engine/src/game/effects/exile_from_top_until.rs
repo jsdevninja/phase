@@ -49,14 +49,13 @@ pub fn resolve(
         _ => return Err(EffectError::MissingParam("until".to_string())),
     };
 
-    let acting_player = if matches!(
-        player_filter,
-        crate::types::ability::TargetFilter::Controller
-    ) {
-        ability.scoped_player.unwrap_or(ability.controller)
-    } else {
-        super::resolve_player_for_context_ref(state, ability, player_filter)
-    };
+    // CR 109.5 + CR 608.2c: "your library" lowers to `TargetFilter::Controller`
+    // (the ability's controller). Mirror `exile_top::resolve` — do not consult
+    // `scoped_player`, which carries event-bound players on combat-damage triggers
+    // (The Infamous Cruelclaw, issue #2881) and would exile from the wrong library.
+    // Per-iteration "their library" uses `TargetFilter::ScopedPlayer` or a typed
+    // `ControllerRef::ScopedPlayer` filter instead.
+    let acting_player = super::resolve_player_for_context_ref(state, ability, player_filter);
     let player = state
         .players
         .iter()
@@ -99,10 +98,13 @@ pub fn resolve(
             ability.source_id,
             ability.duration.as_ref(),
             false,
-            false,
+            crate::types::zones::EtbTapState::Unspecified,
             None,
             &[],
+            None,
             track_exiled_by_source,
+            None,
+            None,
             events,
         ) {
             super::change_zone::ZoneMoveResult::Done => {}
@@ -111,6 +113,7 @@ pub fn resolve(
                     crate::game::replacement::replacement_choice_waiting_for(player, state);
                 return Ok(());
             }
+            super::change_zone::ZoneMoveResult::NeedsAuraAttachmentChoice => return Ok(()),
         }
 
         match until {
@@ -161,7 +164,27 @@ pub fn resolve(
             UntilCondition::NextMatches { .. } => {
                 if let Some(hit) = hit_id {
                     let mut sub_clone = sub.as_ref().clone();
-                    sub_clone.targets = vec![TargetRef::Object(hit)];
+                    // CR 608.2c + CR 610.3: Sub-ability target injection is conditional
+                    // on the sub-ability's effect filter:
+                    //
+                    // * Filter references `ExiledBySource` (Etali Primal Conqueror's
+                    //   "cast any number of spells from among the nonland cards exiled
+                    //   this way", Improvisation Capstone class) — leave `targets`
+                    //   untouched (parser-emitted, empty) so `cast_from_zone::resolve`
+                    //   enumerates the full per-resolution exile-link set via
+                    //   `linked_exile_cards_for_source`. Pre-binding the single hit
+                    //   here would limit the offer to one card per player-iteration
+                    //   rather than the union across players.
+                    //
+                    // * Filter does NOT reference `ExiledBySource` (Chaos Wand /
+                    //   Fallen Shinobi "cast that card" with `ParentTarget`, "put N
+                    //   counters on it" `PutCounter { target: ParentTarget }`,
+                    //   Cascade-shape "put it onto the battlefield") — inject the hit
+                    //   as the parent target so anaphoric `ParentTarget` / `SelfRef`
+                    //   references resolve to the just-exiled card.
+                    if !sub_effect_references_exiled_by_source(&sub_clone) {
+                        sub_clone.targets = vec![TargetRef::Object(hit)];
+                    }
                     sub_clone.context = ability.context.clone();
                     super::resolve_ability_chain(state, &sub_clone, events, 1)?;
                 }
@@ -177,6 +200,17 @@ pub fn resolve(
     Ok(())
 }
 
+/// CR 608.2c: Decide whether the sub-ability's effect filter forwards the
+/// per-resolution single hit (`ParentTarget` / `SelfRef` consumers) or the
+/// whole tracked-exile set (`ExiledBySource` consumers). Delegates to
+/// `extract_target_filter_from_effect` so target-filter extraction stays
+/// in lockstep with the canonical accessor used by stack/trigger code.
+fn sub_effect_references_exiled_by_source(sub: &ResolvedAbility) -> bool {
+    crate::game::triggers::extract_target_filter_from_effect(&sub.effect)
+        .map(crate::types::ability::TargetFilter::references_exiled_by_source)
+        .unwrap_or(false)
+}
+
 /// CR 202.3 / CR 208 / CR 209: Look up the requested measurable property of an
 /// exiled object. Mirrors the per-property dispatch used by
 /// `quantity::resolve_quantity`'s aggregate-of-objects branch so both
@@ -187,9 +221,15 @@ fn extract_property(state: &GameState, obj_id: ObjectId, property: ObjectPropert
     };
     match property {
         ObjectProperty::Power => obj.power.unwrap_or(0),
-        // CR 202.3e: `mana_value()` excludes X (treats X as 0 outside the stack).
-        ObjectProperty::ManaValue => i32::try_from(obj.mana_cost.mana_value()).unwrap_or(i32::MAX),
+        // CR 202.3d + CR 202.3e + CR 709.4b: combined MV for a split card off the
+        // stack (X treated as 0 off the stack, chosen half on the stack).
+        ObjectProperty::ManaValue => i32::try_from(obj.effective_mana_value()).unwrap_or(i32::MAX),
         ObjectProperty::Toughness => obj.toughness.unwrap_or(0),
+        // CR 107.4a + CR 202.1: colored mana symbols of `color` in the cost.
+        ObjectProperty::ManaSymbolCount(color) => i32::try_from(
+            crate::game::devotion::count_cost_color_symbols(&obj.mana_cost, color),
+        )
+        .unwrap_or(i32::MAX),
     }
 }
 
@@ -199,9 +239,9 @@ mod tests {
     use crate::game::engine::apply;
     use crate::game::zones::create_object;
     use crate::types::ability::{
-        AbilityDefinition, AbilityKind, CardPlayMode, Comparator, ControllerRef, LibraryPosition,
-        PlayerFilter, QuantityExpr, ReplacementDefinition, ResolvedAbility, TargetFilter,
-        TargetRef, TypeFilter, TypedFilter,
+        AbilityDefinition, AbilityKind, CardPlayMode, CastingPermission, Comparator, ControllerRef,
+        LibraryPosition, PlayerFilter, QuantityExpr, ReplacementDefinition, ResolvedAbility,
+        TargetFilter, TargetRef, TypeFilter, TypedFilter,
     };
     use crate::types::actions::GameAction;
     use crate::types::card_type::CoreType;
@@ -323,7 +363,9 @@ mod tests {
 
         let mut ability = ResolvedAbility::new(
             Effect::ExileFromTopUntil {
-                player: TargetFilter::Controller,
+                // CR 608.2c: faced-player villainous-choice branches bind
+                // "their library" to the scoped event player, not Controller.
+                player: TargetFilter::ScopedPlayer,
                 until: UntilCondition::NextMatches {
                     filter: nonland_filter(),
                 },
@@ -402,6 +444,9 @@ mod tests {
                 cast_transformed: false,
                 alt_ability_cost: None,
                 constraint: None,
+                duration: None,
+                driver: crate::types::ability::CastFromZoneDriver::LingeringPermission,
+                mana_spend_permission: None,
             },
             vec![],
             source,
@@ -504,6 +549,9 @@ mod tests {
                 cast_transformed: false,
                 alt_ability_cost: None,
                 constraint: None,
+                duration: None,
+                driver: crate::types::ability::CastFromZoneDriver::LingeringPermission,
+                mana_spend_permission: None,
             },
             vec![],
             source,
@@ -572,10 +620,13 @@ mod tests {
                             owner_library: false,
                             enter_transformed: false,
                             enters_under: None,
-                            enter_tapped: false,
+                            enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                             enters_attacking: false,
                             up_to: false,
                             enter_with_counters: vec![],
+                            conditional_enter_with_counters: vec![],
+                            face_down_profile: None,
+                            enters_modified_if: None,
                         },
                     ))
                     .destination_zone(Zone::Exile),
@@ -684,6 +735,140 @@ mod tests {
                 state.objects.get(id).unwrap().zone,
                 Zone::Exile,
                 "card should be in exile"
+            );
+        }
+    }
+
+    /// CR 608.2c + CR 610.3 + CR 118.9 + CR 701.13a: Etali Primal Conqueror —
+    /// `player_scope: All` outer + `NextMatches` exile-until + `CastFromZone`
+    /// sub-ability whose filter references `ExiledBySource`. After per-player
+    /// iteration writes one ExileLink per hit per player, the guard at the
+    /// `NextMatches` sub-ability dispatch must skip the single-hit pre-bind
+    /// so `cast_from_zone::resolve` enumerates every linked card via
+    /// `linked_exile_cards_for_source` and grants `ExileWithAltCost { zero }`
+    /// to each — NOT just the single-hit `ObjectId`.
+    ///
+    /// Negative-control siblings (Chaos Wand `targeted_player_accept_cast_...`,
+    /// `put_counter_it_after_exile_from_top_until_resolves_to_parent_target`)
+    /// must remain green, proving the guard preserves the pre-bind for
+    /// `ParentTarget`-shape consumers.
+    #[test]
+    fn etali_each_player_exile_until_grants_cast_permission_to_every_linked_hit() {
+        let mut state = GameState::new(FormatConfig::standard(), 3, 42);
+        let source = create_object(
+            &mut state,
+            CardId(100),
+            PlayerId(0),
+            "Etali, Primal Conqueror".to_string(),
+            Zone::Battlefield,
+        );
+
+        // Each player's library: one Land then one Creature (the nonland hit).
+        let p0_land = add_library_card(&mut state, PlayerId(0), "P0 Forest", true);
+        let p0_hit = add_library_card(&mut state, PlayerId(0), "P0 Beast", false);
+        state.players[0].library = crate::im::vector![p0_land, p0_hit];
+
+        let p1_land = add_library_card(&mut state, PlayerId(1), "P1 Mountain", true);
+        let p1_hit = add_library_card(&mut state, PlayerId(1), "P1 Goblin", false);
+        state.players[1].library = crate::im::vector![p1_land, p1_hit];
+
+        let p2_land = add_library_card(&mut state, PlayerId(2), "P2 Plains", true);
+        let p2_hit = add_library_card(&mut state, PlayerId(2), "P2 Soldier", false);
+        state.players[2].library = crate::im::vector![p2_land, p2_hit];
+
+        // Sub-ability: CastFromZone with filter referencing ExiledBySource (the
+        // Etali shape after the parser fix). With empty targets, the guard at
+        // the NextMatches dispatch must skip the single-hit pre-bind so
+        // cast_from_zone::resolve materializes every linked exile card.
+        let cast_sub = ResolvedAbility::new(
+            Effect::CastFromZone {
+                target: TargetFilter::And {
+                    filters: vec![TargetFilter::ExiledBySource, nonland_filter()],
+                },
+                without_paying_mana_cost: true,
+                mode: CardPlayMode::Cast,
+                cast_transformed: false,
+                alt_ability_cost: None,
+                constraint: None,
+                duration: None,
+                driver: crate::types::ability::CastFromZoneDriver::LingeringPermission,
+                mana_spend_permission: None,
+            },
+            vec![],
+            source,
+            PlayerId(0),
+        );
+
+        let mut wrapped = ResolvedAbility::new(
+            Effect::ExileFromTopUntil {
+                player: TargetFilter::Controller,
+                until: UntilCondition::NextMatches {
+                    filter: nonland_filter(),
+                },
+            },
+            vec![],
+            source,
+            PlayerId(0),
+        );
+        wrapped.player_scope = Some(PlayerFilter::All);
+        wrapped.sub_ability = Some(Box::new(cast_sub));
+
+        let mut events = Vec::new();
+        super::super::resolve_ability_chain(&mut state, &wrapped, &mut events, 0).unwrap();
+
+        // All six cards should be in exile (lands + nonland hits).
+        for id in &[p0_land, p0_hit, p1_land, p1_hit, p2_land, p2_hit] {
+            assert_eq!(
+                state.objects.get(id).unwrap().zone,
+                Zone::Exile,
+                "card {:?} should be in exile",
+                id
+            );
+        }
+
+        // CR 608.2 + CR 406.6: Exactly six TrackedBySource links — one per
+        // exiled card per player-iteration. A regression that collapsed
+        // `player_scope: All` to a single iteration (or that double-counted
+        // a single player's library) would fail this count check even if the
+        // permission-grant assertions below happened to still pass.
+        let linked_count = state
+            .exile_links
+            .iter()
+            .filter(|l| l.source_id == source)
+            .count();
+        assert_eq!(
+            linked_count, 6,
+            "expected 6 source-linked exiles (3 lands + 3 hits), got {linked_count}",
+        );
+
+        // Every nonland hit must carry ExileWithAltCost { zero } granted to
+        // Etali's controller (PlayerId(0)). Lands must NOT — the AND with the
+        // nonland filter excludes them from the cast permission.
+        for &hit in &[p0_hit, p1_hit, p2_hit] {
+            let perms = &state.objects[&hit].casting_permissions;
+            let zero_cost_etali_permissions = perms
+                .iter()
+                .filter(|p| {
+                    matches!(
+                        p,
+                        CastingPermission::ExileWithAltCost { cost, granted_to: Some(g), .. }
+                            if *cost == ManaCost::zero() && *g == PlayerId(0)
+                    )
+                })
+                .count();
+            assert_eq!(
+                zero_cost_etali_permissions,
+                1,
+                "nonland hit {:?} must have ExileWithAltCost {{ zero, granted_to: PlayerId(0) }} in casting_permissions={:?}",
+                hit,
+                perms
+            );
+        }
+        for &land in &[p0_land, p1_land, p2_land] {
+            assert!(
+                state.objects[&land].casting_permissions.is_empty(),
+                "land {:?} must not have casting permissions (typed leg excludes it)",
+                land
             );
         }
     }

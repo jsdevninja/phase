@@ -4,6 +4,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { GameObject, WaitingFor } from "../../../adapter/types.ts";
 import { CategoryChoiceModal } from "../CategoryChoiceModal.tsx";
 import { useGameStore } from "../../../stores/gameStore.ts";
+import { buildGameObjectWithCoreTypes } from "../../../test/factories/gameObjectFactory.ts";
+import { buildGameState } from "../../../test/factories/gameStateFactory.ts";
 
 const dispatchMock = vi.fn();
 
@@ -14,47 +16,23 @@ vi.mock("../../../hooks/useGameDispatch.ts", () => ({
 type CategoryChoice = Extract<WaitingFor, { type: "CategoryChoice" }>;
 
 function makeObject(id: number, name: string, coreTypes: string[]): GameObject {
-  return {
+  return buildGameObjectWithCoreTypes(coreTypes, {
     id,
     card_id: 1,
-    owner: 0,
-    controller: 0,
     zone: "Battlefield",
-    tapped: false,
-    face_down: false,
-    flipped: false,
-    transformed: false,
-    damage_marked: 0,
-    dealt_deathtouch_damage: false,
-    attached_to: null,
-    attachments: [],
-    counters: {},
     name,
     power: 1,
     toughness: 1,
-    loyalty: null,
-    card_types: { supertypes: [], core_types: coreTypes, subtypes: [] },
-    mana_cost: { type: "NoCost" },
-    keywords: [],
-    abilities: [],
-    trigger_definitions: [],
-    replacement_definitions: [],
-    static_definitions: [],
-    color: [],
     base_power: 1,
     base_toughness: 1,
-    base_keywords: [],
-    base_color: [],
     timestamp: 1,
     entered_battlefield_turn: 1,
-  } as unknown as GameObject;
+  });
 }
 
 function setUpObjects(objects: Record<string, GameObject>) {
   useGameStore.setState({
-    gameState: { objects } as unknown as ReturnType<
-      typeof useGameStore.getState
-    >["gameState"],
+    gameState: buildGameState({ objects }),
   });
 }
 
@@ -72,6 +50,7 @@ function categoryData(
     source_id: 1,
     remaining_players: [],
     all_kept: [],
+    scoped_players: [0],
     ...overrides,
   };
 }
@@ -118,9 +97,10 @@ describe("CategoryChoiceModal", () => {
     expect(noneButton).toBeDisabled();
   });
 
-  it("disables an artifact creature in the Creature category once chosen as Artifact", () => {
+  it("allows one artifact creature to be chosen in multiple category slots", () => {
     render(<CategoryChoiceModal data={categoryData()} />);
 
+    expect(screen.getByRole("button", { name: "Confirm" })).toBeDisabled();
     const hellkiteButtons = screen.getAllByRole("button", { name: "Steel Hellkite" });
     // Both enabled before selection.
     expect(hellkiteButtons[0]).not.toBeDisabled();
@@ -131,11 +111,19 @@ describe("CategoryChoiceModal", () => {
 
     const afterButtons = screen.getAllByRole("button", { name: "Steel Hellkite" });
     expect(afterButtons[0]).toHaveAttribute("aria-pressed", "true");
-    // The Creature-section copy is now disabled (engine duplicate-object rule).
-    expect(afterButtons[1]).toBeDisabled();
+    expect(afterButtons[1]).not.toBeDisabled();
+
+    fireEvent.click(afterButtons[1]);
+    expect(screen.getByRole("button", { name: "Confirm" })).not.toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "Confirm" }));
+
+    expect(dispatchMock).toHaveBeenCalledWith({
+      type: "SelectCategoryPermanents",
+      data: { choices: [57, 57] },
+    });
   });
 
-  it("dispatches SelectCategoryPermanents with the chosen choices including null", () => {
+  it("dispatches SelectCategoryPermanents with all nonempty categories chosen", () => {
     render(<CategoryChoiceModal data={categoryData()} />);
 
     fireEvent.click(screen.getByRole("button", { name: "Sol Ring" }));

@@ -14,7 +14,7 @@
 //! - `TypeFilter::Subtype(String)` at `ability.rs:794`;
 //!   `TypedFilter::get_subtype()` at `ability.rs:1061`.
 //! - `Effect::Token { types: Vec<String>, .. }` at `ability.rs:2131`.
-//! - `StaticMode::ReduceCost { spell_filter: Option<TargetFilter>, .. }`
+//! - `StaticMode::ModifyCost { spell_filter: Option<TargetFilter>, .. }`
 //!   at `statics.rs:136`.
 //! - `TriggerDefinition.execute: Option<Box<AbilityDefinition>>`
 //!   at `ability.rs:4520`.
@@ -37,16 +37,22 @@ use engine::types::ability::{
 };
 use engine::types::card::CardFace;
 use engine::types::card_type::CoreType;
-use engine::types::statics::StaticMode;
+use engine::types::statics::{CostModifyMode, StaticMode};
 use engine::types::triggers::TriggerMode;
 use engine::types::zones::Zone;
 
 use crate::ability_chain::collect_chain_effects;
+use crate::features::commitment;
 
 /// Minimum dominant-tribe commitment required to set `dominant_tribe`.
 /// CR 205.3: subtypes determine tribal membership; below this floor the
 /// tribe is incidental rather than a deck-defining axis.
 const DOMINANCE_FLOOR: f32 = 0.25;
+
+/// Minimum member support required before per-60 density can classify a tribe
+/// as dominant. This prevents tiny or singleton samples from looking fully
+/// dense after format-neutral normalization.
+const DOMINANT_TRIBE_MEMBER_FLOOR: u32 = 4;
 
 /// Maximum number of `TribeEntry` records retained (ranked by commitment desc).
 const MAX_TRIBES: usize = 4;
@@ -112,9 +118,13 @@ pub fn detect(deck: &[DeckEntry]) -> TribalFeature {
     // ---- Pass 1: membership census ----
     // For each creature/kindred card, add its count to every listed subtype.
     let mut tribe_map: BTreeMap<String, TribeEntry> = BTreeMap::new();
+    let mut total_nonland = 0u32;
 
     for entry in deck {
         let face = &entry.card;
+        if !face.card_type.core_types.contains(&CoreType::Land) {
+            total_nonland = total_nonland.saturating_add(entry.count);
+        }
         if !is_tribal_member_type(face) {
             continue;
         }
@@ -172,12 +182,28 @@ pub fn detect(deck: &[DeckEntry]) -> TribalFeature {
     // ---- Commitment formula per tribe ----
     // CR 205.3 + CR 613.4c: weighted combination of tribal indicators.
     for te in tribe_map.values_mut() {
-        let raw = 0.03 * te.member_count as f32
-            + 0.15 * te.lord_count as f32
-            + 0.10 * te.etb_payoff_count as f32
-            + 0.10 * te.cost_reducer_count as f32
-            + 0.06 * te.token_gen_count as f32;
-        te.commitment = raw.min(1.0);
+        te.commitment = commitment::weighted_sum(&[
+            (
+                0.03,
+                commitment::density_per_60(te.member_count, total_nonland),
+            ),
+            (
+                0.15,
+                commitment::density_per_60(te.lord_count, total_nonland),
+            ),
+            (
+                0.10,
+                commitment::density_per_60(te.etb_payoff_count, total_nonland),
+            ),
+            (
+                0.10,
+                commitment::density_per_60(te.cost_reducer_count, total_nonland),
+            ),
+            (
+                0.06,
+                commitment::density_per_60(te.token_gen_count, total_nonland),
+            ),
+        ]);
     }
 
     // ---- Dominant tribe selection ----
@@ -192,14 +218,14 @@ pub fn detect(deck: &[DeckEntry]) -> TribalFeature {
     });
 
     let dominant_tribe = sorted.first().and_then(|te| {
-        if te.commitment >= DOMINANCE_FLOOR {
+        if te.member_count >= DOMINANT_TRIBE_MEMBER_FLOOR && te.commitment >= DOMINANCE_FLOOR {
             Some(te.subtype.clone())
         } else {
             None
         }
     });
     let commitment = sorted.first().map_or(0.0, |te| {
-        if te.commitment >= DOMINANCE_FLOOR {
+        if te.member_count >= DOMINANT_TRIBE_MEMBER_FLOOR && te.commitment >= DOMINANCE_FLOOR {
             te.commitment
         } else {
             0.0
@@ -301,11 +327,12 @@ fn trigger_is_etb_payoff_for(t: &engine::types::ability::TriggerDefinition, trib
     filter_references_tribe_you_control(filter, tribe)
 }
 
-/// True if this face has a `ReduceCost` static whose `spell_filter` references
+/// True if this face has a `ModifyCost` (Reduce) static whose `spell_filter` references
 /// the tribe's subtype.
 fn is_cost_reducer(face: &CardFace, tribe: &str) -> bool {
     face.static_abilities.iter().any(|s| {
-        if let StaticMode::ReduceCost {
+        if let StaticMode::ModifyCost {
+            mode: CostModifyMode::Reduce,
             spell_filter: Some(filter),
             ..
         } = &s.mode
@@ -402,7 +429,7 @@ mod tests {
     };
     use engine::types::card::CardFace;
     use engine::types::card_type::{CardType, CoreType};
-    use engine::types::statics::StaticMode;
+    use engine::types::statics::{CostModifyMode, StaticMode};
     use engine::types::triggers::TriggerMode;
     use engine::types::zones::Zone;
 
@@ -547,7 +574,8 @@ mod tests {
         let mut reducer = creature_face("Elf Cost Reducer", vec!["Elf"]);
         reducer
             .static_abilities
-            .push(StaticDefinition::new(StaticMode::ReduceCost {
+            .push(StaticDefinition::new(StaticMode::ModifyCost {
+                mode: CostModifyMode::Reduce,
                 amount: ManaCost::generic(1),
                 spell_filter: Some(TargetFilter::Typed(TypedFilter::new(TypeFilter::Subtype(
                     "Elf".to_string(),
@@ -680,7 +708,7 @@ mod tests {
 
     #[test]
     fn dominance_floor_rejects_incidental_tribes() {
-        // A single 1-of creature: 0.03 * 1 = 0.03 < DOMINANCE_FLOOR 0.25
+        // A single 1-of creature lacks enough support to be deck-defining.
         let face = creature_face("Rare Merfolk", vec!["Merfolk"]);
         let deck = vec![entry(face, 1)];
 

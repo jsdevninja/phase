@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import {
   fetchCardImageAsset,
@@ -9,6 +9,7 @@ import {
   getCardPrintings,
   isCardImageFlipLayoutSync,
   isCardImageRotatedSync,
+  pickOldestPrinting,
   resolveFaceIndexSync,
   resolveOracleIdSync,
   resolvePrintingImageUrl,
@@ -116,7 +117,7 @@ function applyChainEntry(
     case "newest":
       return printings[0];
     case "oldest":
-      return printings[printings.length - 1];
+      return pickOldestPrinting(printings);
     case "prefer_borderless":
       return printings.find((p) => p.border_color === "borderless") ?? null;
     case "prefer_extended":
@@ -347,6 +348,16 @@ export function useCardImage(
         tokenImageRef.face_name ?? "",
       ].join(":")
     : "";
+  // Stabilize the token ref's identity to tokenImageRefKey. fetchTokenImageByRef
+  // reads only scryfall_id / scryfall_oracle_id / face_name — all captured by the
+  // key (preset_id is intentionally excluded; it doesn't affect image lookup) —
+  // so a caller passing a fresh inline {scryfall_id,...} object on every render
+  // would otherwise re-fire the image-load effect (release + refetch the cached
+  // src) for an unchanged image. exhaustive-deps can't see that the key fully
+  // captures the object, so the disable is scoped to this one line rather than
+  // blinding the dependency check on the large effect below.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const stableTokenImageRef = useMemo(() => tokenImageRef, [tokenImageRefKey]);
   const oracleId = options?.oracleId ?? "";
   const faceName = options?.faceName ?? "";
   const scryfallId = options?.scryfallId ?? "";
@@ -481,7 +492,7 @@ export function useCardImage(
           filterColors,
           filterSubtypes,
           filterHasAbilities,
-          tokenImageRef,
+          stableTokenImageRef,
           oracleId,
           faceName,
         );
@@ -515,7 +526,7 @@ export function useCardImage(
     filterPower,
     filterSubtypes,
     filterToughness,
-    tokenImageRef,
+    stableTokenImageRef,
     tokenImageRefKey,
     isToken,
     oracleId,

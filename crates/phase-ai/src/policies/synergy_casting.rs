@@ -10,6 +10,8 @@ use super::registry::{DecisionKind, PolicyId, PolicyReason, PolicyVerdict, Tacti
 use super::strategy_helpers::is_own_main_phase;
 use crate::deck_profile::DeckArchetype;
 use crate::features::DeckFeatures;
+#[cfg(test)]
+use engine::types::game_state::CastPaymentMode;
 
 /// Rewards casting spells that have synergy with existing board presence.
 ///
@@ -210,6 +212,8 @@ mod tests {
                 object_id: obj_id,
                 card_id,
                 targets: Vec::new(),
+
+                payment_mode: CastPaymentMode::Auto,
             },
             metadata: ActionMetadata {
                 actor: Some(PlayerId(0)),
@@ -224,6 +228,7 @@ mod tests {
             config: &config,
             context: &crate::context::AiContext::empty(&config.weights),
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
 
         let score = SynergyCastingPolicy.score(&ctx);
@@ -248,6 +253,8 @@ mod tests {
                 object_id: obj_id,
                 card_id,
                 targets: Vec::new(),
+
+                payment_mode: CastPaymentMode::Auto,
             },
             metadata: ActionMetadata {
                 actor: Some(PlayerId(0)),
@@ -262,6 +269,7 @@ mod tests {
             config: &config,
             context: &crate::context::AiContext::empty(&config.weights),
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
 
         assert_eq!(
@@ -287,6 +295,8 @@ mod tests {
                 object_id: obj_id,
                 card_id,
                 targets: Vec::new(),
+
+                payment_mode: CastPaymentMode::Auto,
             },
             metadata: ActionMetadata {
                 actor: Some(PlayerId(0)),
@@ -301,6 +311,7 @@ mod tests {
             config: &config,
             context: &crate::context::AiContext::empty(&config.weights),
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
 
         let score = SynergyCastingPolicy.score(&ctx);

@@ -77,6 +77,7 @@ fn make_targeted_loyalty_ability(loyalty_amount: i32) -> AbilityDefinition {
             amount: QuantityExpr::Fixed { value: 1 },
             target: TargetFilter::Player,
             damage_source: None,
+            excess: None,
         },
     )
     .cost(AbilityCost::Loyalty {
@@ -111,7 +112,10 @@ fn make_grant_ability(controller: PlayerId, source: ObjectId) -> ResolvedAbility
         controller,
         original_controller: None,
         scoped_player: None,
+        target_chooser: None,
         source_id: source,
+        source_incarnation: None,
+        source_card_id: None,
         targets: vec![],
         kind: AbilityKind::Activated,
         sub_ability: None,
@@ -119,10 +123,12 @@ fn make_grant_ability(controller: PlayerId, source: ObjectId) -> ResolvedAbility
         duration: None,
         condition: None,
         context: Default::default(),
+        replacement_applied: Default::default(),
         optional_targeting: false,
         optional: false,
         optional_for: None,
         multi_target: None,
+        target_constraints: Vec::new(),
         target_choice_timing: engine::types::ability::TargetChoiceTiming::Stack,
         description: None,
         player_scope: None,
@@ -130,6 +136,7 @@ fn make_grant_ability(controller: PlayerId, source: ObjectId) -> ResolvedAbility
         chosen_x: None,
         cost_paid_object: None,
         effect_context_object: None,
+        amassed_army_object: None,
         ability_index: None,
         may_trigger_origin: None,
         repeat_for: None,
@@ -143,6 +150,10 @@ fn make_grant_ability(controller: PlayerId, source: ObjectId) -> ResolvedAbility
         chosen_players: Vec::new(),
         repeat_until: None,
         sub_link: SubAbilityLink::ContinuationStep,
+        modal: None,
+        mode_abilities: vec![],
+        dig_found_nothing_for_parent_target: false,
+        choose_from_zone_found_nothing_for_parent_target: false,
     }
 }
 

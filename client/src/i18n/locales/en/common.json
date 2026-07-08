@@ -28,15 +28,36 @@
     "updateIssue": "update issue",
     "updated": "updated"
   },
+  "comboDetector": {
+    "label": "Combo Detector",
+    "title": "Detect infinite loops: end mandatory loops automatically and show ∞ resources (off by default)",
+    "on": "On",
+    "off": "Off"
+  },
   "gameMenu": {
+    "sections": {
+      "view": "View",
+      "tools": "Tools",
+      "game": "Game"
+    },
+    "reportCard": "Report a card",
     "menu": "Game menu",
     "sandboxTools": "Sandbox Tools",
     "sandboxToolsTitle": "Sandbox Tools — set up any board state (`)",
+    "openSandboxTools": "Open Sandbox Tools",
+    "clickModeButton": "Click Mode Button",
+    "shown": "Shown",
+    "hidden": "Hidden",
     "resume": "Resume",
     "settings": "Settings",
+    "boardLayoutSplit": "Split",
+    "boardLayoutLegacy": "Legacy",
+    "switchToSplitView": "Switch to split table view",
+    "switchToLegacyView": "Switch to legacy focused view",
     "helpShortcuts": "Help & Shortcuts",
     "showAiHand": "Show AI Hand",
     "hideAiHand": "Hide AI Hand",
+    "requestTakeback": "Request Takeback",
     "concede": "Concede",
     "backToDraft": "Back to Draft",
     "mainMenu": "Main Menu",
@@ -49,10 +70,13 @@
     "volume": "Volume"
   },
   "hostControl": {
+    "collapse": "Collapse",
+    "expand": "Expand host panel",
     "seatHost": "Host",
     "seatPlayer": "Player",
     "seatOpen": "Open",
     "seatAi": "AI ({{difficulty}})",
+    "teamLabel": "Team {{number}}",
     "waiting": "Waiting…",
     "seatLabel": "Seat {{id}}",
     "addAi": "Add AI",
@@ -69,7 +93,9 @@
     "seatsOccupied": "{{occupied}}/{{total}} seats occupied",
     "startGame": "Start Game",
     "startNow": "Start Now",
-    "fillWithAi": "Fill With AI"
+    "fillWithAi": "Fill With AI",
+    "joinLinkCopied": "Join link copied",
+    "copyJoinLink": "Copy join link: {{joinShare}}"
   },
   "grantDebug": {
     "heading": "Sandbox: Debug Permissions",
@@ -190,6 +216,12 @@
       "message": "Set up any board state with <tools>Sandbox Tools</tools> — add cards and tokens, change life and counters, copy permanents, or jump phases. Open it anytime with the <key>`</key> key.",
       "dismiss": "Dismiss",
       "open": "Open Sandbox Tools"
+    },
+    "reportCardNudge": {
+      "message": "See a card render or play wrong? Tap the <flag>report flag</flag> in the top-left to flag it so we can fix it.",
+      "dismiss": "Dismiss",
+      "open": "Report a Card",
+      "debugPrompt": "See a card render or play wrong? Flag it so we can fix it."
     }
   },
   "splash": {
@@ -199,10 +231,33 @@
   "turnBanner": {
     "turn": "Turn {{number}}"
   },
+  "diceRoll": {
+    "rollingForFirst": "Rolling for first player",
+    "tieReroll": "Tie — reroll!",
+    "versus": "VS",
+    "skip": "Tap to skip",
+    "continue": "Tap to continue",
+    "you": "You",
+    "youPlayFirst": "You play first",
+    "playerPlaysFirst": "{{name}} plays first",
+    "heads": "Heads",
+    "tails": "Tails"
+  },
   "chrome": {
     "back": "Back",
     "settings": "Settings",
     "languageSettings": "Language ({{lang}}) — open settings",
     "languageTitle": "Language: {{lang}}"
+  },
+  "errorBoundary": {
+    "heading": "Something went wrong",
+    "body": "The app hit an unexpected error and can't continue on this screen. Reloading usually fixes it.",
+    "reload": "Reload"
+  },
+  "actionError": {
+    "title": "{{action}} failed",
+    "skipTarget": "Skip target",
+    "genericAction": "Action",
+    "unknownEngineError": "Unknown engine error"
   }
 }

@@ -5,15 +5,22 @@ import { useTranslation } from "react-i18next";
 import { ManaCostPips } from "../mana/ManaCostPips.tsx";
 import { useGameStore } from "../../stores/gameStore.ts";
 import { useUiStore } from "../../stores/uiStore.ts";
+import { usePreferencesStore } from "../../stores/preferencesStore.ts";
 import { useCardImage } from "../../hooks/useCardImage.ts";
-import { useLongPress } from "../../hooks/useLongPress.ts";
+import { useCardHover } from "../../hooks/useCardHover.ts";
 import { useCanActForWaitingState, usePerspectivePlayerId } from "../../hooks/usePlayerId.ts";
 import { dispatchAction } from "../../game/dispatch.ts";
-import type { ManaCost, ObjectId } from "../../adapter/types.ts";
+import type { GameObject, ManaCost, ObjectId } from "../../adapter/types.ts";
 import {
   collectObjectActions,
   resolveSingleActionDispatch,
 } from "../../viewmodel/cardActionChoice.ts";
+import { useCardOrganizer } from "../modal/cardChoice/useCardOrganizer.ts";
+import { CardOrganizerToolbar } from "../modal/cardChoice/CardOrganizerToolbar.tsx";
+
+// Stable empty lookup so an undefined `objects` (pre-game) never busts the
+// organizer's filter memo with a fresh `{}` each render.
+const EMPTY_OBJECTS: Record<string, GameObject> = {};
 
 export function MobileHandDrawer() {
   const { t } = useTranslation("game");
@@ -41,7 +48,12 @@ export function MobileHandDrawer() {
   });
 
   useEffect(() => {
-    if (waitingForType === "TargetSelection" || waitingForType === "TriggerTargetSelection") {
+    if (
+      waitingForType === "TargetSelection"
+      || waitingForType === "TriggerTargetSelection"
+      || waitingForType === "ChooseXValue"
+      || waitingForType === "PayAmountChoice"
+    ) {
       setOpen(false);
     }
   }, [waitingForType, setOpen]);
@@ -58,6 +70,25 @@ export function MobileHandDrawer() {
   const playableObjectIds = useMemo(() => {
     return new Set(Object.keys(legalActionsByObject ?? {}).map(Number));
   }, [legalActionsByObject]);
+
+  // Display-only organizing of the player's own hand: persisted sort + ephemeral
+  // hide-filter, sharing the discard grid's mechanism. The drawer is a flat grid
+  // with no reorder, so every axis is safe to apply (no ReorderHand hazard).
+  const handSort = usePreferencesStore((s) => s.handSort);
+  const setHandSort = usePreferencesStore((s) => s.setHandSort);
+  const handFilter = useUiStore((s) => s.handFilter);
+  const setHandFilter = useUiStore((s) => s.setHandFilter);
+  const handCardIds = useMemo(
+    () => (player?.hand ?? []).filter((id) => objects?.[id] && id !== pendingObjectId),
+    [player?.hand, objects, pendingObjectId],
+  );
+  const organizer = useCardOrganizer({
+    cards: handCardIds,
+    objects: objects ?? EMPTY_OBJECTS,
+    playableIds: playableObjectIds,
+    sort: { value: handSort, onChange: setHandSort },
+    filter: { value: handFilter, onChange: setHandFilter },
+  });
 
   // Close the drawer first so the context menu isn't rendered beneath the
   // drawer's full-screen panel; coordinates flow through from the tap.
@@ -97,10 +128,6 @@ export function MobileHandDrawer() {
 
   if (!player || !objects) return null;
 
-  const handObjects = player.hand
-    .map((id) => objects[id])
-    .filter((obj) => obj && obj.id !== pendingObjectId);
-
   return (
     <AnimatePresence>
       {isOpen && (
@@ -133,23 +160,36 @@ export function MobileHandDrawer() {
               }
             }}
           >
-            <div className="flex shrink-0 items-center justify-between px-4 pt-3 pb-2">
-              <span className="text-sm font-semibold text-white/80">
-                {t("hand.handTitle", { count: handObjects.length })}
-              </span>
-              <button
-                onClick={() => setOpen(false)}
-                className="rounded-lg px-3 py-1 text-xs font-medium text-white/70 hover:bg-white/10 active:bg-white/20"
-              >
-                {t("common:actions.close")}
-              </button>
+            <div className="flex shrink-0 flex-col gap-2 px-4 pt-3 pb-2">
+              <div className="flex items-center justify-between">
+                <span className="text-sm font-semibold text-white/80">
+                  {t("hand.handTitle", { count: handCardIds.length })}
+                </span>
+                <button
+                  onClick={() => setOpen(false)}
+                  className="rounded-lg px-3 py-1 text-xs font-medium text-white/70 hover:bg-white/10 active:bg-white/20"
+                >
+                  {t("common:actions.close")}
+                </button>
+              </div>
+              <CardOrganizerToolbar
+                sort={organizer.sort}
+                onSortChange={organizer.setSort}
+                filter={organizer.filter}
+                onFilterChange={organizer.setFilter}
+                showSort
+                showFilter
+                disabled={pendingObjectId != null}
+              />
             </div>
 
             <div
               className="grid gap-3 overflow-y-auto overscroll-contain px-3 pb-4"
               style={{ gridTemplateColumns: "repeat(auto-fill, minmax(170px, 1fr))" }}
             >
-              {handObjects.map((obj) => {
+              {organizer.ordered.map((id) => {
+                const obj = objects[id];
+                if (!obj) return null;
                 const isPlayable = hasPriority && playableObjectIds.has(Number(obj.id));
                 return (
                   <DrawerCard
@@ -199,15 +239,18 @@ const DrawerCard = memo(function DrawerCard({
   const isReduced = effectiveCost?.type === "Cost" && manaCost.type === "Cost"
     && (effectiveCost.generic < manaCost.generic || effectiveCost.shards.length < manaCost.shards.length);
 
-  const { handlers: longPressHandlers, firedRef: longPressFired } = useLongPress(() => {
-    inspectObject(objectId);
-    setPreviewSticky(true);
-  });
+  // Mouse hover (desktop) + long-press (touch) both open the card preview, and
+  // the hook tags the element with `data-card-hover` so usePreviewDismiss's
+  // pointer poll keeps the preview alive while the cursor is over the card.
+  // This is what lets a player read any card in the full-hand modal: the fanned
+  // hand overlaps cards, so the modal is the only place to inspect the ones
+  // hidden behind others — and that inspection must work for mouse and touch.
+  const { handlers, firedRef } = useCardHover(objectId);
 
   const handleClick = useCallback(
     (e: React.MouseEvent) => {
-      if (longPressFired.current) {
-        longPressFired.current = false;
+      if (firedRef.current) {
+        firedRef.current = false;
         return;
       }
       // Click-mode (sandbox debug interaction) routes the tap to the debug
@@ -226,7 +269,7 @@ const DrawerCard = memo(function DrawerCard({
         setPreviewSticky(true);
       }
     },
-    [objectId, isPlayable, onPlay, onDebugOpen, inspectObject, setPreviewSticky, longPressFired],
+    [objectId, isPlayable, onPlay, onDebugOpen, inspectObject, setPreviewSticky, firedRef],
   );
 
   const glowClass = hasPriority && isPlayable
@@ -237,7 +280,7 @@ const DrawerCard = memo(function DrawerCard({
     <button
       className={`relative aspect-[5/7] w-full overflow-hidden rounded-lg bg-gray-800 ${glowClass}`}
       onClick={handleClick}
-      {...longPressHandlers}
+      {...handlers}
     >
       {src ? (
         <img

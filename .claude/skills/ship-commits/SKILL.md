@@ -25,7 +25,7 @@ A worktree based on `origin/main` gives a clean branch we cherry-pick into, isol
 
 ## When NOT to use
 
-- Work is uncommitted. Run `/commit` first (commit by pathspec — your memory's `feedback_shared_index_commit_pathspec`).
+- Work is uncommitted. Run `/commit` first (commit by pathspec — your memory's `feedback_shared_index_commit_pathspec`). **Uncommitted work being shipped must not be left dirty on local `main`.**
 - A PR for these commits already exists. Use `gh pr merge <N> --auto` directly to enqueue.
 - The commits are already on `origin/main`. Nothing to do.
 - Repo isn't `phase-rs/phase`. This skill encodes phase.rs-specific conventions.
@@ -42,9 +42,90 @@ A worktree based on `origin/main` gives a clean branch we cherry-pick into, isol
 
 ## Sequence
 
+### 0. Reconcile already-shipped commits (run this FIRST)
+
+**Squash-merges leave the originals stranded on local `main`.** When a prior ship's PR squash-merges, its commits collapse into one *new* commit on `origin/main` with a different SHA and patch-id. The original commits still sit on local `main`, invisible to any SHA- or `git cherry` patch-id comparison. Left alone they pile up across sessions and — worse — get **re-shipped**, because Step 1's `git rev-list origin/main..main` re-lists them. Clear them before doing anything else.
+
+The safe, squash-aware test is content-based: a 3-way merge of local `main` into `origin/main` that yields `origin/main`'s *exact tree* means local `main` contributes no new content, so every ahead-commit is already shipped and resetting loses nothing.
+
+```bash
+git fetch origin main
+ahead=$(git rev-list --count origin/main..main)
+if [ "$ahead" -eq 0 ]; then
+  echo "local main not ahead of origin/main — nothing to reconcile"
+else
+  merged_tree=$(git merge-tree --write-tree origin/main main 2>/dev/null); mt_exit=$?
+  origin_tree=$(git rev-parse 'origin/main^{tree}')
+  if [ "$mt_exit" -eq 0 ] && [ "$merged_tree" = "$origin_tree" ]; then
+    # Every ahead-commit's content is already in origin/main (incl. via squash).
+    # Multi-agent guard: never discard another agent's uncommitted tracked work.
+    # (reset --hard preserves untracked files; it only drops tracked modifications.)
+    if git diff --quiet && git diff --cached --quiet; then
+      git reset --hard origin/main
+      echo "reset local main to origin/main — dropped $ahead already-shipped commit(s)"
+    else
+      echo "WARNING: $ahead ahead-commit(s) are already shipped, but the working tree has"
+      echo "uncommitted tracked changes — NOT resetting. Resolve those first, then re-run."
+    fi
+  else
+    # merge-tree conflicted, OR local main adds content origin/main lacks.
+    echo "local main has $ahead ahead-commit(s) NOT fully contained in origin/main:"
+    git --no-pager log --oneline origin/main..main
+    echo "(genuine unshipped work, or a PR that diverged from local main during review.)"
+  fi
+fi
+```
+
+Outcomes:
+- **Reset happened** → re-evaluate what (if anything) is actually left to ship before continuing.
+- **Left alone, clean (`mt_exit` 0 but tree differs)** → there is genuine unshipped work; proceed to Step 1 to ship it.
+- **Left alone, divergent (`mt_exit` non-zero)** → the ahead-commits look shipped but the merged PR diverged from local `main` (e.g., a fix was added during review, as happens when a cherry-pick onto a newer `origin/main` needed a follow-up). The clean fix is still `git reset --hard origin/main` once nothing local is worth keeping — **surface this to the user and let them decide; do not silently discard.**
+
+**Then prune ship worktrees whose PR has merged.** Each ship leaves a `../forge.rs-ship-*` worktree on a `ship/<topic>` branch (Step 8). After the PR squash-merges, that worktree is dead weight and its build artifacts (`target/`, `node_modules/`) pile up on disk. Remove the ones whose branch is now fully contained in `origin/main`:
+
+```bash
+git worktree list --porcelain | awk '/^worktree /{wt=$2} /^branch /{print wt"\t"$2}' \
+| while IFS=$'\t' read -r wt ref; do
+    case "$ref" in refs/heads/ship/*) ;; *) continue ;; esac        # only OUR ship/* worktrees — never another agent's
+    br=${ref#refs/heads/}
+    merged=$(git merge-tree --write-tree origin/main "$br" 2>/dev/null)
+    [ "$merged" = "$(git rev-parse 'origin/main^{tree}')" ] || continue   # not yet merged (PR still in queue) — keep
+    if git -C "$wt" diff --quiet && git -C "$wt" diff --cached --quiet; then
+      # merged + no tracked changes → only gitignored build output remains, so --force is safe
+      git worktree remove --force "$wt" && git branch -D "$br" \
+        && echo "pruned merged ship worktree $wt ($br)"
+    else
+      echo "ship worktree $wt ($br) is merged but has uncommitted TRACKED changes — leaving it for review"
+    fi
+  done
+git worktree prune    # drop stale admin refs for worktrees whose dir was deleted manually
+```
+
+This only ever touches `ship/*` worktrees this skill created; `forge.rs-pr` and `.claude/worktrees/agent-*` are filtered out. `--force` is deliberate — a merged ship worktree's sole uncommitted content is gitignored build output (`target/`/`node_modules/`), and the tracked-diff guard refuses if anything real is dirty.
+
 ### 1. Identify the commits to ship
 
 If the user named commits explicitly (SHAs, "the last commit", "HEAD~3..HEAD"), use them. Otherwise, ask once: which commits?
+
+**Hard gate: do not ship uncommitted source changes by recreating them in the ship worktree.** If the work to ship currently exists as tracked modifications in local `main`, first commit that exact work in the source worktree by pathspec, then verify the shipped pathspecs are clean there before continuing. The source worktree may contain unrelated dirty files from other agents, but the files you are shipping must not remain dirty.
+
+Use this checklist before creating the ship worktree:
+
+```bash
+# 1) Identify the paths that belong to the work being shipped.
+SHIPPED_PATHS="path/one path/two ..."
+
+# 2) If any shipped path is dirty, commit it in the source worktree first.
+git status --short -- $SHIPPED_PATHS
+# If output is non-empty: run /commit or create a normal local commit scoped to $SHIPPED_PATHS.
+
+# 3) Re-check. This must print nothing before shipping.
+git status --short -- $SHIPPED_PATHS
+```
+
+If the re-check still shows shipped paths dirty, stop and fix that before shipping. Do not proceed with a PR while the same work remains as uncommitted local `main` changes. This prevents the user from seeing the work both "shipped" and still dirty locally.
+
+Generated planning/review artifacts are not part of the shipped code unless the user explicitly requested them. If you created untracked artifacts while preparing the shipment (`.claude/wf/*`, `.agents/pr-review/*`, compiler crash dumps, logs), either remove your own artifacts or explicitly report them and get approval before leaving them behind.
 
 Resolve to a concrete list of SHAs in chronological order (oldest first):
 
@@ -132,26 +213,25 @@ If `gh pr merge` errors:
 
 Never retry blindly.
 
-### 7. Clean up the source of the shipped commits
+### 7. Reconcile local main (post-ship)
 
-If the commits were on local `main` ahead of `origin/main`, reset local main so the same commits don't get shipped twice on the next invocation:
+Re-run the **Step 0 reconciliation** (`cd -` back to the main working dir first). Immediately after enqueue the PR hasn't merged, so `origin/main` hasn't advanced and the merge-tree test shows `main` still ahead — it correctly **no-ops**, leaving the just-shipped commits in place until the queue lands them. The durable cleanup then happens automatically on the *next* ship-commits run (Step 0), once the PR has squash-merged.
+
+Do **not** reintroduce a SHA-equality reset here. A squash-merge changes the SHA, so `git rev-list origin/main..main == $SHAS` never matches after merge and the commits accumulate forever — that is the exact bug Step 0's content-based test fixes.
+
+If the commits were shipped from a feature branch (not `main`), leave that branch alone.
+
+Then verify source-worktree hygiene for the shipped paths recorded in Step 1:
 
 ```bash
-cd -                                          # back to main working dir
-git fetch origin main
-# Only reset if local main contains exactly these shipped commits ahead of origin/main:
-if [ "$(git rev-list origin/main..main)" = "$(echo $SHAS | tr ' ' '\n' | tac | tr '\n' ' ' | xargs)" ]; then
-  git branch -f main origin/main
-fi
+git status --short -- $SHIPPED_PATHS
 ```
 
-If local `main` has commits OTHER than the shipped ones ahead of `origin/main` (another agent committed in parallel), do NOT reset — leave it and report. The user (or another ship invocation) will handle those.
-
-If the commits were on a feature branch (not `main`), leave the branch alone.
+This must print nothing for work that was originally uncommitted on local `main`. If it prints shipped paths, the shipment is incomplete operationally: either the work was not committed before shipping, or the source worktree still contains duplicate local modifications. Do not silently leave that state. Clean only files you own and only after confirming they are represented by the shipped commits; otherwise stop and report the exact dirty paths.
 
 ### 8. Worktree disposition
 
-Default: leave the worktree at `$WORKTREE` so the user can inspect it if the queue rejects the PR. It's gitignored at the repo level (worktrees live above the repo root). Remove later with `git worktree remove "$WORKTREE"` once the PR lands.
+Default: leave the worktree at `$WORKTREE` so the user can inspect it if the queue rejects the PR. It's gitignored at the repo level (worktrees live above the repo root). It will be **auto-pruned by Step 0 on the next ship-commits run** once its PR squash-merges (along with its build artifacts) — so you don't have to remember to clean it up. To remove it sooner: `git worktree remove "$WORKTREE"` once the PR lands.
 
 If the user explicitly asks for clean-up-as-you-go, remove immediately after enqueue:
 
@@ -165,7 +245,7 @@ When the user has several independent chunks to ship in parallel:
 
 1. For each chunk: do steps 2–6 in its own worktree (each branched from `origin/main`, not from a previous chunk's branch).
 2. Fire all enqueues without waiting between them — the queue batches up to its configured group size and runs CI once on the synthesized group.
-3. Step 7 (reset local main) runs once at the end, only if local main contains exactly the union of shipped commits.
+3. Step 7 (reconcile local main) runs once at the end; it is content-based (see Step 0) and no-ops until the PRs squash-merge, so it never needs to know which commits belonged to which chunk.
 4. Report each PR + enqueue status in one final summary.
 
 Branching each chunk off `origin/main` (not stacked) avoids dependency chains where one PR's failure blocks the others.
@@ -179,6 +259,7 @@ For each shipped PR, report:
 - Commits included (SHA + subject, in cherry-pick order)
 - Enqueue status: `enqueued: yes` with timestamp, or `enqueued: no` with the exact `gh pr merge` error
 - Whether local `main` was reset (and why, or why not)
+- Source-worktree hygiene: whether the shipped pathspecs are clean on local `main`; list any remaining dirty shipped paths explicitly
 - Worktree disposition (left in place vs. removed)
 
 Do not claim "merged" — the queue is async. The correct status at end-of-skill is `enqueued`.

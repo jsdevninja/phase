@@ -16,7 +16,7 @@ import {
   openPhaseSocket,
   type PhaseSocket,
 } from "../services/openPhaseSocket";
-import { isValidWebSocketUrl } from "../services/serverDetection";
+import { isValidWebSocketUrl, mixedContentBlockReason } from "../services/serverDetection";
 import type { WsSessionData } from "../services/multiplayerSession";
 
 /** Deck data format matching server protocol. */
@@ -24,25 +24,35 @@ export interface DeckData {
   main_deck: string[];
   sideboard: string[];
   commander?: string[];
+  planar_deck?: string[];
+  scheme_deck?: string[];
+  sticker_sheets?: string[];
 }
 
 /**
  * Wire-protocol version the client speaks. Must match `PROTOCOL_VERSION` in
  * `crates/server-core/src/protocol.rs`. Bump in lockstep when either side
  * adds, removes, renames, or changes the type of a protocol variant field.
+ *
+ * 13 — WaitingFor::MulliganBottomCards removed; mulligan bottoming folded
+ *      into a MulliganDecisionPhase::BottomCards sub-phase on
+ *      WaitingFor::MulliganDecision.
  */
-export const PROTOCOL_VERSION = 7;
+export const PROTOCOL_VERSION = 13;
 
 /**
  * Lowest server protocol version this client will accept in the handshake.
- * Derived as `PROTOCOL_VERSION - 1` so bumping `PROTOCOL_VERSION` automatically
- * rolls the floor forward — the same structural pattern as
- * `MIN_SUPPORTED_PROTOCOL` in `crates/server-core/src/protocol.rs`. Allows a
- * one-minor deprecation window so a freshly-built client can connect to a
- * not-yet-redeployed lobby broker during rollout, instead of hard-failing
- * with "Server protocol version N-1 does not match client N".
+ * Planechase changed the wire message surface in a non-backward-compatible way,
+ * so this release only accepts the current protocol.
  */
-export const MIN_SUPPORTED_SERVER_PROTOCOL = Math.max(0, PROTOCOL_VERSION - 1);
+export const MIN_SUPPORTED_SERVER_PROTOCOL = PROTOCOL_VERSION;
+
+/**
+ * Lowest server protocol version this client accepts for lobby-only brokers.
+ * LobbyOnly carries matchmaking metadata only, so it keeps a one-version
+ * rollout window while Full servers stay current-only.
+ */
+export const LOBBY_MIN_SUPPORTED_SERVER_PROTOCOL = PROTOCOL_VERSION - 1;
 
 /** Identity advertised by the server in its `ServerHello`. */
 export interface ServerInfo {
@@ -50,6 +60,9 @@ export interface ServerInfo {
   buildCommit: string;
   protocolVersion: number;
   mode: "Full" | "LobbyOnly";
+  /** Public base URL the server advertises for `<code>@<host>` join strings
+   * (a tunnel/proxy URL), or undefined when the server has none to share. */
+  publicUrl?: string;
 }
 
 /** Events emitted by the WebSocketAdapter for UI state updates. */
@@ -77,10 +90,12 @@ export type WsAdapterEvent =
   | { type: "reconnecting"; attempt: number; maxAttempts: number }
   | { type: "reconnected" }
   | { type: "reconnectFailed" }
-  | { type: "stateChanged"; state: GameState; events: GameEvent[]; legalResult: LegalActionsResult }
+  | { type: "stateChanged"; state: GameState; events: GameEvent[]; legalResult: LegalActionsResult; logEntries?: GameLogEntry[] }
   | { type: "emoteReceived"; fromPlayer: PlayerId; emote: string }
   | { type: "conceded"; player: PlayerId }
-  | { type: "timerUpdate"; player: PlayerId; remainingSeconds: number };
+  | { type: "timerUpdate"; player: PlayerId; remainingSeconds: number }
+  | { type: "takebackRequested"; requester: PlayerId; requesterName: string }
+  | { type: "takebackResolved"; approved: boolean; resolvedBy: PlayerId | null };
 
 type WsAdapterEventListener = (event: WsAdapterEvent) => void;
 
@@ -110,6 +125,10 @@ export class WebSocketAdapter implements EngineAdapter {
   private pendingReject: ((error: Error) => void) | null = null;
   private initResolve: (() => void) | null = null;
   private initReject: ((error: Error) => void) | null = null;
+  /** Starting-player contest event captured from the initial GameStarted
+   *  message, handed back by `initializeGame()` so the dice overlay animates it.
+   *  Empty on reconnects (the server drains it after first send). */
+  private initStartEvents: GameEvent[] = [];
   private listeners: WsAdapterEventListener[] = [];
   private reconnectAttempt = 0;
   private readonly maxReconnectAttempts = 8;
@@ -139,7 +158,7 @@ export class WebSocketAdapter implements EngineAdapter {
 
   constructor(
     private readonly serverUrl: string,
-    private readonly mode: "host" | "join",
+    private readonly mode: "host" | "join" | "spectate",
     private readonly deckData: DeckData,
     private readonly joinGameCode?: string,
     private readonly joinPassword?: string,
@@ -175,8 +194,13 @@ export class WebSocketAdapter implements EngineAdapter {
     _matchConfig?: unknown,
     _firstPlayer?: number,
   ): Promise<SubmitResult> {
-    // Server handles deck data via WebSocket protocol during initialize()
-    return { events: [] };
+    // Server handles deck data via WebSocket protocol during initialize().
+    // The starting-player contest events (if any) were captured from the
+    // initial GameStarted message; hand them back so gameStore.initGame routes
+    // them to the dice overlay, then clear so they're consumed once.
+    const events = this.initStartEvents;
+    this.initStartEvents = [];
+    return { events };
   }
 
   async initialize(): Promise<void> {
@@ -191,19 +215,31 @@ export class WebSocketAdapter implements EngineAdapter {
         return;
       }
 
+      // A ws:// target from an HTTPS page is blocked by the browser before the
+      // handshake — surface why instead of letting it fail as "unreachable".
+      const blockReason = mixedContentBlockReason(this.serverUrl);
+      if (blockReason) {
+        reject(new AdapterError("WS_ERROR", blockReason, false));
+        this.initResolve = null;
+        this.initReject = null;
+        return;
+      }
+
       const setupFrame =
         this.mode === "host"
           ? { type: "CreateGame", data: { deck: this.deckData } }
-          : {
-              type: "JoinGameWithPassword",
-              data: {
-                game_code: this.joinGameCode!,
-                deck: this.deckData,
-                display_name: this.displayName,
-                password: this.joinPassword ?? null,
-                reservation_token: this.reservationToken ?? null,
-              },
-            };
+          : this.mode === "spectate"
+            ? { type: "SpectatorJoin", data: { game_code: this.joinGameCode! } }
+            : {
+                type: "JoinGameWithPassword",
+                data: {
+                  game_code: this.joinGameCode!,
+                  deck: this.deckData,
+                  display_name: this.displayName,
+                  password: this.joinPassword ?? null,
+                  reservation_token: this.reservationToken ?? null,
+                },
+              };
 
       this.attachSocket(setupFrame).catch(() => {
         // `attachSocket` emits reject via initReject; swallow the
@@ -303,7 +339,16 @@ export class WebSocketAdapter implements EngineAdapter {
       }
     };
 
-    socket.ws.send(JSON.stringify(setupFrame));
+    if (!this.send(setupFrame)) {
+      socket.close();
+      if (this.initReject) {
+        this.initReject(
+          new AdapterError("WS_CLOSED", "Failed to send setup frame", true),
+        );
+        this.initResolve = null;
+        this.initReject = null;
+      }
+    }
   }
 
   async submitAction(action: GameAction, _actor: PlayerId): Promise<SubmitResult> {
@@ -320,7 +365,14 @@ export class WebSocketAdapter implements EngineAdapter {
     return new Promise<SubmitResult>((resolve, reject) => {
       this.pendingResolve = resolve;
       this.pendingReject = reject;
-      this.send({ type: "Action", data: { action } });
+      // If the frame cannot be sent, the server will never reply, so clear the
+      // pending state and reject now instead of leaving the caller hanging.
+      if (!this.send({ type: "Action", data: { action } })) {
+        this.pendingResolve = null;
+        this.pendingReject = null;
+        this.emit({ type: "actionPendingChanged", pending: false });
+        reject(new AdapterError("WS_CLOSED", "Failed to send action", true));
+      }
     });
   }
 
@@ -361,6 +413,22 @@ export class WebSocketAdapter implements EngineAdapter {
 
   sendEmote(emote: string): void {
     this.send({ type: "Emote", data: { emote } });
+  }
+
+  /** GH #1507: ask every other human player to approve rolling the game
+   * back to the state immediately before this player's last action. */
+  sendRequestTakeback(): void {
+    this.send({ type: "RequestTakeback" });
+  }
+
+  /** Approve or decline a pending takeback request. */
+  sendRespondTakeback(approve: boolean): void {
+    this.send({ type: "RespondTakeback", data: { approve } });
+  }
+
+  /** Withdraw a takeback request this player made themselves. */
+  sendCancelTakeback(): void {
+    this.send({ type: "CancelTakeback" });
   }
 
   sendReadyToggle(): void {
@@ -463,8 +531,33 @@ export class WebSocketAdapter implements EngineAdapter {
     }, 5000);
   }
 
-  private send(msg: unknown): void {
-    this.ws?.send(JSON.stringify(msg));
+  /**
+   * Serialize and send a frame. Returns `false` (and emits an `error` event)
+   * instead of throwing when the socket is missing/closed or `WebSocket.send`
+   * throws, so callers — especially `submitAction` — can recover rather than
+   * leaving the adapter wedged. Mirrors the guarded send in `PeerSession`.
+   */
+  private send(msg: unknown): boolean {
+    const ws = this.ws;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      this.emit({
+        type: "error",
+        message: "Cannot send message: WebSocket is not open.",
+      });
+      return false;
+    }
+    try {
+      ws.send(JSON.stringify(msg));
+      return true;
+    } catch (err) {
+      this.emit({
+        type: "error",
+        message: `Failed to send message: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      });
+      return false;
+    }
   }
 
   /** Snapshot of the server's advertised identity, or null before ServerHello. */
@@ -524,7 +617,7 @@ export class WebSocketAdapter implements EngineAdapter {
       }
 
       case "GameStarted": {
-        const data = msg.data as { state: GameState; your_player: PlayerId; opponent_name?: string; player_names?: string[]; legal_actions?: GameAction[]; auto_pass_recommended?: boolean; spell_costs?: Record<string, ManaCost>; legal_actions_by_object?: Record<string, GameAction[]>; derived?: GameState["derived"]; player_token?: string };
+        const data = msg.data as { state: GameState; your_player: PlayerId; opponent_name?: string; player_names?: string[]; legal_actions?: GameAction[]; auto_pass_recommended?: boolean; spell_costs?: Record<string, ManaCost>; legal_actions_by_object?: Record<string, GameAction[]>; derived?: GameState["derived"]; player_token?: string; events?: GameEvent[] };
         if (this.reconnectInFlight) {
           this.reconnectInFlight = false;
           this.reconnectAttempt = 0;
@@ -546,10 +639,10 @@ export class WebSocketAdapter implements EngineAdapter {
         };
         // Joiners receive their player_token here (hosts get it via GameCreated).
         // Set _gameCode from joinGameCode if not already set (host sets it via GameCreated).
+        if (!this._gameCode && this.joinGameCode) {
+          this._gameCode = this.joinGameCode;
+        }
         if (data.player_token) {
-          if (!this._gameCode && this.joinGameCode) {
-            this._gameCode = this.joinGameCode;
-          }
           this.playerToken = data.player_token;
           this.emit({ type: "sessionChanged", session: this.currentSession() });
         }
@@ -563,6 +656,11 @@ export class WebSocketAdapter implements EngineAdapter {
           ...(playerNames === undefined ? {} : { playerNames }),
         });
         if (this.initResolve) {
+          // CR 103.1: the server sends the StartingPlayerContest event only on
+          // the initial GameStarted (drained server-side, so reconnects carry
+          // none). Stash it for initializeGame() to return, routing it through
+          // the same gameStore.initGame contest path as local games.
+          this.initStartEvents = data.events ?? [];
           this.initResolve();
           this.initResolve = null;
           this.initReject = null;
@@ -593,7 +691,13 @@ export class WebSocketAdapter implements EngineAdapter {
           this.pendingResolve = null;
           this.pendingReject = null;
         } else {
-          this.emit({ type: "stateChanged", state: data.state, events: data.events, legalResult: this._legalActions });
+          this.emit({
+            type: "stateChanged",
+            state: data.state,
+            events: data.events,
+            legalResult: this._legalActions,
+            logEntries: data.log_entries,
+          });
         }
         break;
       }
@@ -660,6 +764,26 @@ export class WebSocketAdapter implements EngineAdapter {
           type: "timerUpdate",
           player: data.player,
           remainingSeconds: data.remaining_seconds,
+        });
+        break;
+      }
+
+      case "TakebackRequested": {
+        const data = msg.data as { requester: PlayerId; requester_name: string };
+        this.emit({
+          type: "takebackRequested",
+          requester: data.requester,
+          requesterName: data.requester_name,
+        });
+        break;
+      }
+
+      case "TakebackResolved": {
+        const data = msg.data as { approved: boolean; resolved_by?: PlayerId | null };
+        this.emit({
+          type: "takebackResolved",
+          approved: data.approved,
+          resolvedBy: data.resolved_by ?? null,
         });
         break;
       }

@@ -28,15 +28,36 @@
     "updateIssue": "problema na atualização",
     "updated": "atualizado"
   },
+  "comboDetector": {
+    "label": "Detector de combos",
+    "title": "Detectar loops infinitos: encerrar loops obrigatórios automaticamente e mostrar recursos ∞ (desativado por padrão)",
+    "on": "Ligado",
+    "off": "Desligado"
+  },
   "gameMenu": {
+    "sections": {
+      "view": "Visualização",
+      "tools": "Ferramentas",
+      "game": "Jogo"
+    },
+    "reportCard": "Relatar uma carta",
     "menu": "Menu do jogo",
     "sandboxTools": "Ferramentas de Sandbox",
     "sandboxToolsTitle": "Ferramentas de Sandbox — configure qualquer estado de tabuleiro (`)",
+    "openSandboxTools": "Abrir Ferramentas de Sandbox",
+    "clickModeButton": "Botão de modo de clique",
+    "shown": "Visível",
+    "hidden": "Oculto",
     "resume": "Continuar",
     "settings": "Configurações",
+    "boardLayoutSplit": "Dividido",
+    "boardLayoutLegacy": "Legacy",
+    "switchToSplitView": "Alternar para visualização de mesa dividida",
+    "switchToLegacyView": "Alternar para visualização legacy focada",
     "helpShortcuts": "Ajuda e Atalhos",
     "showAiHand": "Mostrar Mão da IA",
     "hideAiHand": "Ocultar Mão da IA",
+    "requestTakeback": "Solicitar retrocesso",
     "concede": "Conceder",
     "backToDraft": "Voltar ao Draft",
     "mainMenu": "Menu Principal",
@@ -49,10 +70,13 @@
     "volume": "Volume"
   },
   "hostControl": {
+    "collapse": "Recolher",
+    "expand": "Expandir painel do anfitrião",
     "seatHost": "Anfitrião",
     "seatPlayer": "Jogador",
     "seatOpen": "Livre",
     "seatAi": "IA ({{difficulty}})",
+    "teamLabel": "Equipe {{number}}",
     "waiting": "Aguardando…",
     "seatLabel": "Assento {{id}}",
     "addAi": "Adicionar IA",
@@ -69,7 +93,9 @@
     "seatsOccupied": "{{occupied}}/{{total}} assentos ocupados",
     "startGame": "Iniciar Jogo",
     "startNow": "Iniciar Agora",
-    "fillWithAi": "Preencher com IA"
+    "fillWithAi": "Preencher com IA",
+    "joinLinkCopied": "Link de entrada copiado",
+    "copyJoinLink": "Copiar link de entrada: {{joinShare}}"
   },
   "grantDebug": {
     "heading": "Sandbox: Permissões de Depuração",
@@ -190,6 +216,12 @@
       "message": "Configure qualquer estado de tabuleiro com as <tools>Ferramentas de Sandbox</tools> — adicione cartas e fichas, altere vidas e marcadores, copie permanentes ou avance fases. Abra a qualquer momento com a tecla <key>`</key>.",
       "dismiss": "Dispensar",
       "open": "Abrir Ferramentas de Sandbox"
+    },
+    "reportCardNudge": {
+      "message": "Uma carta é exibida ou jogada de forma errada? Toque na <flag>bandeira de reporte</flag> no canto superior esquerdo para reportá-la e podermos corrigi-la.",
+      "dismiss": "Dispensar",
+      "open": "Reportar carta",
+      "debugPrompt": "Uma carta é exibida ou jogada de forma errada? Reporte-a para podermos corrigi-la."
     }
   },
   "splash": {
@@ -199,10 +231,33 @@
   "turnBanner": {
     "turn": "Turno {{number}}"
   },
+  "diceRoll": {
+    "rollingForFirst": "Rolagem para ver quem começa",
+    "tieReroll": "Empate — rolar de novo!",
+    "versus": "VS",
+    "skip": "Toque para pular",
+    "continue": "Toque para continuar",
+    "you": "Você",
+    "youPlayFirst": "Você joga primeiro",
+    "playerPlaysFirst": "{{name}} joga primeiro",
+    "heads": "Cara",
+    "tails": "Coroa"
+  },
   "chrome": {
     "back": "Voltar",
     "settings": "Configurações",
     "languageSettings": "Idioma ({{lang}}) — abrir configurações",
     "languageTitle": "Idioma: {{lang}}"
+  },
+  "errorBoundary": {
+    "heading": "Algo deu errado",
+    "body": "O aplicativo encontrou um erro inesperado e não pode continuar nesta tela. Recarregar geralmente resolve.",
+    "reload": "Recarregar"
+  },
+  "actionError": {
+    "title": "{{action}} falhou",
+    "skipTarget": "Pular alvo",
+    "genericAction": "Ação",
+    "unknownEngineError": "Erro desconhecido do motor"
   }
 }

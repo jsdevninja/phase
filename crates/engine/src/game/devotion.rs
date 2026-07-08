@@ -11,8 +11,12 @@ use crate::types::player::PlayerId;
 pub fn count_devotion(state: &GameState, player: PlayerId, colors: &[ManaColor]) -> u32 {
     let mut total = 0u32;
     for &id in &state.battlefield {
+        // CR 702.26b: a phased-out permanent "is treated as though it does not
+        // exist," so its mana symbols drop out of devotion. Phased-out permanents
+        // remain in `state.battlefield` (only `phase_status` flips), so this guard
+        // is required — mirroring `filter.rs` and `targeting.rs::zone_object_ids`.
         let obj = match state.objects.get(&id) {
-            Some(o) if o.controller == player => o,
+            Some(o) if o.controller == player && o.is_phased_in() => o,
             _ => continue,
         };
         if let ManaCost::Cost { ref shards, .. } = obj.mana_cost {
@@ -23,6 +27,27 @@ pub fn count_devotion(state: &GameState, player: PlayerId, colors: &[ManaColor])
                     total += 1;
                 }
             }
+        }
+    }
+    total
+}
+
+/// CR 107.4a + CR 107.4e + CR 202.1: Count colored mana symbols of `color` in a
+/// single mana cost. Hybrid symbols contribute to each of their colors (so {W/U}
+/// counts toward both white and blue), Phyrexian colored symbols count for their
+/// color, and generic/colorless symbols never count. This is the per-object
+/// building block behind chroma in any zone: summed over a zone-scoped filter via
+/// `QuantityRef::Aggregate` + `ObjectProperty::ManaSymbolCount` (e.g. Umbra
+/// Stalker's "black mana symbols among cards in your graveyard"). `count_devotion`
+/// is the battlefield-permanent analogue (CR 700.5).
+pub fn count_cost_color_symbols(cost: &ManaCost, color: ManaColor) -> u32 {
+    let ManaCost::Cost { shards, .. } = cost else {
+        return 0;
+    };
+    let mut total = 0u32;
+    for shard in shards {
+        if shard.contributes_to(color) {
+            total += 1;
         }
     }
     total
@@ -179,6 +204,42 @@ mod tests {
         );
     }
 
+    /// CR 702.26b: a phased-out permanent is treated as though it doesn't exist —
+    /// "it can't affect or be affected by anything else in the game." Its mana
+    /// symbols therefore drop out of devotion (CR 700.5) while it is phased out.
+    /// (Phased-out permanents stay in `state.battlefield` with `phase_status`
+    /// flipped, so a raw battlefield scan that ignores phasing over-counts them —
+    /// corrupting Gray Merchant's drain, the Theros Gods' creature-ness CDA, and
+    /// any `QuantityRef::Devotion`.)
+    #[test]
+    fn devotion_excludes_phased_out_permanents() {
+        use crate::game::game_object::{PhaseOutCause, PhaseStatus};
+        let mut state = setup();
+        let id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Nightveil Specter".to_string(),
+            Zone::Battlefield,
+        );
+        state.objects.get_mut(&id).unwrap().mana_cost = ManaCost::Cost {
+            shards: vec![
+                ManaCostShard::BlueBlack,
+                ManaCostShard::BlueBlack,
+                ManaCostShard::BlueBlack,
+            ],
+            generic: 0,
+        };
+        // Phased in: the three {U/B} pips count.
+        assert_eq!(count_devotion(&state, PlayerId(0), &[ManaColor::Blue]), 3);
+
+        // Phase it out — CR 702.26b: its pips no longer exist for devotion.
+        state.objects.get_mut(&id).unwrap().phase_status = PhaseStatus::PhasedOut {
+            cause: PhaseOutCause::Directly,
+        };
+        assert_eq!(count_devotion(&state, PlayerId(0), &[ManaColor::Blue]), 0);
+    }
+
     #[test]
     fn devotion_phyrexian_counts() {
         let mut state = setup();
@@ -215,5 +276,43 @@ mod tests {
         assert!(!ManaCostShard::Colorless.contributes_to(ManaColor::White));
         assert!(!ManaCostShard::Snow.contributes_to(ManaColor::Blue));
         assert!(!ManaCostShard::X.contributes_to(ManaColor::Red));
+    }
+
+    // CR 107.4a + CR 202.1: per-cost colored-symbol counting building block.
+    #[test]
+    fn cost_color_symbols_counts_matching_shards() {
+        // {B}{B}{B} → 3 black symbols, 0 red.
+        let cost = ManaCost::Cost {
+            shards: vec![
+                ManaCostShard::Black,
+                ManaCostShard::Black,
+                ManaCostShard::Black,
+            ],
+            generic: 0,
+        };
+        assert_eq!(count_cost_color_symbols(&cost, ManaColor::Black), 3);
+        assert_eq!(count_cost_color_symbols(&cost, ManaColor::Red), 0);
+    }
+
+    // CR 107.4e: a hybrid symbol is all of its component colors, so it counts
+    // toward each color (but is still a single symbol).
+    #[test]
+    fn cost_color_symbols_hybrid_counts_for_each_color() {
+        let cost = ManaCost::Cost {
+            shards: vec![ManaCostShard::BlueBlack, ManaCostShard::BlueBlack],
+            generic: 1,
+        };
+        assert_eq!(count_cost_color_symbols(&cost, ManaColor::Black), 2);
+        assert_eq!(count_cost_color_symbols(&cost, ManaColor::Blue), 2);
+    }
+
+    // Generic-only mana costs contribute no colored symbols.
+    #[test]
+    fn cost_color_symbols_zero_for_generic_only() {
+        let cost = ManaCost::Cost {
+            shards: vec![],
+            generic: 3,
+        };
+        assert_eq!(count_cost_color_symbols(&cost, ManaColor::Black), 0);
     }
 }

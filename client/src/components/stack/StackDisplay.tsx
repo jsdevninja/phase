@@ -3,15 +3,15 @@ import { AnimatePresence, motion } from "framer-motion";
 import { useTranslation } from "react-i18next";
 
 import { StackEntry } from "./StackEntry.tsx";
-import {
-  pressureMultiplier,
-  stackPressureFromLength,
-} from "../../utils/stackPressure.ts";
+import { pressureMultiplier } from "../../utils/stackPressure.ts";
+import { effectiveStackPressure } from "../../utils/stackThroughput.ts";
 import { StackTargetArcs } from "./StackTargetArcs.tsx";
 import { useGameStore } from "../../stores/gameStore.ts";
 import { usePreferencesStore } from "../../stores/preferencesStore.ts";
+import { getSeatCount, isSplitBoardActive } from "../../viewmodel/gameStateView.ts";
 import type { ObjectId, StackDisplayGroup, StackEntry as StackEntryType, StackEntryDisplay, WaitingFor } from "../../adapter/types.ts";
 import { getStackCardSize } from "../board/boardSizing.ts";
+import { DraggableWidget } from "../flexlayout/DraggableWidget.tsx";
 
 const EMPTY_STACK: StackEntryType[] = [];
 const EMPTY_GROUPS: StackDisplayGroup[] = [];
@@ -33,21 +33,24 @@ function getPendingCastObjectId(
 ): ObjectId | null {
   if (!waitingFor) return null;
   switch (waitingFor.type) {
+    // These cast-flow prompts all carry the casting spell in `pending_cast`, so
+    // the stack keeps its "Casting" badge while the prompt is up. CostTypeChoice
+    // is Celestial Reunion's pre-cost "choose a creature type" (CR 601.2b).
     case "TargetSelection":
     case "ModeChoice":
     case "OptionalCostChoice":
     case "DefilerPayment":
-    case "DiscardForCost":
-    case "SacrificeForCost":
-    case "ReturnToHandForCost":
-    case "RemoveCounterForCost":
     case "BlightChoice":
-    case "BeholdForCost":
-    case "TapCreaturesForSpellCost":
-    case "ExileForCost":
     case "HarmonizeTapChoice":
     case "ChooseXValue":
+    case "CostTypeChoice":
       return waitingFor.data.pending_cast.object_id;
+    // CR 601.2b: PayCost carries its pending cast inside `resume` (only the
+    // spell-cast resume; mana-ability cost payment has no pending cast).
+    case "PayCost":
+      return waitingFor.data.resume.type === "Spell"
+        ? waitingFor.data.resume.Spell.object_id
+        : null;
     case "ManaPayment":
       return topOfStackId;
     default:
@@ -75,7 +78,8 @@ function getViewportSize() {
 
 export function StackDisplay() {
   const { t } = useTranslation("game");
-  const stack = useGameStore((s) => s.gameState?.stack ?? EMPTY_STACK);
+  const gameState = useGameStore((s) => s.gameState);
+  const stack = gameState?.stack ?? EMPTY_STACK;
   const waitingFor = useGameStore((s) => s.waitingFor);
   // Engine-authored stack grouping rides on the same state snapshot that
   // carries `state.stack` (see `engine::game::derived_views`). Reading
@@ -97,7 +101,11 @@ export function StackDisplay() {
   // choice on every resolution.
   const stackDockSide = usePreferencesStore((s) => s.stackDockSide);
   const setStackDockSide = usePreferencesStore((s) => s.setStackDockSide);
+  const multiplayerBoardLayout = usePreferencesStore((s) => s.multiplayerBoardLayout);
   const dockedLeft = stackDockSide === "left";
+  // User size multiplier over the viewport-derived auto-scale (absent ⇒ 1).
+  // Cards derive width AND height from one scale, so this stays aspect-correct.
+  const userStackScale = usePreferencesStore((s) => s.flexLayout.scales?.stack) ?? 1;
 
   useEffect(() => {
     function handleResize() {
@@ -152,7 +160,7 @@ export function StackDisplay() {
       viewport.width < 1024 ? 0.72 :
         viewport.width < 1440 ? 0.86 : 1;
   const heightScale = viewport.height < 820 ? 0.9 : 1;
-  const responsiveScale = widthScale * heightScale;
+  const responsiveScale = widthScale * heightScale * userStackScale;
   const cardSize = {
     width: Math.max(112, Math.round(rawCardSize.width * responsiveScale)),
     height: Math.max(156, Math.round(rawCardSize.height * responsiveScale)),
@@ -170,8 +178,10 @@ export function StackDisplay() {
   // clamped to a pixel top below so the panel header — the only controls (swap,
   // collapse, count) — can never be pushed off the top edge when the pile is
   // taller than the viewport.
-  const topFraction =
-    viewport.width < 640 ? 0.38 :
+  const splitBoardActive = isSplitBoardActive(multiplayerBoardLayout, getSeatCount(gameState));
+  const topFraction = splitBoardActive
+    ? viewport.width < 640 ? 0.52 : viewport.width < 1024 ? 0.58 : 0.66
+    : viewport.width < 640 ? 0.38 :
       viewport.width < 1024 ? 0.43 : 0.5;
   const collapsedPeekPx = viewport.width < 768 ? 24 : COLLAPSED_PEEK_PX;
 
@@ -211,25 +221,33 @@ export function StackDisplay() {
   }));
 
   return (
-    <AnimatePresence>
-      <motion.div
-        key="stack-container"
-        initial={{ opacity: 0, x: dockedLeft ? -60 : 60 }}
-        animate={{ opacity: 1, x: 0 }}
-        exit={{ opacity: 0, x: dockedLeft ? -60 : 60 }}
-        transition={{ type: "spring", stiffness: 300, damping: 30 }}
-        // `pointer-events-none`: the outer box keeps its full panel width even
-        // when the inner panel is transform-collapsed offscreen, so a
-        // transparent region would otherwise hover over (and swallow clicks
-        // meant for) battlefield objects. Click-through here; the real
-        // interactive surfaces below opt back in with `pointer-events-auto`.
-        // Vertical position comes entirely from the clamped pixel `top` in
-        // `panelAnchorStyle` — no `top-1/2`/`-translate-y-1/2` centering, which
-        // would let a tall panel's header slide above the viewport top edge.
-        className="pointer-events-none fixed z-[35]"
-        style={panelAnchorStyle}
-      >
+    // The DraggableWidget owns the fixed dock anchor so its Flex Layout offset
+    // composes with the panel's own entry/collapse animations below. Its
+    // `pointer-events-none`: the outer box keeps its full panel width even when
+    // the inner panel is transform-collapsed offscreen, so a transparent region
+    // would otherwise hover over (and swallow clicks meant for) battlefield
+    // objects. Click-through here; the real interactive surfaces below opt back
+    // in with `pointer-events-auto`. Vertical position comes entirely from the
+    // clamped pixel `top` in `panelAnchorStyle` — no `top-1/2`/`-translate-y-1/2`
+    // centering, which would let a tall panel's header slide above the viewport.
+    <DraggableWidget
+      target={{ kind: "widget", key: "stackPanel" }}
+      flexZone="stackPanel"
+      className="pointer-events-none fixed z-[35]"
+      style={panelAnchorStyle}
+      scaleKey="stack"
+      resizeCorner={dockedLeft ? "br" : "bl"}
+    >
+      <AnimatePresence>
         <motion.div
+          key="stack-container"
+          initial={{ opacity: 0, x: dockedLeft ? -60 : 60 }}
+          animate={{ opacity: 1, x: 0 }}
+          exit={{ opacity: 0, x: dockedLeft ? -60 : 60 }}
+          transition={{ type: "spring", stiffness: 300, damping: 30 }}
+          className="pointer-events-none"
+        >
+          <motion.div
           animate={{ x: isCollapsed ? collapsedX : 0 }}
           transition={{ type: "spring", stiffness: 340, damping: 34 }}
           className="relative"
@@ -239,7 +257,7 @@ export function StackDisplay() {
             <button
               type="button"
               onClick={() => setIsCollapsed(false)}
-              className={`pointer-events-auto absolute top-1/2 z-20 flex h-20 w-7 -translate-y-1/2 items-center justify-center border border-white/10 bg-gray-950/95 text-gray-300 shadow-[0_18px_36px_rgba(0,0,0,0.45)] transition-colors hover:bg-gray-900 hover:text-white ${dockedLeft ? "right-0 translate-x-1/2 rounded-l-md rounded-r-xl" : "left-0 -translate-x-1/2 rounded-l-xl rounded-r-md"}`}
+              className={`pointer-events-auto absolute top-1/2 z-20 flex h-16 w-7 -translate-y-1/2 items-center justify-center rounded-[6px] border border-white/12 bg-gray-950 text-gray-300 shadow-[0_8px_18px_rgba(0,0,0,0.36)] transition-colors hover:bg-gray-900 hover:text-white ${dockedLeft ? "right-0 translate-x-1/2" : "left-0 -translate-x-1/2"}`}
               aria-label={t("stack.expandPanel")}
             >
               {/* Chevron points back toward the board (the direction the panel
@@ -254,7 +272,7 @@ export function StackDisplay() {
             </button>
           )}
 
-          <div className="pointer-events-auto relative h-full overflow-hidden rounded-2xl border border-white/10 bg-gray-950/88 shadow-[0_24px_60px_rgba(0,0,0,0.55)] backdrop-blur-md">
+          <div className="pointer-events-auto relative h-full overflow-hidden rounded-[10px] border border-white/10 bg-gray-950/96 shadow-[0_16px_36px_rgba(0,0,0,0.45)]">
             <div className="flex h-9 items-center justify-between border-b border-white/10 px-3">
               <div className="flex items-center gap-2">
                 <span className="text-[11px] font-semibold uppercase tracking-[0.24em] text-gray-400">
@@ -305,11 +323,12 @@ export function StackDisplay() {
             >
               <AnimatePresence mode="popLayout">
                 {(() => {
-                  // Mass-trigger pacing: engine-authored StackPressure thresholds
-                  // (10/30/100) collapse per-entry animation under stack pressure.
-                  // See crates/engine/src/game/stack.rs + utils/stackPressure.ts.
+                  // Mass-trigger pacing: collapse per-entry animation under stack
+                  // pressure — depth (engine thresholds 10/30/100) OR recent
+                  // resolution churn (rate axis, for low-depth-high-throughput
+                  // loops depth can't see). See utils/stackThroughput.ts.
                   const pacing = pressureMultiplier(
-                    stackPressureFromLength(displayStack.length),
+                    effectiveStackPressure(displayStack.length),
                   );
                   return groupedStack.map(({ entry, count }, index) => (
                     <StackEntry
@@ -340,5 +359,6 @@ export function StackDisplay() {
         />
       </motion.div>
     </AnimatePresence>
+    </DraggableWidget>
   );
 }

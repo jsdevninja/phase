@@ -36,9 +36,9 @@ impl MulliganPolicy for RampKeepablesMulligan {
         hand: &[ObjectId],
         state: &GameState,
         features: &DeckFeatures,
-        _plan: &PlanSnapshot,
-        _turn_order: TurnOrder,
-        _mulligans_taken: u8,
+        _plan: &PlanSnapshot, // input-unused: ramp opener scoring is card-composition only
+        _turn_order: TurnOrder, // input-unused: ramp opener scoring is card-composition only
+        _mulligans_taken: u8, // input-unused: ramp opener scoring is card-composition only
     ) -> MulliganScore {
         let commitment = features.mana_ramp.commitment;
         if commitment <= COMMITMENT_THRESHOLD {
@@ -181,6 +181,7 @@ mod tests {
                 target_player: None,
                 selection_constraint: engine::types::ability::SearchSelectionConstraint::None,
                 split: None,
+                source_zones: vec![engine::types::zones::Zone::Library],
             },
         );
         ability.sub_ability = Some(Box::new(AbilityDefinition::new(
@@ -192,10 +193,13 @@ mod tests {
                 owner_library: false,
                 enter_transformed: false,
                 enters_under: Some(ControllerRef::You),
-                enter_tapped: true,
+                enter_tapped: engine::types::zones::EtbTapState::Tapped,
                 enters_attacking: false,
                 up_to: false,
                 enter_with_counters: vec![],
+                conditional_enter_with_counters: vec![],
+                face_down_profile: None,
+                enters_modified_if: None,
             },
         )));
         ability

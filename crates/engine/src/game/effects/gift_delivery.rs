@@ -3,7 +3,7 @@ use crate::types::ability::{Effect, EffectError, EffectKind, ResolvedAbility};
 use crate::types::card_type::{CardType, CoreType};
 use crate::types::events::GameEvent;
 use crate::types::game_state::GameState;
-use crate::types::identifiers::CardId;
+use crate::types::identifiers::{CardId, ObjectId};
 use crate::types::keywords::GiftKind;
 use crate::types::mana::ManaColor;
 use crate::types::player::PlayerId;
@@ -46,22 +46,30 @@ pub fn resolve(
         }
         // CR 702.174h: "Gift a Treasure" means the chosen player creates a Treasure token.
         GiftKind::Treasure => {
-            create_gift_token(state, events, opponent, "Treasure", |ct| {
-                ct.core_types.push(CoreType::Artifact);
-                ct.subtypes.push("Treasure".to_string());
-            });
+            create_gift_token(
+                state,
+                events,
+                opponent,
+                "Treasure",
+                ability.source_id,
+                |ct| {
+                    ct.core_types.push(CoreType::Artifact);
+                    ct.subtypes.push("Treasure".to_string());
+                },
+            );
         }
         GiftKind::Food => {
-            create_gift_token(state, events, opponent, "Food", |ct| {
+            create_gift_token(state, events, opponent, "Food", ability.source_id, |ct| {
                 ct.core_types.push(CoreType::Artifact);
                 ct.subtypes.push("Food".to_string());
             });
         }
         GiftKind::TappedFish => {
-            let obj_id = create_gift_token(state, events, opponent, "Fish", |ct| {
-                ct.core_types.push(CoreType::Creature);
-                ct.subtypes.push("Fish".to_string());
-            });
+            let obj_id =
+                create_gift_token(state, events, opponent, "Fish", ability.source_id, |ct| {
+                    ct.core_types.push(CoreType::Creature);
+                    ct.subtypes.push("Fish".to_string());
+                });
             if let Some(obj) = state.objects.get_mut(&obj_id) {
                 obj.color = vec![ManaColor::Blue];
                 obj.base_color = vec![ManaColor::Blue];
@@ -103,16 +111,10 @@ fn deliver_card_draw(
             else {
                 return;
             };
-            let Some(player) = state.players.iter().find(|p| p.id == player_id) else {
-                return;
-            };
-
-            let cards_to_draw: Vec<_> = player
-                .library
-                .iter()
-                .take(count as usize)
-                .copied()
-                .collect();
+            // CR 121.1 + CR 613.11: route card selection through the single
+            // `select_cards_to_draw` authority so a `DrawFromBottom` static is
+            // honored on the gift draw too.
+            let cards_to_draw = super::draw::select_cards_to_draw(state, player_id, count as usize);
 
             for obj_id in cards_to_draw {
                 zones::move_to_zone(state, obj_id, Zone::Hand, events);
@@ -150,6 +152,7 @@ fn create_gift_token(
     events: &mut Vec<GameEvent>,
     owner: PlayerId,
     name: &str,
+    source_id: ObjectId,
     setup: impl FnOnce(&mut CardType),
 ) -> crate::types::identifiers::ObjectId {
     let obj_id = zones::create_object(state, CardId(0), owner, name.to_string(), Zone::Battlefield);
@@ -161,12 +164,16 @@ fn create_gift_token(
         obj.base_card_types = card_type;
     }
 
+    // CR 613.7d: the gift token enters the battlefield, so it receives a
+    // timestamp. Drawn before the `get_mut` (`next_timestamp` takes `&mut self`).
+    let entry_timestamp = state.next_timestamp();
+
     // CR 400.7 + CR 302.6 + CR 603.6a: Single authority for ETB state.
     if let Some(obj) = state.objects.get_mut(&obj_id) {
-        obj.reset_for_battlefield_entry(state.turn_number);
+        obj.reset_for_battlefield_entry(state.turn_number, entry_timestamp);
     }
 
-    state.layers_dirty = true;
+    crate::game::layers::mark_layers_full(state);
     crate::game::restrictions::record_battlefield_entry(state, obj_id);
     crate::game::restrictions::record_token_created(state, obj_id);
 
@@ -188,6 +195,7 @@ fn create_gift_token(
     events.push(GameEvent::TokenCreated {
         object_id: obj_id,
         name: name.to_string(),
+        source_id,
     });
 
     obj_id

@@ -61,7 +61,7 @@ pub fn resolve(
     if candidates.len() == 1 {
         // Only one creature — auto-select as ring-bearer.
         state.ring_bearer.insert(controller, Some(candidates[0]));
-        state.layers_dirty = true;
+        crate::game::layers::mark_layers_full(state);
         return Ok(());
     }
 
@@ -110,7 +110,7 @@ pub(crate) fn clear_ring_bearer_if_object(state: &mut GameState, object_id: Obje
         }
     });
     if changed {
-        state.layers_dirty = true;
+        crate::game::layers::mark_layers_full(state);
     }
 }
 
@@ -131,7 +131,7 @@ pub(crate) fn normalize_ring_bearers(state: &mut GameState) -> bool {
     for player in stale {
         state.ring_bearer.remove(&player);
     }
-    state.layers_dirty = true;
+    crate::game::layers::mark_layers_full(state);
     true
 }
 
@@ -246,7 +246,7 @@ mod tests {
         let creature_id = make_creature(&mut state, 1, PlayerId(0));
         state.ring_level.insert(PlayerId(0), 1);
         state.ring_bearer.insert(PlayerId(0), Some(creature_id));
-        state.layers_dirty = true;
+        state.layers_dirty.mark_full();
 
         layers::evaluate_layers(&mut state);
 
@@ -374,7 +374,8 @@ mod tests {
             &mut state,
             &[GameEvent::CombatDamageDealtToPlayer {
                 player_id: PlayerId(1),
-                source_ids: vec![bearer],
+                source_amounts: vec![(bearer, 3)],
+                total_damage: 3,
             }],
         );
 
@@ -387,5 +388,84 @@ mod tests {
             }
         ));
         assert_eq!(ability.player_scope, Some(PlayerFilter::Opponent));
+    }
+
+    const RING_TRIGGER_ORACLE: &str = "Whenever the Ring tempts you, draw a card.";
+
+    #[test]
+    fn ring_tempts_you_observer_trigger_is_collected_and_draws() {
+        use crate::game::trigger_index;
+        use crate::parser::oracle_trigger::parse_trigger_line;
+
+        let mut state = GameState::new_two_player(42);
+        state.waiting_for = WaitingFor::Priority {
+            player: PlayerId(0),
+        };
+        let watcher = make_creature(&mut state, 10, PlayerId(0));
+        {
+            let obj = state.objects.get_mut(&watcher).unwrap();
+            obj.trigger_definitions
+                .push(parse_trigger_line(RING_TRIGGER_ORACLE, "Ring Watcher"));
+        }
+        trigger_index::reindex_object_triggers(&mut state, watcher);
+
+        let mut events = Vec::new();
+        let ability =
+            ResolvedAbility::new(Effect::RingTemptsYou, vec![], ObjectId(99), PlayerId(0));
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        triggers::process_triggers(&mut state, &events);
+
+        assert_eq!(
+            state.stack.len(),
+            1,
+            "Whenever the Ring tempts you must place a triggered ability on the stack"
+        );
+        let draw = state.stack.last().unwrap().ability().unwrap();
+        assert!(matches!(
+            draw.effect,
+            Effect::Draw {
+                count: crate::types::ability::QuantityExpr::Fixed { value: 1 },
+                ..
+            }
+        ));
+    }
+
+    const SMEAGOL_RING_TRIGGER: &str = "Whenever the Ring tempts you, target opponent reveals cards from the top of their library until they reveal a land card. Put that card onto the battlefield tapped under your control and the rest into their graveyard.";
+
+    #[test]
+    fn ring_tempts_you_smeagol_observer_collects_with_opponent_target() {
+        use crate::game::trigger_index;
+        use crate::parser::oracle_trigger::parse_trigger_line;
+        use crate::types::ability::{TargetFilter, TargetRef};
+
+        let mut state = GameState::new_two_player(42);
+        state.waiting_for = WaitingFor::Priority {
+            player: PlayerId(0),
+        };
+        let smeagol = make_creature(&mut state, 10, PlayerId(0));
+        let trigger_def = parse_trigger_line(SMEAGOL_RING_TRIGGER, "Sméagol, Helpful Guide");
+        assert_eq!(trigger_def.valid_target, Some(TargetFilter::Player));
+        {
+            let obj = state.objects.get_mut(&smeagol).unwrap();
+            obj.trigger_definitions.push(trigger_def);
+        }
+        trigger_index::reindex_object_triggers(&mut state, smeagol);
+
+        let mut events = Vec::new();
+        let ability =
+            ResolvedAbility::new(Effect::RingTemptsYou, vec![], ObjectId(99), PlayerId(0));
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        triggers::process_triggers(&mut state, &events);
+
+        assert_eq!(
+            state.stack.len(),
+            1,
+            "Sméagol's RingTemptsYou trigger must reach the stack"
+        );
+        let reveal = state.stack.last().unwrap().ability().unwrap();
+        assert!(matches!(reveal.effect, Effect::RevealUntil { .. }));
+        assert_eq!(reveal.targets, vec![TargetRef::Player(PlayerId(1))]);
     }
 }

@@ -7,17 +7,21 @@ pub mod combat_ai;
 pub mod combo;
 pub mod config;
 pub mod context;
+pub mod damage_reflection;
 pub mod decision_kind;
 pub mod deck_knowledge;
 pub mod deck_profile;
+pub mod determinize;
 pub mod draft_eval;
 pub mod duel_suite;
 pub mod eval;
 pub mod features;
+pub mod mana_colors;
 pub mod plan;
 pub mod planner;
 pub mod policies;
 pub mod projection;
+pub mod saved_state;
 pub mod search;
 pub mod session;
 pub mod strategy_profile;
@@ -43,4 +47,8 @@ pub use eval::{
     threat_level_projected, EvalWeightSet, EvalWeights, EvaluationBreakdown, KeywordBonuses,
     StrategicIntent,
 };
-pub use search::{choose_action, score_candidates, softmax_select_pairs};
+pub use search::{
+    choose_action, choose_action_with_session, score_candidates, score_candidates_with_session,
+    softmax_select_pairs,
+};
+pub use session::{deck_pools_fingerprint, AiSession, SessionCache};

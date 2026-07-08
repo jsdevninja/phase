@@ -35,7 +35,9 @@ pub enum ReplacementEvent {
     ChangeZone,
     /// CR 614.1a: Replaces an object moving zones (post-move replacement).
     Moved,
-    /// CR 614.1a: Replaces one or more counters being placed on an object.
+    /// CR 614.1a + CR 122.1: Replaces one or more counters being placed on an
+    /// object or player.
+    #[serde(alias = "AddPlayerCounter")]
     AddCounter,
     /// CR 614.1a: Replaces one or more counters being removed from an object.
     RemoveCounter,
@@ -63,10 +65,17 @@ pub enum ReplacementEvent {
     ProduceMana,
     /// CR 614.1a: Replaces a scry event.
     Scry,
+    /// CR 614.1a + CR 705.1: Replaces an individual coin flip.
+    CoinFlip,
     /// CR 614.1a: Replaces a transform event.
     Transform,
     /// CR 614.1a: Replaces an explore event.
     Explore,
+    /// CR 701.50a + CR 614.1a: Replaces a connive keyword action. Lets a
+    /// replacement effect intercept "a creature would connive" and substitute a
+    /// modified action (Leader, Super-Genius — "instead you draw a card, then
+    /// that creature connives").
+    Connive,
 
     // --- Stub-only Forge types (recognized but no-op) ---
     AssembleContraption,
@@ -91,6 +100,8 @@ pub enum ReplacementEvent {
     LoseMana,
     PlanarDiceResult,
     Planeswalk,
+    /// CR 701.34a + CR 614.1a: Replaces a proliferate action (count-modifying
+    /// "proliferate twice instead" effects such as Tekuthal, Inquiry Dominus).
     Proliferate,
 
     /// Fallback for truly unknown event strings.
@@ -123,8 +134,10 @@ impl fmt::Display for ReplacementEvent {
             ReplacementEvent::DrawCards => write!(f, "DrawCards"),
             ReplacementEvent::ProduceMana => write!(f, "ProduceMana"),
             ReplacementEvent::Scry => write!(f, "Scry"),
+            ReplacementEvent::CoinFlip => write!(f, "CoinFlip"),
             ReplacementEvent::Transform => write!(f, "Transform"),
             ReplacementEvent::Explore => write!(f, "Explore"),
+            ReplacementEvent::Connive => write!(f, "Connive"),
             ReplacementEvent::AssembleContraption => write!(f, "AssembleContraption"),
             ReplacementEvent::BeginPhase => write!(f, "BeginPhase"),
             ReplacementEvent::BeginTurn => write!(f, "BeginTurn"),
@@ -158,7 +171,7 @@ impl FromStr for ReplacementEvent {
             "Counter" => ReplacementEvent::Counter,
             "ChangeZone" => ReplacementEvent::ChangeZone,
             "Moved" => ReplacementEvent::Moved,
-            "AddCounter" => ReplacementEvent::AddCounter,
+            "AddCounter" | "AddPlayerCounter" => ReplacementEvent::AddCounter,
             "RemoveCounter" => ReplacementEvent::RemoveCounter,
             "CreateToken" => ReplacementEvent::CreateToken,
             "Tap" => ReplacementEvent::Tap,
@@ -171,8 +184,10 @@ impl FromStr for ReplacementEvent {
             "DrawCards" => ReplacementEvent::DrawCards,
             "ProduceMana" => ReplacementEvent::ProduceMana,
             "Scry" => ReplacementEvent::Scry,
+            "CoinFlip" => ReplacementEvent::CoinFlip,
             "Transform" => ReplacementEvent::Transform,
             "Explore" => ReplacementEvent::Explore,
+            "Connive" => ReplacementEvent::Connive,
             "AssembleContraption" => ReplacementEvent::AssembleContraption,
             "BeginPhase" => ReplacementEvent::BeginPhase,
             "BeginTurn" => ReplacementEvent::BeginTurn,
@@ -219,6 +234,10 @@ mod tests {
             ReplacementEvent::AddCounter
         );
         assert_eq!(
+            ReplacementEvent::from_str("AddPlayerCounter").unwrap(),
+            ReplacementEvent::AddCounter
+        );
+        assert_eq!(
             ReplacementEvent::from_str("CreateToken").unwrap(),
             ReplacementEvent::CreateToken
         );
@@ -248,6 +267,7 @@ mod tests {
             ReplacementEvent::AddCounter,
             ReplacementEvent::CreateToken,
             ReplacementEvent::DealtDamage,
+            ReplacementEvent::CoinFlip,
             ReplacementEvent::Other("Custom".to_string()),
         ];
         for event in events {

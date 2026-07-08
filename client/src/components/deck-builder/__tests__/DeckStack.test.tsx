@@ -14,7 +14,12 @@ class ResizeObserverMock {
   unobserve(): void {}
 }
 
-function makeCard(name: string, typeLine: string, cmc = 0): ScryfallCard {
+function makeCard(
+  name: string,
+  typeLine: string,
+  cmc = 0,
+  oracleText?: string,
+): ScryfallCard {
   return {
     id: name.toLowerCase(),
     name,
@@ -23,6 +28,7 @@ function makeCard(name: string, typeLine: string, cmc = 0): ScryfallCard {
     type_line: typeLine,
     color_identity: [],
     legalities: {},
+    oracle_text: oracleText,
   };
 }
 
@@ -84,6 +90,7 @@ describe("DeckStack", () => {
         onRemoveCard={vi.fn()}
         onMoveCard={vi.fn()}
         onRemoveCommander={vi.fn()}
+        groupMode="type"
       />,
     );
 
@@ -135,6 +142,7 @@ describe("DeckStack", () => {
         onRemoveCard={vi.fn()}
         onMoveCard={vi.fn()}
         onRemoveCommander={vi.fn()}
+        groupMode="type"
       />,
     );
 
@@ -146,11 +154,9 @@ describe("DeckStack", () => {
     const plainsTile = getTileByRemoveTitle("Plains");
 
     expect(screen.getByText("Creatures")).toBeInTheDocument();
-    expect(screen.getByText("Spells")).toBeInTheDocument();
+    expect(screen.getByText("Enchantments")).toBeInTheDocument();
     expect(screen.getByText("Lands")).toBeInTheDocument();
-    expect(
-      screen.getByTitle("Ajani's Pridemate is at the copy limit"),
-    ).toBeDisabled();
+    expect(screen.getByTitle("Add one Ajani's Pridemate")).toBeEnabled();
     expect(screen.queryByText("MD")).not.toBeInTheDocument();
     expect(screen.queryByText("SB")).not.toBeInTheDocument();
 
@@ -159,6 +165,72 @@ describe("DeckStack", () => {
     expectDocumentOrder(angelTile, banishingTile);
     expectDocumentOrder(banishingTile, leylineTile);
     expectDocumentOrder(banishingTile, plainsTile);
+  });
+
+  it("keeps the add button enabled for main-deck cards regardless of copy count", () => {
+    // Copy-limit legality is enforced by evaluateDeckCompatibility, not the stack UI.
+    render(
+      <DeckStack
+        deck={{
+          main: [{ name: "Relentless Rats", count: 5 }],
+          sideboard: [],
+        }}
+        commanders={[]}
+        cardDataCache={
+          new Map([
+            ["Relentless Rats", makeCard("Relentless Rats", "Creature — Rat", 3)],
+          ])
+        }
+        onAddCard={vi.fn()}
+        onRemoveCard={vi.fn()}
+        onMoveCard={vi.fn()}
+        onRemoveCommander={vi.fn()}
+        groupMode="type"
+      />,
+    );
+
+    expect(screen.getByTitle("Add one Relentless Rats")).toBeEnabled();
+  });
+
+  it("does not disable the add button at an override cap — engine validates copies", () => {
+    render(
+      <DeckStack
+        deck={{ main: [{ name: "Seven Dwarves", count: 7 }], sideboard: [] }}
+        commanders={[]}
+        cardDataCache={
+          new Map([["Seven Dwarves", makeCard("Seven Dwarves", "Creature — Dwarf", 4)]])
+        }
+        onAddCard={vi.fn()}
+        onRemoveCard={vi.fn()}
+        onMoveCard={vi.fn()}
+        onRemoveCommander={vi.fn()}
+        groupMode="type"
+      />,
+    );
+    expect(screen.getByTitle("Add one Seven Dwarves")).toBeEnabled();
+  });
+
+  it("keeps the add button enabled in singleton formats — engine validates copies", () => {
+    render(
+      <DeckStack
+        deck={{
+          main: [{ name: "Sol Ring", count: 1 }],
+          sideboard: [],
+        }}
+        commanders={[]}
+        cardDataCache={
+          new Map([["Sol Ring", makeCard("Sol Ring", "Artifact", 1)]])
+        }
+        format="Commander"
+        onAddCard={vi.fn()}
+        onRemoveCard={vi.fn()}
+        onMoveCard={vi.fn()}
+        onRemoveCommander={vi.fn()}
+        groupMode="type"
+      />,
+    );
+
+    expect(screen.getByTitle("Add one Sol Ring")).toBeEnabled();
   });
 
   it("moves a second-section card back to the main deck via its move button", () => {
@@ -182,6 +254,7 @@ describe("DeckStack", () => {
         onRemoveCard={vi.fn()}
         onMoveCard={onMoveCard}
         onRemoveCommander={vi.fn()}
+        groupMode="type"
       />,
     );
 

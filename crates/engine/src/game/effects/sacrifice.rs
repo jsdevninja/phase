@@ -43,7 +43,8 @@ fn resolve_sacrifice_scope(
             .map(|p| p.id)
             .filter(|&id| id != ability.controller)
             .collect(),
-        Some(ControllerRef::TargetPlayer) => ability
+        // CR 109.4: TargetOpponent reads identically to TargetPlayer.
+        Some(ControllerRef::TargetPlayer | ControllerRef::TargetOpponent) => ability
             .targets
             .iter()
             .find_map(|t| match t {
@@ -61,8 +62,24 @@ fn resolve_sacrifice_scope(
             .map(|pid| vec![pid])
             .unwrap_or_default()
         }
+        Some(ControllerRef::ParentTargetOwner) => {
+            crate::game::targeting::resolve_effect_player_ref(
+                state,
+                ability,
+                &TargetFilter::ParentTargetOwner,
+            )
+            .map(|pid| vec![pid])
+            .unwrap_or_default()
+        }
         Some(ControllerRef::DefendingPlayer) => {
-            crate::game::combat::defending_player_for_attacker(state, ability.source_id)
+            crate::game::combat::resolve_defending_player(state, ability.source_id)
+                .map(|pid| vec![pid])
+                .unwrap_or_default()
+        }
+        // CR 613.1: Player persisted on the source via an "as ~ enters, choose
+        // a player" replacement.
+        Some(ControllerRef::SourceChosenPlayer) => {
+            crate::game::game_object::source_chosen_player(state, ability.source_id)
                 .map(|pid| vec![pid])
                 .unwrap_or_default()
         }
@@ -81,6 +98,19 @@ fn resolve_sacrifice_scope(
             .and_then(|event| crate::game::targeting::extract_player_from_event(event, state))
             .map(|pid| vec![pid])
             .unwrap_or_default(),
+        // CR 303.4b: The player an Aura is attached to.
+        Some(ControllerRef::EnchantedPlayer) => crate::game::filter::controller_ref_player(
+            state,
+            ability.source_id,
+            Some(ability.controller),
+            Some(ability),
+            // CR 303.4b: Resolve enchanted player as sacrifice scope.
+            &ControllerRef::EnchantedPlayer,
+        )
+        .map(|pid| vec![pid])
+        .unwrap_or_default(),
+        // CR 102.1: the active player, read live.
+        Some(ControllerRef::ActivePlayer) => vec![state.active_player],
     }
 }
 
@@ -124,6 +154,19 @@ pub fn resolve(
         }
         _ => (&TargetFilter::Any, &default_count, false, 0),
     };
+    // CR 400.7: A self-referential sacrifice ("sacrifice this creature") does
+    // nothing if the source has left and re-entered the battlefield (blink/
+    // flicker) since this ability fired — the re-entered permanent is a new
+    // object. Sacrifice is non-targeted and resolves `SelfRef` through a
+    // resolution-time pool filter rather than the `resolved_targets` chokepoint,
+    // so the self-reference epoch guard must be applied here explicitly.
+    if matches!(filter, TargetFilter::SelfRef) && !ability.source_is_current(state) {
+        events.push(GameEvent::EffectResolved {
+            kind: EffectKind::from(&ability.effect),
+            source_id: ability.source_id,
+        });
+        return Ok(());
+    }
     let scoped_ability;
     let ability = if matches!(
         sacrifice_controller_scope(filter),
@@ -181,11 +224,25 @@ pub fn resolve(
             .iter()
             .copied()
             .filter(|id| {
-                state.objects.get(id).is_some_and(|obj| {
-                    obj.controller == chooser
-                        && !obj.is_emblem
-                        && crate::game::filter::matches_target_filter(state, *id, filter, &ctx)
-                })
+                // CR 614.13a/b: restrict to objects present before the devourer co-entry
+                // began; vacuous when None. (Pool is built from LIVE battlefield, so an
+                // object an earlier co-entering devourer already sacrificed is excluded by
+                // the live basis, and the devourers themselves by the snapshot.)
+                state
+                    .devour_eligible_snapshot
+                    .as_ref()
+                    .is_none_or(|s| s.contains(id))
+                    && state.objects.get(id).is_some_and(|obj| {
+                        obj.controller == chooser
+                            && !obj.is_emblem
+                            && crate::game::filter::matches_target_filter(state, *id, filter, &ctx)
+                            && !crate::game::static_abilities::triggered_cause_sacrifice_or_exile_muzzled(
+                                state,
+                                ability,
+                                *id,
+                                chooser,
+                            )
+                    })
             })
             .collect();
 
@@ -217,7 +274,7 @@ pub fn resolve(
         // this rather than round-tripping through EffectZoneChoice.
         if !up_to && eligible.len() <= count {
             let mut sacrificed: i32 = 0;
-            for obj_id in eligible {
+            for &obj_id in &eligible {
                 match sacrifice::sacrifice_permanent(state, obj_id, chooser, events) {
                     Ok(SacrificeOutcome::Complete) => sacrificed += 1,
                     Ok(SacrificeOutcome::NeedsReplacementChoice(player)) => {
@@ -228,6 +285,15 @@ pub fn resolve(
                     Err(_) => {}
                 }
             }
+            // CR 701.21a + CR 603.10a + CR 608.2f: every eligible permanent was
+            // sacrificed as part of the same resolution event, so co-departing
+            // sacrifice/LTB observers (Blood Artist) observe each other.
+            // `departed_subset` drops any permanent that didn't actually leave
+            // (e.g. CantBeSacrificed members excluded upstream).
+            crate::game::zones::mark_simultaneous_departures(
+                events,
+                &crate::game::zones::departed_subset(state, &eligible),
+            );
             state.last_effect_count = Some(sacrificed);
             events.push(GameEvent::EffectResolved {
                 kind: EffectKind::from(&ability.effect),
@@ -250,13 +316,20 @@ pub fn resolve(
             effect_kind: EffectKind::Sacrifice,
             zone: Zone::Battlefield,
             destination: None,
-            enter_tapped: false,
+            enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             enter_transformed: false,
             enters_under_player: None,
             enters_attacking: false,
             owner_library: false,
             track_exiled_by_source: false,
+            // CR 708.2a: sacrifice selection is not a face-down entry.
+            face_down_profile: None,
+            enter_with_counters: vec![],
+            conditional_enter_with_counters: vec![],
             count_param: 0,
+            library_position: None,
+            is_cost_payment: false,
+            enters_modified_if: None,
         };
 
         // EffectResolved is emitted by the EffectZoneChoice handler after the player chooses
@@ -289,6 +362,12 @@ pub fn resolve(
         }
 
         let player_id = obj.controller;
+
+        if crate::game::static_abilities::triggered_cause_sacrifice_or_exile_muzzled(
+            state, ability, obj_id, player_id,
+        ) {
+            continue;
+        }
 
         match sacrifice::sacrifice_permanent(state, obj_id, player_id, events) {
             Ok(SacrificeOutcome::Complete) => {}
@@ -483,6 +562,71 @@ mod tests {
             }
             other => panic!("expected EffectZoneChoice with eligible set, got {other:?}"),
         }
+    }
+
+    /// Cluster J1 (building-block companion to the Disciple of Bolas
+    /// cast-pipeline guard): "sacrifice **another** creature" as an EFFECT must
+    /// exclude the ability's source from the eligible pool. With exactly one
+    /// OTHER creature, the mandatory sacrifice auto-resolves onto it and the
+    /// source survives.
+    ///
+    /// CR 701.21a: sacrifice moves the chosen permanent to its owner's
+    /// graveyard. `FilterProp::Another` is evaluated via
+    /// `FilterContext::from_ability` (source excluded). The paired negative
+    /// (source survives) is made non-vacuous by asserting the OTHER creature was
+    /// actually moved to the graveyard.
+    #[test]
+    fn sacrifice_another_creature_effect_excludes_source_from_pool() {
+        let mut state = GameState::new_two_player(42);
+        let source = create_object(
+            &mut state,
+            CardId(100),
+            PlayerId(0),
+            "Disciple".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&source)
+            .unwrap()
+            .card_types
+            .core_types = vec![CoreType::Creature];
+        let other = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Hill Giant".to_string(),
+            Zone::Battlefield,
+        );
+        state.objects.get_mut(&other).unwrap().card_types.core_types = vec![CoreType::Creature];
+
+        let ability = ResolvedAbility::new(
+            Effect::Sacrifice {
+                target: TargetFilter::Typed(
+                    TypedFilter::creature().properties(vec![FilterProp::Another]),
+                ),
+                count: QuantityExpr::Fixed { value: 1 },
+                min_count: 0,
+            },
+            vec![],
+            source,
+            PlayerId(0),
+        );
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        assert!(
+            state.battlefield.contains(&source),
+            "FilterProp::Another must exclude the source — it survives"
+        );
+        assert!(
+            state.players[0].graveyard.contains(&other),
+            "the OTHER creature is the sole eligible target and is sacrificed"
+        );
+        assert!(
+            !state.battlefield.contains(&other),
+            "non-vacuous: the other creature actually left the battlefield"
+        );
     }
 
     #[test]
@@ -1584,5 +1728,78 @@ mod tests {
             }
             other => panic!("expected EffectZoneChoice, got {other:?}"),
         }
+    }
+
+    /// CR 608.2c: "[Mandatory action]. If you do, [rider]." — a mandatory effect
+    /// that performs its action satisfies the `IfYouDo`
+    /// (`EffectOutcome { OptionalEffectPerformed }`) gate on its sibling, even
+    /// though there was no "you may" decision. Regression for issue #1514: Dark
+    /// Depths' "sacrifice it. If you do, create Marit Lage" never created the
+    /// token because the mandatory sacrifice left `optional_effect_performed`
+    /// false. Building-block test on the `Sacrifice` → `Token` chain (covers the
+    /// whole mandatory-rider class, not just Dark Depths).
+    #[test]
+    fn mandatory_sacrifice_if_you_do_rider_fires() {
+        use crate::types::ability::{AbilityCondition, PtValue, SubAbilityLink};
+
+        let mut state = GameState::new_two_player(42);
+        let victim = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Doomed Permanent".to_string(),
+            Zone::Battlefield,
+        );
+
+        // "Sacrifice it. If you do, create a 1/1 token." — a mandatory sacrifice
+        // with an `IfYouDo`-gated Token sibling, exactly the shape the parser
+        // emits for Dark Depths' Marit Lage rider.
+        let mut rider = ResolvedAbility::new(
+            Effect::Token {
+                name: "Test Token".to_string(),
+                power: PtValue::Fixed(1),
+                toughness: PtValue::Fixed(1),
+                types: vec!["Creature".to_string()],
+                colors: vec![],
+                keywords: vec![],
+                tapped: false,
+                count: QuantityExpr::Fixed { value: 1 },
+                owner: TargetFilter::Controller,
+                attach_to: None,
+                enters_attacking: false,
+                supertypes: vec![],
+                static_abilities: vec![],
+                enter_with_counters: vec![],
+            },
+            vec![],
+            ObjectId(100),
+            PlayerId(0),
+        )
+        .condition(AbilityCondition::effect_performed());
+        rider.sub_link = SubAbilityLink::SequentialSibling;
+
+        let mut ability = make_sacrifice_ability(victim);
+        ability.sub_ability = Some(Box::new(rider));
+
+        let tokens_before = state.battlefield.len();
+        let mut events = Vec::new();
+        resolve_ability_chain(&mut state, &ability, &mut events, 0).unwrap();
+
+        // The victim was sacrificed and the IfYouDo rider created the token.
+        assert!(
+            !state.battlefield.contains(&victim),
+            "mandatory sacrifice must remove the victim"
+        );
+        let created = state
+            .battlefield
+            .iter()
+            .filter_map(|id| state.objects.get(id))
+            .any(|obj| obj.is_token && obj.name == "Test Token");
+        assert!(
+            created,
+            "the mandatory-sacrifice IfYouDo rider must create the token \
+             (battlefield went from {tokens_before} to {})",
+            state.battlefield.len()
+        );
     }
 }

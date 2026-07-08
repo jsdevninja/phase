@@ -23,9 +23,6 @@
 //!   - `counter::resolve` to confirm each legal target type is actually
 //!     countered (CR 701.6a).
 
-use std::path::Path;
-use std::sync::OnceLock;
-
 use engine::database::card_db::CardDatabase;
 use engine::game::targeting::find_legal_targets;
 use engine::game::zones::create_object;
@@ -39,14 +36,7 @@ use engine::types::identifiers::{CardId, ObjectId};
 use engine::types::zones::Zone;
 use engine::types::PlayerId;
 
-fn load_db() -> Option<&'static CardDatabase> {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../client/public/card-data.json");
-    if !path.exists() {
-        return None;
-    }
-    static DB: OnceLock<CardDatabase> = OnceLock::new();
-    Some(DB.get_or_init(|| CardDatabase::from_export(&path).expect("export should load")))
-}
+use crate::support::shared_card_db as load_db;
 
 /// Extract the `Effect::Counter` target filter from Louisoix's Sacrifice's
 /// parsed card definition.
@@ -88,9 +78,14 @@ fn louisoix_sacrifice_parses_disjunctive_counter_target() {
 
     // Ability leg — any activated/triggered ability on the stack.
     assert!(
-        filters
-            .iter()
-            .any(|f| matches!(f, TargetFilter::StackAbility { controller: None })),
+        filters.iter().any(|f| matches!(
+            f,
+            TargetFilter::StackAbility {
+                controller: None,
+                tag: None,
+                kind: None,
+            }
+        )),
         "missing the activated/triggered ability disjunct: {target:?}"
     );
 
@@ -170,6 +165,7 @@ fn stack_with_four_entries() -> (GameState, ObjectId, ObjectId, ObjectId, Object
             description: None,
             source_name: String::new(),
             subject_match_count: None,
+            die_result: None,
         },
     });
 
@@ -291,6 +287,7 @@ fn louisoix_counter_resolves_each_legal_target() {
             Effect::Counter {
                 target: filter.clone(),
                 source_rider: None,
+                countered_spell_zone: None,
             },
             vec![TargetRef::Object(activated)],
             ObjectId(1000),
@@ -317,6 +314,7 @@ fn louisoix_counter_resolves_each_legal_target() {
             Effect::Counter {
                 target: filter.clone(),
                 source_rider: None,
+                countered_spell_zone: None,
             },
             vec![TargetRef::Object(triggered)],
             ObjectId(1000),
@@ -337,6 +335,7 @@ fn louisoix_counter_resolves_each_legal_target() {
             Effect::Counter {
                 target: filter.clone(),
                 source_rider: None,
+                countered_spell_zone: None,
             },
             vec![TargetRef::Object(noncreature_spell)],
             ObjectId(1000),

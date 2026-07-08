@@ -27,10 +27,15 @@ pub enum Layer {
     SetPT,
     /// CR 613.4c: Layer 7c — Effects that modify P/T (+N/+N).
     ModifyPT,
+    /// CR 613.4c: Layer 7c — +1/+1, -1/-1, and asymmetric P/T counters modifying
+    /// P/T. Counters are part of layer 7c (not a distinct sublayer), applied with
+    /// the other 7c effects and therefore BEFORE the 7d switch. Kept as its own
+    /// variant so the counter fold has a positional step in the layer loop; it
+    /// must order before `SwitchPT` (applying counters after the switch would
+    /// transpose asymmetric counters onto the wrong axis).
+    CounterPT,
     /// CR 613.4d: Layer 7d — Effects that switch P/T.
     SwitchPT,
-    /// CR 613.4c: Layer 7e — +1/+1 and -1/-1 counters modifying P/T (applied after other 7c effects).
-    CounterPT,
 }
 
 impl Layer {
@@ -46,8 +51,8 @@ impl Layer {
             Layer::CharDef,
             Layer::SetPT,
             Layer::ModifyPT,
-            Layer::SwitchPT,
             Layer::CounterPT,
+            Layer::SwitchPT,
         ]
     }
 
@@ -63,6 +68,7 @@ impl Layer {
                 | Layer::Ability
                 | Layer::CharDef
                 | Layer::SetPT
+                | Layer::ModifyPT
         )
     }
 }
@@ -75,6 +81,9 @@ impl ContinuousModification {
             // CR 707.9b + CR 613.1a: Copy-effect name override applies in Layer 1
             // after CopyValues, per timestamp order within the layer.
             ContinuousModification::SetName { .. } => Layer::Copy,
+            // CR 612.8 + CR 613.1c: Setting an object's name to the source's
+            // chosen card name is a text-changing effect — Layer 3.
+            ContinuousModification::SetChosenName => Layer::Text,
             ContinuousModification::AddPower { .. }
             | ContinuousModification::AddToughness { .. }
             | ContinuousModification::AddDynamicPower { .. }
@@ -88,8 +97,15 @@ impl ContinuousModification {
             ContinuousModification::AddKeyword { .. }
             | ContinuousModification::RemoveKeyword { .. }
             | ContinuousModification::RemoveChosenKeyword
+            | ContinuousModification::AddChosenKeyword
             | ContinuousModification::AddDynamicKeyword { .. }
+            // CR 613.1f: derived-cost cast-from-off-zone keyword grant is an
+            // ability-adding effect (Layer 6). This is what makes the off-zone
+            // collector's `effect.layer == Layer::Ability` filter retain it.
+            | ContinuousModification::AddKeywordWithDerivedCost { .. }
             | ContinuousModification::GrantAbility { .. }
+            | ContinuousModification::GrantAllActivatedAbilitiesOf { .. }
+            | ContinuousModification::GrantAllTriggeredAbilitiesOf { .. }
             | ContinuousModification::GrantTrigger { .. }
             | ContinuousModification::RemoveAllAbilities
             | ContinuousModification::AddStaticMode { .. }
@@ -104,14 +120,33 @@ impl ContinuousModification {
             | ContinuousModification::RemoveSupertype { .. }
             | ContinuousModification::AddAllCreatureTypes
             | ContinuousModification::AddAllBasicLandTypes
+            | ContinuousModification::AddAllLandTypes
             | ContinuousModification::AddChosenSubtype { .. }
-            | ContinuousModification::SetBasicLandType { .. } => Layer::Type, // CR 613.1d + CR 205.4b
+            | ContinuousModification::SetBasicLandType { .. }
+            | ContinuousModification::SetChosenBasicLandType => Layer::Type, // CR 613.1d + CR 205.4b
             // CR 122.1 + CR 614.1c: One-shot counter placement at copy
             // resolution. Consumed by the BecomeCopy / CopyTokenOf resolvers
             // before any continuous-effect machinery is reached. Reaching this
             // arm via `apply_continuous_effect` indicates a wiring bug.
             ContinuousModification::AddCounterOnEnter { .. } => unreachable!(
                 "AddCounterOnEnter is consumed at resolution; never layered. \
+                 Verify resolver dispatch in token_copy.rs / become_copy.rs."
+            ),
+            // CR 707.9b + CR 306.5b/c: Starting loyalty exceptions are folded
+            // into copied values before a copy is installed or a copy token's
+            // loyalty counters are seeded, so they never become standalone
+            // continuous-effect layer entries.
+            ContinuousModification::SetStartingLoyalty { .. } => unreachable!(
+                "SetStartingLoyalty is consumed at copy resolution; never layered. \
+                 Verify resolver dispatch in token_copy.rs / become_copy.rs."
+            ),
+            // CR 707.9 + CR 202.1b: The "has no mana cost" copy exception is
+            // consumed at copy resolution (token_copy.rs bakes it into the token;
+            // become_copy.rs strips it from the copied values), exactly like
+            // AddCounterOnEnter — it never flows through the layer system.
+            // Reaching this arm indicates a wiring bug.
+            ContinuousModification::RemoveManaCost => unreachable!(
+                "RemoveManaCost is consumed at copy resolution; never layered. \
                  Verify resolver dispatch in token_copy.rs / become_copy.rs."
             ),
             ContinuousModification::SetColor { .. }
@@ -130,7 +165,8 @@ impl ContinuousModification {
             // ability part of the copiable values. Applied at Layer 1 alongside
             // CopyValues / SetName so downstream copy effects observe the
             // retained ability when reading copiable values.
-            ContinuousModification::RetainPrintedTriggerFromSource { .. } => Layer::Copy,
+            ContinuousModification::RetainPrintedTriggerFromSource { .. }
+            | ContinuousModification::RetainPrintedAbilityFromSource { .. } => Layer::Copy,
         }
     }
 }
@@ -197,7 +233,7 @@ mod tests {
         assert!(Layer::Copy.has_dependency_ordering());
         assert!(Layer::Type.has_dependency_ordering());
         assert!(Layer::Ability.has_dependency_ordering());
-        assert!(!Layer::ModifyPT.has_dependency_ordering());
+        assert!(Layer::ModifyPT.has_dependency_ordering());
         assert!(!Layer::SwitchPT.has_dependency_ordering());
         assert!(!Layer::CounterPT.has_dependency_ordering());
     }
@@ -220,11 +256,15 @@ mod tests {
                     replacement_definitions: Default::default(),
                     static_definitions: Default::default(),
                 }),
+                display_source: crate::game::game_object::DisplaySource::Card,
                 printed_ref: None,
+                token_image_ref: None,
             }
             .layer(),
             Layer::Copy
         );
+        // CR 612.8 + CR 613.1c: SetChosenName is a text-changing effect (Layer 3).
+        assert_eq!(ContinuousModification::SetChosenName.layer(), Layer::Text);
         assert_eq!(
             ContinuousModification::AddPower { value: 1 }.layer(),
             Layer::ModifyPT

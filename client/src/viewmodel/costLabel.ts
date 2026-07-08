@@ -45,6 +45,26 @@ export function manaCostToShards(cost: ManaCost): string[] {
   return shards;
 }
 
+/** Extract the mana component of an activation/additional ability cost for payment UI. */
+export function abilityCostToManaShards(cost: SerializedAbilityCost | undefined): string[] | null {
+  if (!cost) return null;
+  const serialized = cost as SerializedCost;
+  switch (serialized.type) {
+    case "Mana":
+      return serialized.cost ? manaCostToShards(serialized.cost as ManaCost) : [];
+    case "Composite":
+    case "OneOf": {
+      for (const part of serialized.costs ?? []) {
+        const shards = abilityCostToManaShards(part);
+        if (shards != null && shards.length > 0) return shards;
+      }
+      return [];
+    }
+    default:
+      return [];
+  }
+}
+
 // Mirrors Rust AbilityCost serialization shape (serde tag = "type").
 // `amount`/`count` on PayLife/Discard are `QuantityExpr` (a typed enum), not
 // raw numbers — the engine serializes `{ type: "Fixed", value: N }` etc.
@@ -157,12 +177,53 @@ function quantityIsPlural(q: QuantityExpr | number | undefined): boolean {
   return q.type === "Fixed" ? q.value > 1 : true;
 }
 
+// mana-font ships loyalty numerals only for these magnitudes (0–20 and 25);
+// any other value has no glyph and must fall back to plain text.
+const LOYALTY_NUMERALS: ReadonlySet<number> = new Set([
+  ...Array.from({ length: 21 }, (_, i) => i),
+  25,
+]);
+
+// Single source of truth for a loyalty amount's sign → mana-font direction
+// segment + magnitude, shared by the text label (formatCost) and the icon
+// helpers so the two can never drift on how they classify +/−/0.
+function loyaltyDirection(amount: number): {
+  dir: "up" | "down" | "zero";
+  magnitude: number;
+} {
+  if (amount > 0) return { dir: "up", magnitude: amount };
+  if (amount < 0) return { dir: "down", magnitude: -amount };
+  return { dir: "zero", magnitude: 0 };
+}
+
+/**
+ * mana-font classes for a planeswalker ability's loyalty COST (e.g. `+2`, `−7`,
+ * `0`) — an up/down/zero arrow plus the numeral. Returns null when the
+ * magnitude has no shipped numeral glyph (caller falls back to text).
+ */
+export function loyaltyIconClasses(amount: number): string | null {
+  const { dir, magnitude } = loyaltyDirection(amount);
+  if (!LOYALTY_NUMERALS.has(magnitude)) return null;
+  return `ms-loyalty-${dir} ms-loyalty-${magnitude}`;
+}
+
+/**
+ * mana-font classes for a planeswalker's current loyalty TOTAL rendered in the
+ * shield glyph (`ms-loyalty-start` + numeral). Returns null when the total has
+ * no shipped numeral glyph (caller keeps the plain amber badge).
+ */
+export function loyaltyStartIconClasses(amount: number): string | null {
+  if (!LOYALTY_NUMERALS.has(amount)) return null;
+  return `ms-loyalty-start ms-loyalty-${amount}`;
+}
+
 export function formatCost(cost: SerializedCost): string {
   switch (cost.type) {
     case "Loyalty": {
       // CR 606.1: Loyalty cost is always a literal `i32` on the Rust side.
       const amt = (typeof cost.amount === "number" ? cost.amount : 0);
-      return amt > 0 ? `+${amt}` : `${amt}`;
+      const { dir, magnitude } = loyaltyDirection(amt);
+      return dir === "up" ? `+${magnitude}` : dir === "down" ? `-${magnitude}` : "0";
     }
     case "Tap": return "{T}";
     case "Untap": return "{Q}";
@@ -185,6 +246,11 @@ export function formatCost(cost: SerializedCost): string {
     case "Blight": return `Blight ${cost.count ?? 1}`;
     case "CollectEvidence":
       return `Collect evidence ${cost.amount ?? 0}`;
+    case "ReturnToHand": {
+      const count = formatQuantity(cost.count, 1);
+      const noun = quantityIsPlural(cost.count) ? "permanents" : "permanent";
+      return `Return ${count} ${noun}`;
+    }
     case "Composite":
       return (cost.costs ?? []).map(formatCost).join(", ");
     case "OneOf":
@@ -194,9 +260,42 @@ export function formatCost(cost: SerializedCost): string {
   }
 }
 
+/**
+ * Loyalty badge descriptor for a planeswalker ability cost, or null when the
+ * cost isn't a Loyalty cost with a shipped numeral glyph. Reads the structured
+ * `{ type: "Loyalty", amount }` cost — never parses "+N" strings. `text` is the
+ * plain fallback shown before the mana-font is ready ("+2" / "-7" / "0").
+ */
+export function loyaltyBadge(
+  cost: SerializedAbilityCost | undefined,
+): { iconClasses: string; text: string } | null {
+  const c = cost as SerializedCost | undefined;
+  if (!c || c.type !== "Loyalty") return null;
+  const amount = typeof c.amount === "number" ? c.amount : 0;
+  const iconClasses = loyaltyIconClasses(amount);
+  if (!iconClasses) return null;
+  return { iconClasses, text: formatCost(c) };
+}
+
+/**
+ * Strip a leading bracket/bare loyalty-cost prefix ("[+2]:", "[−1]", "+2:",
+ * "0") from a label so it isn't shown twice alongside a loyalty badge. Only
+ * applied to options that already resolved to a loyalty badge, so it can't
+ * over-strip a non-loyalty label.
+ */
+export function stripLoyaltyCostPrefix(label: string): string {
+  return label.replace(/^\[?\s*[+\-−–]?\d+\s*\]?:?\s*/, "");
+}
+
 export function abilityLabel(ability: SerializedAbility | null | undefined): string {
-  const cost = ability?.cost;
-  return cost ? formatCost(cost) : "0";
+  if (!ability) return "0";
+  if (ability.description) {
+    const colon = ability.description.indexOf(":");
+    const costText = colon > 0 ? ability.description.slice(0, colon).trim() : ability.description;
+    if (costText) return costText;
+  }
+  const cost = ability.cost;
+  return cost ? formatCost(cost as SerializedCost) : "0";
 }
 
 // Maps ManaColor names to MTG mana symbol abbreviations.
@@ -208,6 +307,7 @@ export function abilityChoiceLabel(
   action: GameAction,
   object: GameObject,
   objects?: Record<ObjectId, GameObject>,
+  webSlingingCosts?: Record<string, ManaCost>,
 ): { label: string; description?: string } {
   // CR 702.190a: Sneak — label identifies which unblocked attacker is
   // returned to pay the Sneak cost. Include the Sneak mana cost from the
@@ -245,11 +345,16 @@ export function abilityChoiceLabel(
   if (action.type === "CastSpellAsWebSlinging") {
     const returnedId = action.data.creature_to_return;
     const returnedName = objects?.[returnedId]?.name ?? `creature #${returnedId}`;
+    // Prefer the engine-derived cost (covers statically-GRANTED web-slinging,
+    // e.g. Amazing Spider-Man); fall back to the printed keyword. The engine
+    // decides which cards qualify — the frontend only formats the ManaCost.
+    const derivedCost = webSlingingCosts?.[String(object.id)];
     const webSlingingKeyword = object.keywords.find(
       (k): k is { WebSlinging: ManaCost } => typeof k === "object" && "WebSlinging" in k,
     );
-    const costSymbols = webSlingingKeyword
-      ? manaCostToShards(webSlingingKeyword.WebSlinging).map((s) => `{${s}}`).join("")
+    const cost = derivedCost ?? webSlingingKeyword?.WebSlinging;
+    const costSymbols = cost
+      ? manaCostToShards(cost).map((s) => `{${s}}`).join("")
       : "";
     const costSuffix = costSymbols ? ` (${costSymbols})` : "";
     return {

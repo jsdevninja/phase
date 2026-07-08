@@ -1,12 +1,24 @@
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+const REPO_ROOT = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "../../../..",
+);
+
 function makeLocalDataMap(
-  cards: Record<string, { name: string; mana_cost?: string; cmc?: number; type_line?: string }>,
+  cards: Record<string, { name: string; mana_cost?: string; cmc?: number; type_line?: string; oracle_id?: string }>,
 ): Response {
   const map: Record<string, unknown> = {};
   for (const [key, card] of Object.entries(cards)) {
     map[key.toLowerCase()] = {
       name: card.name,
+      oracle_id: card.oracle_id ?? key,
+      face_names: [card.name.toLowerCase()],
       mana_cost: card.mana_cost ?? "{1}",
       cmc: card.cmc ?? 1,
       type_line: card.type_line ?? "Instant",
@@ -100,6 +112,50 @@ describe("scryfallLegalityKey", () => {
 
     expect(scryfallLegalityKey("TinyLeaders")).toBeUndefined();
     expect(scryfallLegalityKey("FreeForAll")).toBeUndefined();
+    expect(scryfallLegalityKey("Archenemy")).toBeUndefined();
+  });
+});
+
+describe("pickOldestPrinting", () => {
+  it("picks the earliest release date and lowest collector number on ties", async () => {
+    const { pickOldestPrinting } = await loadScryfallModule();
+    const printings = [
+      {
+        id: "new",
+        set: "neo",
+        set_name: "Kamigawa: Neon Dynasty",
+        collector_number: "10",
+        released_at: "2022-02-11",
+        border_color: "black",
+        frame_effects: [],
+        full_art: false,
+        faces: [{ normal: "https://img.example/new.jpg", art_crop: "https://img.example/new-art.jpg" }],
+      },
+      {
+        id: "old",
+        set: "lea",
+        set_name: "Limited Edition Alpha",
+        collector_number: "2",
+        released_at: "1993-08-05",
+        border_color: "black",
+        frame_effects: [],
+        full_art: false,
+        faces: [{ normal: "https://img.example/old.jpg", art_crop: "https://img.example/old-art.jpg" }],
+      },
+      {
+        id: "same-day-later-cn",
+        set: "lea",
+        set_name: "Limited Edition Alpha",
+        collector_number: "10",
+        released_at: "1993-08-05",
+        border_color: "black",
+        frame_effects: [],
+        full_art: false,
+        faces: [{ normal: "https://img.example/same-day.jpg", art_crop: "https://img.example/same-day-art.jpg" }],
+      },
+    ];
+
+    expect(pickOldestPrinting(printings).id).toBe("old");
   });
 });
 
@@ -147,6 +203,97 @@ describe("fetchCardData", () => {
 
     expect(card.name).toBe("Abrade");
   });
+
+  it("resolves ASCII names to diacritic local data keys (issue #1497)", async () => {
+    global.fetch = vi.fn().mockResolvedValueOnce(
+      makeLocalDataMap({
+        "éomer of the riddermark": { name: "Éomer of the Riddermark", oracle_id: "eomer-oracle" },
+      }),
+    );
+
+    const { resolveOracleIdSync, fetchCardImageUrl, loadScryfallData } = await loadScryfallModule();
+    await loadScryfallData();
+    expect(resolveOracleIdSync("Eomer of the Riddermark")).toBe("eomer-oracle");
+    await expect(fetchCardImageUrl("Eomer of the Riddermark", 0)).resolves.toMatch(/^https?:\/\//);
+  });
+});
+
+describe("fetchCardData — combined multi-face names", () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  // A two-face card keyed the way the export does it: by front-face name and by
+  // the spaced display name, but NOT by the glued combined form.
+  function makeDfcDataMap(): Response {
+    const dfc = {
+      oracle_id: "peter-oracle",
+      face_names: ["peter parker", "the amazing spider-man"],
+      faces: [
+        { normal: "https://img.example/peter-front.jpg", art_crop: "https://img.example/peter-front-art.jpg" },
+        { normal: "https://img.example/peter-back.jpg", art_crop: "https://img.example/peter-back-art.jpg" },
+      ],
+      layout: "transform",
+      name: "Peter Parker // The Amazing Spider-Man",
+      mana_cost: "{1}{W}",
+      cmc: 2,
+      type_line: "Legendary Creature — Human Hero",
+      colors: ["W"],
+      color_identity: ["W"],
+      keywords: [],
+    };
+    const map: Record<string, unknown> = {
+      "peter parker": dfc,
+      "peter parker // the amazing spider-man": dfc,
+      // A single-faced card whose own printed name contains "//" (issue #4790).
+      "sp//dr, piloted by peni": {
+        oracle_id: "spdr-oracle",
+        face_names: ["sp//dr, piloted by peni"],
+        faces: [{ normal: "https://img.example/spdr.jpg", art_crop: "https://img.example/spdr-art.jpg" }],
+        name: "SP//dr, Piloted by Peni",
+        mana_cost: "{3}{W}{U}",
+        cmc: 5,
+        type_line: "Legendary Artifact Creature — Spider Hero",
+        colors: ["W", "U"],
+        color_identity: ["W", "U"],
+        keywords: [],
+      },
+    };
+    return new Response(JSON.stringify(map), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  it("resolves a hand-typed glued double-faced name via the front face", async () => {
+    global.fetch = vi.fn().mockResolvedValueOnce(makeDfcDataMap());
+
+    const { fetchCardData } = await loadScryfallModule();
+    const card = await fetchCardData("Peter Parker//The Amazing Spider-Man");
+
+    expect(card.name).toBe("Peter Parker // The Amazing Spider-Man");
+    expect(global.fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("resolves the canonical spaced double-faced name directly", async () => {
+    global.fetch = vi.fn().mockResolvedValueOnce(makeDfcDataMap());
+
+    const { fetchCardData } = await loadScryfallModule();
+    const card = await fetchCardData("Peter Parker // The Amazing Spider-Man");
+
+    expect(card.name).toBe("Peter Parker // The Amazing Spider-Man");
+  });
+
+  it("does not mis-split a single-faced card whose name contains \"//\" (issue #4790)", async () => {
+    global.fetch = vi.fn().mockResolvedValueOnce(makeDfcDataMap());
+
+    const { fetchCardData } = await loadScryfallModule();
+    const card = await fetchCardData("SP//dr, Piloted by Peni");
+
+    // Its own name is a primary key, so the exact match wins before any split.
+    expect(card.name).toBe("SP//dr, Piloted by Peni");
+    expect(card.type_line).toContain("Spider Hero");
+  });
 });
 
 describe("fetchCardImageUrl", () => {
@@ -166,6 +313,103 @@ describe("fetchCardImageUrl", () => {
 
     expect(url).toBe("https://img.example/Lightning%20Bolt.jpg");
     expect(global.fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("falls back to a real local printing when canonical image data is Scryfall's soon placeholder", async () => {
+    const oracleId = "war-room-oracle";
+    global.fetch = vi.fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            [oracleId]: {
+              oracle_id: oracleId,
+              face_names: ["war room"],
+              faces: [
+                {
+                  normal: "https://errors.scryfall.com/soon.jpg",
+                  art_crop: "https://errors.scryfall.com/soon.jpg",
+                },
+              ],
+              layout: "normal",
+              name: "War Room",
+              mana_cost: "",
+              cmc: 0,
+              type_line: "Land",
+              colors: [],
+              color_identity: [],
+              keywords: [],
+            },
+            "war room": {
+              oracle_id: oracleId,
+              face_names: ["war room"],
+              faces: [
+                {
+                  normal: "https://errors.scryfall.com/soon.jpg",
+                  art_crop: "https://errors.scryfall.com/soon.jpg",
+                },
+              ],
+              layout: "normal",
+              name: "War Room",
+              mana_cost: "",
+              cmc: 0,
+              type_line: "Land",
+              colors: [],
+              color_identity: [],
+              keywords: [],
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            [oracleId]: [
+              {
+                id: "future-placeholder",
+                set: "soc",
+                set_name: "Secrets of Strixhaven Commander",
+                collector_number: "422",
+                released_at: "2026-04-24",
+                border_color: "black",
+                frame_effects: [],
+                full_art: false,
+                faces: [
+                  {
+                    normal: "https://errors.scryfall.com/soon.jpg",
+                    art_crop: "https://errors.scryfall.com/soon.jpg",
+                  },
+                ],
+              },
+              {
+                id: "real-printing",
+                set: "cmm",
+                set_name: "Commander Masters",
+                collector_number: "1054",
+                released_at: "2023-08-04",
+                border_color: "black",
+                frame_effects: [],
+                full_art: false,
+                faces: [
+                  {
+                    normal: "https://cards.scryfall.io/normal/front/w/r/war-room.jpg",
+                    art_crop: "https://cards.scryfall.io/art_crop/front/w/r/war-room.jpg",
+                  },
+                ],
+              },
+            ],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        ),
+      );
+
+    const { fetchCardImageAssetByOracleId, fetchCardImageUrl } = await loadScryfallModule();
+    const url = await fetchCardImageUrl("War Room", 0, "normal");
+    const oracleAsset = await fetchCardImageAssetByOracleId(oracleId, "War Room", "normal");
+
+    expect(url).toBe("https://cards.scryfall.io/normal/front/w/r/war-room.jpg");
+    expect(oracleAsset.src).toBe("https://cards.scryfall.io/normal/front/w/r/war-room.jpg");
+    expect(global.fetch).toHaveBeenCalledTimes(2);
   });
 
   it("throws when card image is not in local data (no API fallback)", async () => {
@@ -190,6 +434,190 @@ describe("fetchCardImageUrl", () => {
     const url = await fetchCardImageUrl("Mountain <288>", 0, "art_crop");
 
     expect(url).toBe("https://img.example/Mountain-art.jpg");
+  });
+});
+
+describe("fetchCardImageAssetByOracleId — reversible cards (issue #2031)", () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("resolves front-face art keyed by face oracle_id", async () => {
+    const oracleId = "ea9709b6-4c37-4d5a-b04d-cd4c42e4f9dd";
+    global.fetch = vi.fn().mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          [oracleId]: {
+            oracle_id: oracleId,
+            face_names: ["propaganda", "propaganda"],
+            faces: [
+              {
+                normal: "https://img.example/propaganda-front.jpg",
+                art_crop: "https://img.example/propaganda-front-art.jpg",
+              },
+              {
+                normal: "https://img.example/propaganda-back.jpg",
+                art_crop: "https://img.example/propaganda-back-art.jpg",
+              },
+            ],
+            layout: "reversible_card",
+            name: "Propaganda // Propaganda",
+            mana_cost: "{2}{U}",
+            cmc: 3,
+            type_line: "Enchantment",
+            colors: ["U"],
+            color_identity: ["U"],
+            keywords: [],
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+
+    const { fetchCardImageAssetByOracleId } = await loadScryfallModule();
+    const asset = await fetchCardImageAssetByOracleId(oracleId, "Propaganda", "normal");
+
+    expect(asset.src).toBe("https://img.example/propaganda-front.jpg");
+    expect(global.fetch).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("Scryfall generation scripts — reversible cards (issue #2031)", () => {
+  const oracleId = "ea9709b6-4c37-4d5a-b04d-cd4c42e4f9dd";
+
+  function withTempDir(run: (dir: string) => void) {
+    const dir = mkdtempSync(path.join(tmpdir(), "scryfall-gen-"));
+    try {
+      run(dir);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  it("keys image data by face oracle_id when reversible cards omit root oracle_id", () => {
+    withTempDir((dir) => {
+      const input = path.join(dir, "oracle-cards.json");
+      const output = path.join(dir, "scryfall-data.json");
+      writeFileSync(
+        input,
+        JSON.stringify([
+          {
+            layout: "reversible_card",
+            name: "Propaganda // Propaganda",
+            card_faces: [
+              {
+                oracle_id: oracleId,
+                name: "Propaganda",
+                mana_cost: "{2}{U}",
+                cmc: 3,
+                type_line: "Enchantment",
+                colors: ["U"],
+                color_identity: ["U"],
+                keywords: ["Ward"],
+                image_uris: {
+                  normal: "https://img.example/front.jpg",
+                  art_crop: "https://img.example/front-art.jpg",
+                },
+              },
+              {
+                oracle_id: oracleId,
+                name: "Propaganda",
+                image_uris: {
+                  normal: "https://img.example/back.jpg",
+                  art_crop: "https://img.example/back-art.jpg",
+                },
+              },
+            ],
+          },
+        ]),
+      );
+
+      execFileSync("bash", [path.join(REPO_ROOT, "scripts/gen-scryfall-images.sh")], {
+        cwd: REPO_ROOT,
+        env: {
+          ...process.env,
+          SCRYFALL_ORACLE_FILE: input,
+          SCRYFALL_IMAGES_OUTPUT: output,
+        },
+        stdio: "pipe",
+      });
+
+      const generated = JSON.parse(readFileSync(output, "utf8"));
+      expect(generated[oracleId]).toMatchObject({
+        oracle_id: oracleId,
+        layout: "reversible_card",
+        color_identity: ["U"],
+        keywords: ["Ward"],
+      });
+      expect(generated[oracleId].faces[0].normal).toBe("https://img.example/front.jpg");
+    });
+  });
+
+  it("groups printings by face oracle_id when reversible cards omit root oracle_id", () => {
+    withTempDir((dir) => {
+      const input = path.join(dir, "default-cards.json");
+      const output = path.join(dir, "scryfall-printings.json");
+      writeFileSync(
+        input,
+        JSON.stringify([
+          {
+            id: "old-printing",
+            layout: "reversible_card",
+            name: "Propaganda // Propaganda",
+            set: "sld",
+            set_name: "Secret Lair Drop",
+            collector_number: "1",
+            released_at: "2024-01-01",
+            border_color: "borderless",
+            full_art: false,
+            card_faces: [
+              {
+                oracle_id: oracleId,
+                image_uris: {
+                  normal: "https://img.example/old-front.jpg",
+                  art_crop: "https://img.example/old-front-art.jpg",
+                },
+              },
+            ],
+          },
+          {
+            id: "new-printing",
+            layout: "reversible_card",
+            name: "Propaganda // Propaganda",
+            set: "sld",
+            set_name: "Secret Lair Drop",
+            collector_number: "2",
+            released_at: "2025-01-01",
+            border_color: "borderless",
+            full_art: true,
+            card_faces: [
+              {
+                oracle_id: oracleId,
+                image_uris: {
+                  normal: "https://img.example/new-front.jpg",
+                  art_crop: "https://img.example/new-front-art.jpg",
+                },
+              },
+            ],
+          },
+        ]),
+      );
+
+      execFileSync("bash", [path.join(REPO_ROOT, "scripts/gen-scryfall-printings.sh")], {
+        cwd: REPO_ROOT,
+        env: {
+          ...process.env,
+          SCRYFALL_DEFAULT_CARDS_FILE: input,
+          SCRYFALL_PRINTINGS_OUTPUT: output,
+        },
+        stdio: "pipe",
+      });
+
+      const generated = JSON.parse(readFileSync(output, "utf8"));
+      expect(generated[oracleId]).toHaveLength(2);
+      expect(generated[oracleId][0].id).toBe("new-printing");
+      expect(generated[oracleId][1].id).toBe("old-printing");
+    });
   });
 });
 

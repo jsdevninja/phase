@@ -157,7 +157,20 @@ pub(crate) fn parse_saga_chapters(
     let mut triggers = Vec::new();
     for (nums, effect_text) in &chapters {
         for &n in nums {
-            let mut execute = parse_effect_chain(effect_text, AbilityKind::Spell);
+            // CR 701.38 (Council's-dilemma / Will-of-the-council vote): a saga
+            // chapter may itself be a vote (Trial of a Time Lord IV: "Starting
+            // with you, each player votes for innocent or guilty. If guilty
+            // gets more votes, ..."). The vote dispatcher recognizes the entire
+            // opener + outcome clauses as one synthesized Vote effect; chain
+            // parsing would mis-split the opener and leave the outcome clauses
+            // Unimplemented. Try it first, mirroring the spell-line dispatch in
+            // `oracle.rs`.
+            let mut execute =
+                match crate::parser::oracle_vote::parse_vote_block(effect_text, AbilityKind::Spell)
+                {
+                    Some(vote_def) => vote_def,
+                    None => parse_effect_chain(effect_text, AbilityKind::Spell),
+                };
             // CR 611.2b + CR 714.2b: A chapter ability that grants an ability with no
             // explicit duration in its Oracle text creates a continuous effect that
             // persists indefinitely. The general-purpose `try_parse_gain_quoted_ability`
@@ -279,7 +292,9 @@ fn promote_generic_effect_duration(effect: &mut Effect) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::ability::{ControllerRef, FilterProp, PtValue, TypeFilter};
+    use crate::types::ability::{
+        ContinuousModification, ControllerRef, FilterProp, PtValue, TypeFilter,
+    };
 
     #[test]
     fn parse_roman_numeral_range() {
@@ -395,6 +410,54 @@ mod tests {
     }
 
     #[test]
+    fn summon_yojimbo_chapter_combat_tax_parses() {
+        use crate::parser::oracle_effect::parse_effect;
+        use crate::types::ability::{ContinuousModification, StaticCondition};
+        use crate::types::statics::StaticMode;
+
+        let lines = vec!["II, III — Until your next turn, creatures can't attack you unless their controller pays {2} for each of those creatures."];
+        let (triggers, _etb, _consumed) = parse_saga_chapters(&lines, "Summon: Yojimbo");
+        assert_eq!(triggers.len(), 2);
+
+        for trigger in &triggers {
+            let exec = trigger.execute.as_ref().expect("chapter execute");
+            assert!(
+                matches!(exec.duration, Some(Duration::UntilNextTurnOf { .. })),
+                "expected UntilNextTurnOf, got {:?}",
+                exec.duration
+            );
+            match &*exec.effect {
+                Effect::GenericEffect {
+                    static_abilities,
+                    target,
+                    ..
+                } => {
+                    assert_eq!(target, &Some(TargetFilter::SelfRef));
+                    let ContinuousModification::GrantStaticAbility { definition } =
+                        &static_abilities[0].modifications[0]
+                    else {
+                        panic!("expected GrantStaticAbility combat tax");
+                    };
+                    assert!(matches!(definition.mode, StaticMode::CantAttack));
+                    assert!(matches!(
+                        definition.condition,
+                        Some(StaticCondition::UnlessPay { .. })
+                    ));
+                }
+                other => panic!("expected GenericEffect combat tax, got {other:?}"),
+            }
+        }
+
+        let effect = parse_effect(
+            "Until your next turn, creatures can't attack you unless their controller pays {2} for each of those creatures.",
+        );
+        assert!(
+            matches!(effect, Effect::GenericEffect { .. }),
+            "peeled duration combat tax must not be Unimplemented"
+        );
+    }
+
+    #[test]
     fn is_saga_chapter_extended() {
         assert!(is_saga_chapter("VI — Something"));
         assert!(is_saga_chapter("VII — Something"));
@@ -447,6 +510,42 @@ mod tests {
             }
             other => panic!("expected GenericEffect, got {other:?}"),
         }
+    }
+
+    /// CR 111.3 (issue #4605): Urza's Saga chapter II grants
+    /// `{2}, {T}: Create a 0/0 colorless Construct artifact creature token with
+    /// 'This token gets +1/+1 for each artifact you control.'`. Because the
+    /// create-token clause is nested inside the double-quoted granted ability,
+    /// its inner token ability uses SINGLE quotes. The granted ability's effect
+    /// must be a token-creation effect — NOT the inner `Pump` lifted out of the
+    /// single-quoted span (which is what made activating it create no token).
+    #[test]
+    fn urzas_saga_chapter_two_granted_ability_creates_token() {
+        let lines = vec![
+            "II — This Saga gains \"{2}, {T}: Create a 0/0 colorless Construct artifact creature token with 'This token gets +1/+1 for each artifact you control.'\"",
+        ];
+        let (triggers, _etb, _consumed) = parse_saga_chapters(&lines, "Urza's Saga");
+        assert_eq!(triggers.len(), 1);
+        let exec = triggers[0].execute.as_ref().unwrap();
+        let Effect::GenericEffect {
+            static_abilities, ..
+        } = &*exec.effect
+        else {
+            panic!("expected GenericEffect, got {:?}", exec.effect);
+        };
+        let granted = static_abilities
+            .iter()
+            .flat_map(|s| s.modifications.iter())
+            .find_map(|m| match m {
+                ContinuousModification::GrantAbility { definition } => Some(definition),
+                _ => None,
+            })
+            .expect("chapter II must grant an activated ability");
+        assert!(
+            matches!(&*granted.effect, Effect::Token { .. }),
+            "granted ability must create a token, got {:?}",
+            granted.effect
+        );
     }
 
     /// CR 514.2: Roar of the Fifth People chapter IV explicitly says "until end
@@ -526,5 +625,141 @@ mod tests {
         assert!(!chapter_has_explicit_duration_suffix(
             "Create a 1/1 green Saproling."
         ));
+    }
+
+    /// Fable of the Mirror-Breaker chapter III: exile then return transformed.
+    #[test]
+    fn fable_chapter_three_exiles_then_returns_transformed() {
+        let lines = vec![
+            "III — Exile this Saga, then return it to the battlefield transformed under your control.",
+        ];
+        let (triggers, _etb, _consumed) =
+            parse_saga_chapters(&lines, "Fable of the Mirror-Breaker");
+        assert_eq!(triggers.len(), 1);
+        let exec = triggers[0].execute.as_ref().expect("chapter III execute");
+        match &*exec.effect {
+            Effect::ChangeZone {
+                destination: Zone::Exile,
+                target: TargetFilter::SelfRef,
+                ..
+            } => {}
+            other => panic!("expected exile SelfRef clause 1, got {other:?}"),
+        }
+        let sub = exec.sub_ability.as_ref().expect("return transformed sub");
+        assert!(
+            !matches!(&*sub.effect, Effect::ChangeZoneAll { .. }),
+            "chapter III return must be single-object ChangeZone so enter_transformed propagates"
+        );
+        match &*sub.effect {
+            Effect::ChangeZone {
+                destination: Zone::Battlefield,
+                target,
+                enter_transformed,
+                enters_under,
+                ..
+            } => {
+                assert!(
+                    matches!(
+                        target,
+                        TargetFilter::SelfRef
+                            | TargetFilter::TrackedSet { .. }
+                            | TargetFilter::ParentTarget
+                    ),
+                    "return target must refer to the exiled saga, got {target:?}"
+                );
+                assert!(*enter_transformed, "chapter III must return transformed");
+                assert_eq!(
+                    enters_under.as_ref(),
+                    Some(&ControllerRef::You),
+                    "chapter III must enter under your control"
+                );
+            }
+            other => panic!("expected return transformed clause 2, got {other:?}"),
+        }
+    }
+
+    /// CR 714.2 + CR 400.7i: The Legend of Roku chapter I (issue #1549) —
+    /// exile top three, then grant play-from-exile until end of controller's
+    /// next turn. The permission sub-ability must bind to `TrackedSet`, not
+    /// the saga source.
+    #[test]
+    fn legend_of_roku_chapter_one_exiles_and_grants_play_permission() {
+        use crate::types::ability::{
+            CastingPermission, Duration, PlayerScope, QuantityExpr, TargetFilter,
+        };
+        use crate::types::identifiers::TrackedSetId;
+
+        let lines = vec![
+            "I — Exile the top three cards of your library. Until the end of your next turn, you may play those cards.",
+        ];
+        let (triggers, _etb, _consumed) = parse_saga_chapters(&lines, "The Legend of Roku");
+        assert_eq!(triggers.len(), 1);
+        let exec = triggers[0].execute.as_ref().expect("chapter I execute");
+        match &*exec.effect {
+            Effect::ExileTop {
+                player: TargetFilter::Controller,
+                count: QuantityExpr::Fixed { value: 3 },
+                face_down: false,
+            } => {}
+            other => panic!("expected ExileTop(controller, 3), got {other:?}"),
+        }
+        let sub = exec
+            .sub_ability
+            .as_ref()
+            .expect("play permission sub-ability");
+        match &*sub.effect {
+            Effect::GrantCastingPermission {
+                permission:
+                    CastingPermission::PlayFromExile {
+                        duration:
+                            Duration::UntilEndOfNextTurnOf {
+                                player: PlayerScope::Controller,
+                            },
+                        ..
+                    },
+                target:
+                    TargetFilter::TrackedSet {
+                        id: TrackedSetId(0),
+                    },
+                ..
+            } => {}
+            other => panic!("expected PlayFromExile grant on TrackedSet, got {other:?}"),
+        }
+    }
+
+    /// Issue #588: Good King Mog XII chapter IV mass counter placement must
+    /// lower to PutCounterAll scoped to other Moogles you control.
+    #[test]
+    fn good_king_mog_chapter_four_counters_other_moogles_issue_588() {
+        use crate::types::ability::{ControllerRef, FilterProp, QuantityExpr, TypeFilter};
+        use crate::types::counter::CounterType;
+
+        let lines = vec!["IV — Put two +1/+1 counters on each other Moogle you control."];
+        let (triggers, _etb, _consumed) = parse_saga_chapters(&lines, "Summon: Good King Mog XII");
+        assert_eq!(triggers.len(), 1);
+        let exec = triggers[0].execute.as_ref().expect("chapter IV execute");
+        match &*exec.effect {
+            Effect::PutCounterAll {
+                counter_type,
+                count,
+                target,
+            } => {
+                assert_eq!(*counter_type, CounterType::Plus1Plus1);
+                assert_eq!(*count, QuantityExpr::Fixed { value: 2 });
+                let TargetFilter::Typed(tf) = target else {
+                    panic!("expected Typed target, got {target:?}");
+                };
+                assert!(
+                    tf.type_filters
+                        .iter()
+                        .any(|f| matches!(f, TypeFilter::Subtype(s) if s == "Moogle")),
+                    "Moogle subtype must survive saga chapter lowering, got {:?}",
+                    tf.type_filters
+                );
+                assert_eq!(tf.controller, Some(ControllerRef::You));
+                assert!(tf.properties.contains(&FilterProp::Another));
+            }
+            other => panic!("expected PutCounterAll, got {other:?}"),
+        }
     }
 }

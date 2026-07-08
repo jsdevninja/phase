@@ -20,6 +20,8 @@ use crate::features::aggro_pressure::{
     is_low_curve_creature_parts, AGGRO_COMMITMENT_FLOOR,
 };
 use crate::features::DeckFeatures;
+#[cfg(test)]
+use engine::types::game_state::CastPaymentMode;
 
 /// Opponent life total threshold for burn-finisher bonus. CR 120.3.
 const BURN_FINISHER_LIFE_THRESHOLD: i32 = 6;
@@ -53,7 +55,7 @@ impl TacticalPolicy for AggroPressurePolicy {
 
     fn verdict(&self, ctx: &PolicyContext<'_>) -> PolicyVerdict {
         match &ctx.candidate.action {
-            GameAction::DeclareAttackers { attacks } => score_declare_attackers(ctx, attacks),
+            GameAction::DeclareAttackers { attacks, .. } => score_declare_attackers(ctx, attacks),
             GameAction::CastSpell { object_id, .. } => score_cast_spell(ctx, *object_id),
             _ => PolicyVerdict::Score {
                 delta: 0.0,
@@ -281,6 +283,8 @@ mod tests {
                 object_id,
                 card_id,
                 targets: Vec::new(),
+
+                payment_mode: CastPaymentMode::Auto,
             },
             metadata: ActionMetadata {
                 actor: Some(AI),
@@ -293,7 +297,10 @@ mod tests {
         attacks: Vec<(ObjectId, engine::game::combat::AttackTarget)>,
     ) -> CandidateAction {
         CandidateAction {
-            action: GameAction::DeclareAttackers { attacks },
+            action: GameAction::DeclareAttackers {
+                attacks,
+                bands: vec![],
+            },
             metadata: ActionMetadata {
                 actor: Some(AI),
                 tactical_class: TacticalClass::Attack,
@@ -349,6 +356,7 @@ mod tests {
                 amount: QuantityExpr::Fixed { value: 3 },
                 target: TargetFilter::Any,
                 damage_source: None,
+                excess: None,
             },
         );
         ability.kind = AbilityKind::Spell;
@@ -401,6 +409,7 @@ mod tests {
             config: &config,
             context: &context,
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
 
         let verdict = AggroPressurePolicy.verdict(&ctx);
@@ -434,6 +443,7 @@ mod tests {
             config: &config,
             context: &context,
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
 
         let verdict = AggroPressurePolicy.verdict(&ctx);
@@ -469,6 +479,7 @@ mod tests {
             config: &config,
             context: &context,
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
 
         let verdict = AggroPressurePolicy.verdict(&ctx);
@@ -512,6 +523,7 @@ mod tests {
             config: &config,
             context: &context,
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
 
         let verdict = AggroPressurePolicy.verdict(&ctx);

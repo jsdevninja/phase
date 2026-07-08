@@ -17,7 +17,9 @@ use super::token::{
 };
 use crate::parser::oracle_ir::ast::*;
 use crate::parser::oracle_ir::context::ParseContext;
+use crate::parser::oracle_nom::bridge::nom_on_lower;
 use crate::types::ability::{PtValue, QuantityExpr, QuantityRef};
+use crate::types::card_type::Supertype;
 use crate::types::keywords::Keyword;
 use crate::types::mana::ManaColor;
 
@@ -56,21 +58,51 @@ pub(crate) fn parse_animation_spec(text: &str, _ctx: &mut ParseContext) -> Optio
         rest = stripped;
     }
 
+    let (leading_supertypes, after_supertypes) = strip_animation_supertypes(rest);
+    spec.supertypes = leading_supertypes;
+    rest = after_supertypes;
+
+    // CR 107.3c: "X/X where X is ~'s power" — X is bound to a dynamic quantity
+    // (source's power), NOT the cost paid. This pattern must be detected BEFORE
+    // the X-cost activation path (parse_cost_x_become_pt_prefix) to avoid the
+    // false match that would emit CostXPaid (which evaluates to 0 for triggers).
+    // Covers Obuun, Mul Daya Ancestor and similar patterns.
+    // allow-noncombinator: case-insensitive phrase scan - nom lacks case-insensitive take_until
+    if let Some(where_x_pos) = rest.to_lowercase().find("where x is ") {
+        // Trim whitespace first so the trailing comma (from ", where X is") is
+        // exposed for removal. Without this, "reach, " keeps the comma because
+        // trim_end_matches(',') doesn't see past the trailing space.
+        let before_where = rest[..where_x_pos].trim().trim_end_matches(',').trim();
+        let after_where = &rest[where_x_pos + "where x is ".len()..];
+        let after_where_lower = after_where.to_lowercase();
+        rest = parse_cost_x_become_pt_prefix(before_where).unwrap_or(before_where);
+
+        let (_, qty) = nom_quantity::parse_quantity_ref_complete(&after_where_lower).ok()?;
+        let dynamic_qty = QuantityExpr::Ref { qty };
+        spec.dynamic_power = Some(dynamic_qty.clone());
+        spec.dynamic_toughness = Some(dynamic_qty);
+    }
+
     if let Some((power, toughness, after_pt)) = parse_fixed_become_pt_prefix(rest) {
         spec.power = Some(power);
         spec.toughness = Some(toughness);
         rest = after_pt;
-    } else if let Some(after_pt) = parse_cost_x_become_pt_prefix(rest) {
-        // CR 107.3 + CR 107.3a: "{X}{G}: ~ becomes an X/X creature" — P/T resolves
-        // to the X paid for the activation cost. Maps Variable("X")/Variable("X") to
-        // CostXPaid so the animate effect reads cost_x_paid at resolution (not Variable
-        // which only resolves while the spell/ability is on the stack).
-        let cost_x = QuantityExpr::Ref {
-            qty: QuantityRef::CostXPaid,
-        };
-        spec.dynamic_power = Some(cost_x.clone());
-        spec.dynamic_toughness = Some(cost_x);
-        rest = after_pt;
+    } else if spec.dynamic_power.is_none() && spec.dynamic_toughness.is_none() {
+        // Only apply X-cost activation path if dynamic P/T wasn't already set by
+        // "where X is" pattern detection above. This prevents CostXPaid from
+        // overwriting SourcePower for patterns like "X/X where X is ~'s power".
+        if let Some(after_pt) = parse_cost_x_become_pt_prefix(rest) {
+            // CR 107.3 + CR 107.3a: "{X}{G}: ~ becomes an X/X creature" — P/T resolves
+            // to the X paid for the activation cost. Maps Variable("X")/Variable("X") to
+            // CostXPaid so the animate effect reads cost_x_paid at resolution (not Variable
+            // which only resolves while the spell/ability is on the stack).
+            let cost_x = QuantityExpr::Ref {
+                qty: QuantityRef::CostXPaid,
+            };
+            spec.dynamic_power = Some(cost_x.clone());
+            spec.dynamic_toughness = Some(cost_x);
+            rest = after_pt;
+        }
     }
 
     if let Some((descriptor, power, toughness, keywords)) = split_animation_base_pt_clause(rest) {
@@ -80,10 +112,15 @@ pub(crate) fn parse_animation_spec(text: &str, _ctx: &mut ParseContext) -> Optio
         rest = descriptor;
     }
 
-    if let Some((descriptor, value)) = split_animation_dynamic_pt_clause(rest) {
-        spec.dynamic_power = Some(value.clone());
-        spec.dynamic_toughness = Some(value);
-        rest = descriptor;
+    if spec.dynamic_power.is_none() && spec.dynamic_toughness.is_none() {
+        // Only apply split_animation_dynamic_pt_clause if dynamic P/T wasn't already
+        // set by "where X is" pattern detection above. This prevents overwriting
+        // SourcePower with other quantity references.
+        if let Some((descriptor, value)) = split_animation_dynamic_pt_clause(rest) {
+            spec.dynamic_power = Some(value.clone());
+            spec.dynamic_toughness = Some(value);
+            rest = descriptor;
+        }
     }
 
     let (descriptor, keywords) = split_animation_keyword_clause(rest);
@@ -95,13 +132,19 @@ pub(crate) fn parse_animation_spec(text: &str, _ctx: &mut ParseContext) -> Optio
         rest = after_colors;
     }
 
-    spec.types = parse_animation_types(
+    let (parsed_supertypes, types) = parse_animation_type_parts(
         rest,
         spec.power.is_some()
             || spec.toughness.is_some()
             || spec.dynamic_power.is_some()
             || spec.dynamic_toughness.is_some(),
     );
+    for supertype in parsed_supertypes {
+        if !spec.supertypes.contains(&supertype) {
+            spec.supertypes.push(supertype);
+        }
+    }
+    spec.types = types;
 
     if spec.power.is_none()
         && spec.toughness.is_none()
@@ -110,11 +153,37 @@ pub(crate) fn parse_animation_spec(text: &str, _ctx: &mut ParseContext) -> Optio
         && spec.colors.is_none()
         && spec.keywords.is_empty()
         && spec.types.is_empty()
+        && spec.supertypes.is_empty()
         && !spec.remove_all_abilities
     {
         None
     } else {
         Some(spec)
+    }
+}
+
+/// CR 205.4a: Peel leading supertype words before P/T/color/type parsing so
+/// "becomes a legendary 4/4 …" (Sarkhan, the Dragonspeaker) does not stall at
+/// `legendary` and fall through to keyword-only partial parses.
+fn strip_animation_supertypes(mut text: &str) -> (Vec<Supertype>, &str) {
+    let mut supertypes = Vec::new();
+    loop {
+        let trimmed = text.trim_start();
+        let trimmed_lower = trimmed.to_lowercase();
+        let Some((supertype, stripped)) = nom_on_lower(trimmed, &trimmed_lower, |i| {
+            alt((
+                value(Supertype::Legendary, tag("legendary ")),
+                value(Supertype::Snow, tag("snow ")),
+                value(Supertype::Basic, tag("basic ")),
+            ))
+            .parse(i)
+        }) else {
+            return (supertypes, trimmed);
+        };
+        if !supertypes.contains(&supertype) {
+            supertypes.push(supertype);
+        }
+        text = stripped;
     }
 }
 
@@ -150,6 +219,11 @@ pub(crate) fn animation_modifications(
     if spec.remove_all_abilities {
         modifications.push(ContinuousModification::RemoveAllAbilities);
     }
+    for supertype in &spec.supertypes {
+        modifications.push(ContinuousModification::AddSupertype {
+            supertype: *supertype,
+        });
+    }
     for keyword in &spec.keywords {
         modifications.push(ContinuousModification::AddKeyword {
             keyword: keyword.clone(),
@@ -166,6 +240,51 @@ pub(crate) fn animation_modifications(
     }
 
     modifications
+}
+
+/// CR 205.1a + CR 613.1d (Layer 4): Build the layer-4 modifications for a
+/// "[subject] becomes a [type]" animation, applying SUBTYPE **replacement** (not
+/// addition) unless the effect is "in addition to its other types".
+///
+/// `animation_modifications` is the purely-additive base (the CR 205.1b
+/// "in addition" reading). When `is_additive` is false, CR 205.1a applies: a
+/// granted subtype replaces the existing subtypes from the same set — so a
+/// creature that "becomes a Frog" ends up with subtypes exactly `[Frog]` rather
+/// than retaining its prior creature types (Human, Soldier, …). This injects a
+/// `RemoveAllSubtypes` for each affected subtype set before its first
+/// `AddSubtype`.
+///
+/// Card TYPES stay additive (`AddType`): an animated permanent keeps its other
+/// card types (e.g. an animated land remains a land, a creature stays a
+/// creature) — only the subtype dimension is replaced. This matches the
+/// behavior the combined pump+become path already produces.
+pub(crate) fn animation_modifications_with_replacement(
+    spec: &AnimationSpec,
+    is_additive: bool,
+) -> Vec<crate::types::ability::ContinuousModification> {
+    use crate::types::ability::ContinuousModification;
+    use crate::types::card_type::{noncreature_subtype_set, SubtypeSet};
+
+    let base = animation_modifications(spec);
+    if is_additive {
+        return base;
+    }
+
+    let mut out = Vec::with_capacity(base.len() + 1);
+    let mut removed_sets: Vec<SubtypeSet> = Vec::new();
+    for modification in base {
+        // CR 205.1a: a granted subtype replaces existing subtypes from its set —
+        // inject `RemoveAllSubtypes` once per affected set before the AddSubtype.
+        if let ContinuousModification::AddSubtype { subtype } = &modification {
+            let set = noncreature_subtype_set(subtype).unwrap_or(SubtypeSet::Creature);
+            if !removed_sets.contains(&set) {
+                out.push(ContinuousModification::RemoveAllSubtypes { set });
+                removed_sets.push(set);
+            }
+        }
+        out.push(modification);
+    }
+    out
 }
 
 /// Parse a color word prefix from animation text, handling "colorless" and
@@ -332,17 +451,16 @@ fn split_animation_dynamic_pt_clause(text: &str) -> Option<(&str, QuantityExpr)>
 
 /// Classification of a single token within a "becomes [type expression]" noun
 /// phrase. Encodes the full design space so callers can't conflate core types
-/// (emitted as `AddType`) with subtypes (emitted as `AddSubtype`) or leak
-/// supertypes (recognized-but-discarded: animations never change supertypes).
+/// (emitted as `AddType`) with subtypes (emitted as `AddSubtype`) or supertypes
+/// (emitted as `AddSupertype`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AnimationTypeToken {
     /// CR 205.2a core type — maps to `ContinuousModification::AddType`.
     CoreType(&'static str),
     /// CR 205.3 subtype — maps to `ContinuousModification::AddSubtype`.
     Subtype(String),
-    /// CR 205.4 supertype — recognized to avoid halting the sequence, but
-    /// not emitted as a modification (animations don't grant supertypes).
-    Supertype,
+    /// CR 205.4 supertype — maps to `ContinuousModification::AddSupertype`.
+    Supertype(Supertype),
 }
 
 /// Zero-width word-boundary check: next char must be non-alphabetic (whitespace,
@@ -369,20 +487,27 @@ fn parse_animation_core_type(input: &str) -> OracleResult<'_, AnimationTypeToken
         value("Planeswalker", tag_no_case("planeswalker")),
     ))
     .parse(input)?;
+    // CR 205.2a: accept an optional plural "s" so a plural-subject animation
+    // ("All lands are 1/1 creatures that are still lands") recognizes the same
+    // core type as the singular "becomes a creature" form. The trailing word
+    // boundary still rejects longer words ("landwalk", "creatured").
+    let (rest, _) = opt(tag_no_case::<_, _, OracleError<'_>>("s")).parse(rest)?;
     let (rest, _) = alpha_word_boundary(rest)?;
     Ok((rest, AnimationTypeToken::CoreType(core)))
 }
 
 /// Parse a CR 205.4 supertype keyword (case-insensitive, word-boundary terminated).
 fn parse_animation_supertype(input: &str) -> OracleResult<'_, AnimationTypeToken> {
-    let (rest, _) = alt((
-        tag_no_case("legendary"),
-        tag_no_case("basic"),
-        tag_no_case("snow"),
+    let (rest, supertype) = alt((
+        value(Supertype::Legendary, tag_no_case("legendary")),
+        value(Supertype::Basic, tag_no_case("basic")),
+        value(Supertype::Snow, tag_no_case("snow")),
+        value(Supertype::World, tag_no_case("world")),
+        value(Supertype::Ongoing, tag_no_case("ongoing")),
     ))
     .parse(input)?;
     let (rest, _) = alpha_word_boundary(rest)?;
-    Ok((rest, AnimationTypeToken::Supertype))
+    Ok((rest, AnimationTypeToken::Supertype(supertype)))
 }
 
 /// Parse a CR 205.3 subtype: a capitalized proper-noun word of length ≥ 2,
@@ -423,7 +548,7 @@ fn parse_animation_type_token(input: &str) -> OracleResult<'_, AnimationTypeToke
 }
 
 /// Parse a whitespace-separated sequence of type tokens, halting at the first
-/// non-type token. Used by [`parse_animation_types`] as the grammar root.
+/// non-type token. Used by [`parse_animation_type_parts`] as the grammar root.
 fn parse_animation_type_sequence(input: &str) -> OracleResult<'_, Vec<AnimationTypeToken>> {
     separated_list1(multispace1, parse_animation_type_token).parse(input)
 }
@@ -473,24 +598,18 @@ fn parse_animation_type_sequence_loose(input: &str) -> OracleResult<'_, Vec<Anim
 }
 
 /// Run the strict (CR 205.3 capitalized) type-sequence parser; fall back to the
-/// case-insensitive `_loose` variant when the input is terminated by the
-/// "in addition to its other [creature ]types" structural signal. The tail
+/// case-insensitive `_loose` variant when the input is terminated by an
+/// "in addition to {its/their/his/her} other [creature ]types" structural signal. The tail
 /// guarantees the preceding phrase is a type expression, so lowercase subtype
 /// words are safe to classify. Shared by [`parse_becomes_type_modifications`]
-/// and [`parse_animation_types`] so both the static-ability and effect-
+/// and [`parse_animation_type_parts`] so both the static-ability and effect-
 /// imperative paths decompose the descriptor identically.
 fn try_parse_type_sequence_with_suffix(input: &str) -> Option<Vec<AnimationTypeToken>> {
     // Strict path first — preserves existing behavior when the CR 205.3
     // capitalization is present (native effect text, static abilities). The
     // terminator-halt grammar (capitalized subtype required) naturally stops
     // the sequence at lowercase connective words like "in".
-    let suffix_parser = opt(preceded(
-        multispace0,
-        alt((
-            tag("in addition to its other creature types"),
-            tag("in addition to its other types"),
-        )),
-    ));
+    let suffix_parser = opt(preceded(multispace0, parse_in_addition_other_types_marker));
     if let Ok((_, (tokens, _))) = (parse_animation_type_sequence, suffix_parser).parse(input) {
         return Some(tokens);
     }
@@ -513,26 +632,77 @@ fn try_parse_type_sequence_with_suffix(input: &str) -> Option<Vec<AnimationTypeT
     None
 }
 
-/// Split `input` on the " in addition to its other [creature ]types" marker,
-/// returning the prefix and the matched marker variant. Returns `None` if the
-/// marker is absent. Uses `take_until` to locate the marker, then a nom `alt`
-/// to select between the two CR 205.3 variants (creature-types form is the
-/// longer alternative and listed first per nom short-circuit semantics).
+/// Split `input` on the " in addition to {its/their/his/her} other
+/// [creature ]types" marker, returning the prefix and the matched marker
+/// variant. Returns `None` if the marker is absent. Uses `take_until` to
+/// locate the marker, then [`parse_in_addition_other_types_marker`] to consume
+/// and recognize the variant.
 fn split_in_addition_tail(input: &str) -> Option<(&str, &str)> {
     type VE<'a> = OracleError<'a>;
-    // Longer alternative first (nom short-circuit).
     let (_, prefix) =
-        nom::bytes::complete::take_until::<_, _, VE<'_>>(" in addition to its other")(input)
-            .ok()?;
+        nom::bytes::complete::take_until::<_, _, VE<'_>>(" in addition to ")(input).ok()?;
     let pos = prefix.len();
     let rest = input[pos..].trim_start();
-    let (_, matched) = alt((
-        tag::<_, _, VE<'_>>("in addition to its other creature types"),
-        tag::<_, _, VE<'_>>("in addition to its other types"),
-    ))
-    .parse(rest)
-    .ok()?;
+    let (_, matched) = parse_in_addition_other_types_marker(rest).ok()?;
     Some((prefix, matched))
+}
+
+/// nom combinator: match the full "in addition to {its/their/his/her} other
+/// [creature ]types" marker. The two independent axes — possessive pronoun and
+/// type scope (all "types" vs only "creature types") — are composed as a single
+/// `alt` and a single `opt`, not enumerated as the 4×2 = 8 `tag` cross product.
+/// See `oracle_nom/PATTERNS.md` §8 ("compose, don't enumerate permutations").
+/// `recognize` returns the consumed slice, preserving the matched-marker
+/// semantics callers rely on. `opt(tag("creature "))` makes the scope axis
+/// order-independent — no "longest alternative first" ordering footgun.
+fn parse_in_addition_other_types_marker(input: &str) -> OracleResult<'_, &str> {
+    recognize((
+        tag("in addition to "),
+        alt((tag("its"), tag("their"), tag("his"), tag("her"))),
+        tag(" other "),
+        // CR 105.3 + CR 205.1b: the "in addition" clause can enumerate colors
+        // and/or types — "in addition to its other colors and types" (Possessed
+        // Goat), "in addition to its other types". `opt(tag("colors and "))`
+        // makes the color scope an independent axis (compose, don't enumerate);
+        // `opt(tag("creature "))` keeps the type-scope axis order-independent.
+        opt(tag("colors and ")),
+        opt(tag("creature ")),
+        tag("types"),
+    ))
+    .parse(input)
+}
+
+/// nom combinator: locate the marker anywhere in `input`, skipping preceding
+/// text. Named rather than inlined into [`has_in_addition_to_other_types`] so
+/// lifetime elision binds the parser's borrow to the `input` parameter;
+/// inlining the combinator over a local `String` tripped E0597 on the
+/// temporary parser's drop.
+///
+/// `pub(crate)` so the replacement handler (`parse_as_enters_becomes`) and the
+/// classifier recognizer (`parse_as_enters_becomes_in_addition`) share the same
+/// CR 205.1b/105.3 marker class instead of reimplementing bespoke literal tags.
+pub(crate) fn locate_in_addition_other_types_marker(input: &str) -> OracleResult<'_, &str> {
+    preceded(
+        take_until("in addition to "),
+        parse_in_addition_other_types_marker,
+    )
+    .parse(input)
+}
+
+/// CR 105.3: detect the additive-color reading of a "becomes" descriptor —
+/// "in addition to its other colors [and types]". When present, the granted
+/// color is ADDED to the object's existing colors (CR 105.3 "in addition")
+/// rather than replacing them. Used by `build_become_clause` to convert the
+/// default `SetColor` (CR 105.3 replacement) into per-color `AddColor`.
+pub(crate) fn has_in_addition_to_other_colors(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    nom_primitives::scan_contains(&lower, "in addition to ")
+        && nom_primitives::scan_contains(&lower, "other colors")
+}
+
+pub(crate) fn has_in_addition_to_other_types(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    locate_in_addition_other_types_marker(&lower).is_ok()
 }
 
 /// CR 205.1a + CR 205.2 + CR 205.3 + CR 613.1c: Decompose a "becomes a
@@ -543,8 +713,8 @@ fn split_in_addition_tail(input: &str) -> Option<(&str, &str)> {
 /// outside the effect-animation path (e.g., static-ability parsing of
 /// "target creature ... becomes a Horror enchantment creature in addition to
 /// its other types") get the same type-line decomposition: one `AddType` per
-/// CR 205.2 core type, one `AddSubtype` per CR 205.3 subtype, supertypes
-/// discarded (CR 205.4 — animations never grant supertypes).
+/// CR 205.2 core type, one `AddSubtype` per CR 205.3 subtype, and one
+/// `AddSupertype` per CR 205.4 supertype.
 ///
 /// The descriptor is the noun phrase *after* the "becomes a"/"becomes an"
 /// article and *before* any trailing "in addition to its other types" clause.
@@ -601,7 +771,12 @@ pub(crate) fn parse_becomes_type_modifications(
                     modifications.push(modification);
                 }
             }
-            AnimationTypeToken::Supertype => {}
+            AnimationTypeToken::Supertype(supertype) => {
+                let modification = ContinuousModification::AddSupertype { supertype };
+                if !modifications.contains(&modification) {
+                    modifications.push(modification);
+                }
+            }
         }
     }
     modifications
@@ -615,31 +790,36 @@ pub(crate) fn parse_becomes_type_modifications(
 /// This prevents misparses like *"this creature becomes a Dragon, gets +5/+3,
 /// and gains flying"* from sweeping `Gets`, `And`, `Gains`, `Flying` in as
 /// AddSubtype modifications — a common coverage false-positive pattern.
-fn parse_animation_types(text: &str, infer_creature: bool) -> Vec<String> {
+fn parse_animation_type_parts(text: &str, infer_creature: bool) -> (Vec<Supertype>, Vec<String>) {
     let descriptor = text.trim().trim_end_matches(',').trim();
     if descriptor.is_empty() {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
 
     // See parse_becomes_type_modifications for the same forward-parse pattern.
     // oracle_nom/PATTERNS.md ("Optional trailing clause after a token sequence").
     let tokens = match try_parse_type_sequence_with_suffix(descriptor) {
         Some(tokens) => tokens,
-        None => return Vec::new(),
+        None => return (Vec::new(), Vec::new()),
     };
 
+    let mut supertypes = Vec::new();
     let mut core_types = Vec::new();
     let mut subtypes = Vec::new();
     for token in tokens {
         match token {
             AnimationTypeToken::CoreType(name) => push_unique_string(&mut core_types, name),
             AnimationTypeToken::Subtype(name) => subtypes.push(title_case_word(&name)),
-            AnimationTypeToken::Supertype => {}
+            AnimationTypeToken::Supertype(supertype) => {
+                if !supertypes.contains(&supertype) {
+                    supertypes.push(supertype);
+                }
+            }
         }
     }
 
     if core_types.is_empty() && subtypes.is_empty() {
-        return Vec::new();
+        return (supertypes, Vec::new());
     }
     if core_types.is_empty() && infer_creature {
         push_unique_string(&mut core_types, "Creature");
@@ -649,7 +829,7 @@ fn parse_animation_types(text: &str, infer_creature: bool) -> Vec<String> {
     for subtype in subtypes {
         push_unique_string(&mut types, subtype);
     }
-    types
+    (supertypes, types)
 }
 
 fn split_animation_keyword_clause(text: &str) -> (&str, Vec<Keyword>) {
@@ -672,6 +852,15 @@ fn split_animation_keyword_clause(text: &str) -> (&str, Vec<Keyword>) {
         .trim()
         .trim_end_matches('.')
         .trim_end_matches(" in addition to its other types");
+    // CR 205.1b + CR 305.7 + CR 613.1d (#2917, #1155): a trailing "that's still
+    // a <type>" rider confirms the permanent keeps a prior card type — it is NOT
+    // a keyword. The land family (Nissa, Who Shakes the World — "that's still a
+    // land") and the planeswalker family (Gideon Blackblade — "that's still a
+    // planeswalker") both carry such a rider. Without stripping it the last
+    // keyword fuses with the rider ("haste that's still a land" /
+    // "indestructible that's still a planeswalker") and is dropped by
+    // `map_token_keyword`.
+    let keyword_text = strip_still_a_type_rider(keyword_text);
     let keywords = split_token_keyword_list(keyword_text)
         .into_iter()
         .filter_map(map_token_keyword)
@@ -679,9 +868,49 @@ fn split_animation_keyword_clause(text: &str) -> (&str, Vec<Keyword>) {
     (prefix, keywords)
 }
 
+/// Cut a trailing "that's/that is/it's/they're still a[n] <type>" rider off a
+/// keyword phrase so it cannot fuse with (and discard) the final keyword. The
+/// rider marker (" that's still" et al.) is the same regardless of the trailing
+/// type word, so truncating at the marker covers every "still a <type>" family
+/// ("still a land" — Nissa; "still a planeswalker" — Gideon Blackblade #1155;
+/// "still a creature"; "still an artifact") without enumerating type words.
+fn strip_still_a_type_rider(text: &str) -> &str {
+    let lower = text.to_lowercase();
+    [
+        " that's still",
+        " that is still",
+        " it's still",
+        " they're still",
+    ]
+    .iter()
+    .filter_map(|marker| lower.find(marker))
+    .min()
+    .map_or(text, |idx| text[..idx].trim_end())
+}
+
 #[cfg(test)]
 mod test_den_bugbear {
     use super::*;
+
+    /// #2917 (CR 305.7 / 613.1d): a trailing "that's still a land" rider must
+    /// not truncate the keyword list. Nissa, Who Shakes the World grants the
+    /// animated land BOTH vigilance and haste — previously haste fused with the
+    /// rider ("haste that's still a land") and was dropped.
+    #[test]
+    fn animation_keywords_survive_still_a_land_rider() {
+        use crate::types::keywords::Keyword;
+        let (_, keywords) = split_animation_keyword_clause(
+            "a 0/0 Elemental creature with vigilance and haste that's still a land",
+        );
+        assert!(
+            keywords.contains(&Keyword::Vigilance),
+            "expected Vigilance, got {keywords:?}"
+        );
+        assert!(
+            keywords.contains(&Keyword::Haste),
+            "expected Haste (must not be dropped by the rider), got {keywords:?}"
+        );
+    }
 
     #[test]
     fn test_animation_with_quoted_trigger() {
@@ -694,46 +923,47 @@ mod test_den_bugbear {
         assert_eq!(spec.toughness, Some(2));
     }
 
-    /// Regression: parse_animation_types must halt at connectives and
+    /// Regression: parse_animation_type_parts must halt at connectives and
     /// punctuation rather than sweeping subsequent words in as subtypes.
     /// Previously a text like "Dragon, gets +5/+3, and gains flying and trample"
     /// produced subtypes ["Dragon", "Gets", "+5/+3", "And", "Gains", "Flying", "Trample"].
     #[test]
     fn animation_types_halts_at_connectives_and_punctuation() {
         assert_eq!(
-            parse_animation_types("Dragon", true),
+            parse_animation_type_parts("Dragon", true).1,
             vec!["Creature", "Dragon"]
         );
         assert_eq!(
-            parse_animation_types("artifact creature Golem", false),
+            parse_animation_type_parts("artifact creature Golem", false).1,
             vec!["Artifact", "Creature", "Golem"]
         );
 
         // Trailing comma on a valid subtype: accept the subtype, stop after.
         assert_eq!(
-            parse_animation_types("Dragon, gets +5/+3, and gains flying", true),
+            parse_animation_type_parts("Dragon, gets +5/+3, and gains flying", true).1,
             vec!["Creature", "Dragon"]
         );
 
         // Lowercase word immediately after subtype must terminate parsing.
         assert_eq!(
-            parse_animation_types("Golem until end of combat", false),
+            parse_animation_type_parts("Golem until end of combat", false).1,
             vec!["Golem"]
         );
 
         // P/T tokens and quoted triggers must not become subtypes.
         assert_eq!(
-            parse_animation_types("Cat X/X", true),
+            parse_animation_type_parts("Cat X/X", true).1,
             vec!["Creature", "Cat"]
         );
         assert_eq!(
-            parse_animation_types("Shade and gains \"{B}: This creature gets +1/+1\"", true),
+            parse_animation_type_parts("Shade and gains \"{B}: This creature gets +1/+1\"", true,)
+                .1,
             vec!["Creature", "Shade"],
         );
 
         // Leading lowercase connective before any subtype → nothing parseable.
         assert_eq!(
-            parse_animation_types("in addition to its other types and gains flying", false),
+            parse_animation_type_parts("in addition to its other types and gains flying", false).1,
             Vec::<String>::new()
         );
     }
@@ -771,6 +1001,91 @@ mod test_den_bugbear {
         assert!(mods.contains(
             &crate::types::ability::ContinuousModification::SetToughnessDynamic { value: expected }
         ));
+    }
+
+    #[test]
+    fn become_subtype_replaces_when_not_additive() {
+        // CR 205.1a: "becomes a Frog" replaces creature subtypes — a Human
+        // Soldier becomes ONLY a Frog — so the granted subtype is preceded by a
+        // RemoveAllSubtypes{Creature} wipe (not appended additively).
+        use crate::types::ability::ContinuousModification as CM;
+        use crate::types::card_type::SubtypeSet;
+
+        let spec = parse_animation_spec("a green Frog", &mut ParseContext::default())
+            .expect("Frog animation should parse");
+        let mods = animation_modifications_with_replacement(&spec, false);
+
+        let wipe = mods.iter().position(|m| {
+            matches!(
+                m,
+                CM::RemoveAllSubtypes {
+                    set: SubtypeSet::Creature
+                }
+            )
+        });
+        let add = mods
+            .iter()
+            .position(|m| matches!(m, CM::AddSubtype { subtype } if subtype == "Frog"));
+        assert!(
+            wipe.is_some(),
+            "non-additive become must wipe creature subtypes, got {mods:?}"
+        );
+        assert!(add.is_some(), "expected AddSubtype(Frog), got {mods:?}");
+        assert!(
+            wipe.unwrap() < add.unwrap(),
+            "the RemoveAllSubtypes wipe must precede the granted subtype, got {mods:?}"
+        );
+    }
+
+    #[test]
+    fn become_additive_keeps_existing_subtypes() {
+        // CR 205.1b: "in addition to its other types" stays additive — no wipe.
+        use crate::types::ability::ContinuousModification as CM;
+
+        let spec = parse_animation_spec("a green Frog", &mut ParseContext::default())
+            .expect("Frog animation should parse");
+        let mods = animation_modifications_with_replacement(&spec, true);
+
+        assert!(
+            !mods
+                .iter()
+                .any(|m| matches!(m, CM::RemoveAllSubtypes { .. })),
+            "additive become must not wipe subtypes, got {mods:?}"
+        );
+        assert!(
+            mods.iter()
+                .any(|m| matches!(m, CM::AddSubtype { subtype } if subtype == "Frog")),
+            "expected AddSubtype(Frog), got {mods:?}"
+        );
+    }
+
+    #[test]
+    fn become_artifact_creature_stays_additive() {
+        // CR 205.1b: "becomes an artifact creature" is additive (gains artifact,
+        // stays a creature) — keep AddType, never collapse to SetCardTypes.
+        use crate::types::ability::ContinuousModification as CM;
+        use crate::types::card_type::CoreType;
+
+        let spec = parse_animation_spec("an artifact creature", &mut ParseContext::default())
+            .expect("artifact creature animation should parse");
+        let mods = animation_modifications_with_replacement(&spec, false);
+
+        assert!(mods.iter().any(|m| matches!(
+            m,
+            CM::AddType {
+                core_type: CoreType::Artifact
+            }
+        )));
+        assert!(mods.iter().any(|m| matches!(
+            m,
+            CM::AddType {
+                core_type: CoreType::Creature
+            }
+        )));
+        assert!(
+            !mods.iter().any(|m| matches!(m, CM::SetCardTypes { .. })),
+            "artifact creature must stay additive, got {mods:?}"
+        );
     }
 
     #[test]
@@ -834,22 +1149,75 @@ mod test_den_bugbear {
         ));
     }
 
-    /// Regression: supertypes (CR 205.4) must be recognized-and-discarded
-    /// so they don't halt the sequence. Animations never grant supertypes,
-    /// but a leading `legendary` / `basic` / `snow` word in the noun phrase
-    /// must not prevent the subtype that follows from being captured.
+    /// Regression: supertypes (CR 205.4) must be captured without halting the
+    /// sequence. A leading or mid-phrase `legendary` / `basic` / `snow` word in
+    /// the noun phrase must not prevent the subtype that follows from being
+    /// captured.
     #[test]
-    fn animation_types_discards_supertypes_without_halting_sequence() {
+    fn animation_types_captures_supertypes_without_halting_sequence() {
+        let (supertypes, types) = parse_animation_type_parts("legendary Angel creature", false);
+        assert_eq!(supertypes, vec![Supertype::Legendary]);
+        assert_eq!(types, vec!["Creature", "Angel"]);
+
         assert_eq!(
-            parse_animation_types("legendary Angel creature", false),
+            parse_animation_type_parts("legendary Angel creature", false).1,
             vec!["Creature", "Angel"]
         );
-        assert_eq!(parse_animation_types("basic Forest", false), vec!["Forest"]);
+        let (supertypes, types) = parse_animation_type_parts("basic Forest", false);
+        assert_eq!(supertypes, vec![Supertype::Basic]);
+        assert_eq!(types, vec!["Forest"]);
+
         // Supertype between core type and subtype must not halt.
+        let (supertypes, types) = parse_animation_type_parts("snow Creature Elemental", false);
+        assert_eq!(supertypes, vec![Supertype::Snow]);
+        assert_eq!(types, vec!["Creature", "Elemental"]);
         assert_eq!(
-            parse_animation_types("snow Creature Elemental", false),
+            parse_animation_type_parts("snow Creature Elemental", false).1,
             vec!["Creature", "Elemental"]
         );
+    }
+
+    /// Issue #2362 (Sarkhan, the Dragonspeaker): "+1: … becomes a legendary
+    /// 4/4 red Dragon creature with flying, indestructible, and haste" must emit
+    /// full layer-4 mods, not keywords alone.
+    #[test]
+    fn sarkhan_become_legendary_dragon_animation_spec() {
+        use crate::types::ability::ContinuousModification;
+        use crate::types::card_type::{CoreType, Supertype};
+
+        let spec = parse_animation_spec(
+            "a legendary 4/4 red Dragon creature with flying, indestructible, and haste",
+            &mut ParseContext::default(),
+        )
+        .expect("Sarkhan +1 animation phrase must parse");
+        assert_eq!(spec.supertypes, vec![Supertype::Legendary]);
+        assert_eq!(spec.power, Some(4));
+        assert_eq!(spec.toughness, Some(4));
+        assert_eq!(spec.colors, Some(vec![ManaColor::Red]));
+        assert_eq!(
+            spec.types,
+            vec!["Creature".to_string(), "Dragon".to_string()]
+        );
+        assert_eq!(
+            spec.keywords,
+            vec![Keyword::Flying, Keyword::Indestructible, Keyword::Haste]
+        );
+
+        let mods = animation_modifications(&spec);
+        assert!(mods.contains(&ContinuousModification::AddSupertype {
+            supertype: Supertype::Legendary,
+        }));
+        assert!(mods.contains(&ContinuousModification::SetPower { value: 4 }));
+        assert!(mods.contains(&ContinuousModification::SetToughness { value: 4 }));
+        assert!(mods.contains(&ContinuousModification::SetColor {
+            colors: vec![ManaColor::Red],
+        }));
+        assert!(mods.contains(&ContinuousModification::AddType {
+            core_type: CoreType::Creature,
+        }));
+        assert!(mods.contains(&ContinuousModification::AddSubtype {
+            subtype: "Dragon".to_string(),
+        }));
     }
 
     /// Regression: the subtype grammar must reject tokens where a capital
@@ -872,7 +1240,7 @@ mod test_den_bugbear {
     #[test]
     fn becomes_type_modifications_decomposes_subtype_and_core_types() {
         use crate::types::ability::ContinuousModification;
-        use crate::types::card_type::CoreType;
+        use crate::types::card_type::{CoreType, Supertype};
 
         // Pure core type.
         assert_eq!(
@@ -945,10 +1313,13 @@ mod test_den_bugbear {
             ]
         );
 
-        // Supertype (CR 205.4) is recognized and discarded.
+        // Supertype (CR 205.4) is recognized and emitted with the type phrase.
         assert_eq!(
             parse_becomes_type_modifications("legendary Angel creature"),
             vec![
+                ContinuousModification::AddSupertype {
+                    supertype: Supertype::Legendary
+                },
                 ContinuousModification::AddSubtype {
                     subtype: "Angel".into()
                 },
@@ -994,9 +1365,9 @@ mod test_den_bugbear {
         // but lacking the structural signal we must reject lowercase input.
         assert!(parse_becomes_type_modifications("demon").is_empty());
 
-        // parse_animation_types exercises the same fallback.
+        // parse_animation_type_parts exercises the same fallback.
         assert_eq!(
-            parse_animation_types("demon in addition to its other types", false),
+            parse_animation_type_parts("demon in addition to its other types", false).1,
             vec!["Demon"]
         );
     }
@@ -1095,6 +1466,103 @@ mod test_den_bugbear {
         assert!(
             spec.types.contains(&"Creature".to_string()),
             "must infer Creature"
+        );
+    }
+
+    /// #833 Cactus Preserve: "an X/X green Plant creature with reach, where X is ..."
+    /// — the trailing comma before "where X is" must not leak into the keyword
+    /// extraction, or the keyword clause is silently dropped.
+    #[test]
+    fn animation_spec_x_x_with_keyword_and_where_clause() {
+        let spec = parse_animation_spec(
+            "an X/X green Plant creature with reach, where X is the greatest mana value among your commanders",
+            &mut ParseContext::default(),
+        )
+        .expect("Cactus Preserve animation phrase must parse");
+
+        assert!(
+            // allow-raw-authority: test asserts the parser-output AnimationSpec.keywords vec; no GameState/live object exists at parse time
+            spec.keywords.contains(&Keyword::Reach),
+            "must include Reach keyword, got: {:?}",
+            spec.keywords
+        );
+        assert!(
+            spec.types.contains(&"Creature".to_string()),
+            "must include Creature"
+        );
+        assert!(
+            spec.types.contains(&"Plant".to_string()),
+            "must include Plant"
+        );
+    }
+
+    /// CR 107.3c: "X/X where X is ~'s power" — X is bound to the source's power,
+    /// NOT the cost paid. This pattern must be detected before the X-cost activation
+    /// path to avoid the false match that would emit CostXPaid.
+    /// Covers Obuun, Mul Daya Ancestor and similar patterns.
+    #[test]
+    fn animation_spec_x_x_where_x_is_source_power() {
+        use crate::types::ability::{ContinuousModification, QuantityExpr, QuantityRef};
+
+        let spec = parse_animation_spec(
+            "an X/X Elemental creature, where X is ~'s power",
+            &mut ParseContext::default(),
+        )
+        .expect("X/X where X is ~'s power must parse");
+
+        // Dynamic P/T must be SourcePower (not CostXPaid).
+        let expected_qty = QuantityExpr::Ref {
+            qty: QuantityRef::Power {
+                scope: crate::types::ability::ObjectScope::Source,
+            },
+        };
+        assert_eq!(
+            spec.dynamic_power,
+            Some(expected_qty.clone()),
+            "dynamic_power must be SourcePower"
+        );
+        assert_eq!(
+            spec.dynamic_toughness,
+            Some(expected_qty),
+            "dynamic_toughness must be SourcePower"
+        );
+        // Fixed P/T must be None (X/X is dynamic, not fixed).
+        assert_eq!(spec.power, None);
+        assert_eq!(spec.toughness, None);
+
+        // Type list must include Creature and Elemental.
+        assert!(
+            spec.types.contains(&"Creature".to_string()),
+            "must include Creature, got: {:?}",
+            spec.types
+        );
+        assert!(
+            spec.types.contains(&"Elemental".to_string()),
+            "must include Elemental, got: {:?}",
+            spec.types
+        );
+
+        // animation_modifications must emit SetPowerDynamic, SetToughnessDynamic with SourcePower.
+        let mods = animation_modifications(&spec);
+        assert!(
+            mods.contains(&ContinuousModification::SetPowerDynamic {
+                value: QuantityExpr::Ref {
+                    qty: QuantityRef::Power {
+                        scope: crate::types::ability::ObjectScope::Source,
+                    }
+                }
+            }),
+            "must include SetPowerDynamic(SourcePower)"
+        );
+        assert!(
+            mods.contains(&ContinuousModification::SetToughnessDynamic {
+                value: QuantityExpr::Ref {
+                    qty: QuantityRef::Power {
+                        scope: crate::types::ability::ObjectScope::Source,
+                    }
+                }
+            }),
+            "must include SetToughnessDynamic(SourcePower)"
         );
     }
 }

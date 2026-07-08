@@ -7,11 +7,13 @@ use super::blight_value::BlightValuePolicy;
 use super::board_development::BoardDevelopmentPolicy;
 use super::board_wipe_telegraph::BoardWipeTelegraphPolicy;
 use super::card_advantage::CardAdvantagePolicy;
-use super::context::PolicyContext;
+use super::chalice_avoidance::ChaliceAvoidancePolicy;
+use super::context::{PolicyContext, PriorsEnv};
 use super::copy_value::CopyValuePolicy;
 use super::effect_timing::EffectTimingPolicy;
 use super::etb_value::EtbValuePolicy;
 use super::evasion_removal_priority::EvasionRemovalPriorityPolicy;
+use super::fetch_land_patience::FetchLandPatiencePolicy;
 use super::free_outlet_activation::FreeOutletActivationPolicy;
 use super::hand_disruption::HandDisruptionPolicy;
 use super::hold_mana_up::HoldManaUpForInteractionPolicy;
@@ -19,23 +21,32 @@ use super::interaction_reservation::InteractionReservationPolicy;
 use super::landfall_timing::LandfallTimingPolicy;
 use super::lethality_awareness::LethalityAwarenessPolicy;
 use super::life_total_resource::LifeTotalResourcePolicy;
+use super::payment_selection::PaymentSelectionPolicy;
+use super::payoff::{
+    PayoffPolicy, ARTIFACT_SYNERGY, BLINK_PAYOFF, ENCHANTMENTS_PAYOFF, ENERGY_PAYOFF,
+    EQUIPMENT_PAYOFF, LIFEGAIN_PAYOFF, MILL_PAYOFF, REANIMATOR_PAYOFF,
+};
 use super::plus_one_counters::PlusOneCountersPolicy;
 use super::ramp_timing::RampTimingPolicy;
 use super::reactive_self_protection::ReactiveSelfProtectionPolicy;
 use super::recursion_awareness::RecursionAwarenessPolicy;
 use super::redundancy_avoidance::RedundancyAvoidancePolicy;
+use super::sacrifice_land_protection::SacrificeLandProtectionPolicy;
 use super::sacrifice_value::SacrificeValuePolicy;
+use super::self_cost_value::SelfCostValuePolicy;
+use super::separate_piles_timing::SeparatePilesTimingPolicy;
 use super::spellslinger_casting::SpellslingerCastingPolicy;
 use super::sweeper_timing::SweeperTimingPolicy;
 use super::tokens_wide::TokensWidePolicy;
 use super::tribal_lord_priority::TribalLordPriorityPolicy;
 use super::tutor::TutorPolicy;
+use super::x_cast_gate::XCastGatePolicy;
+use super::x_value::XValuePolicy;
 use crate::cast_facts::cast_facts_for_action;
-use crate::config::AiConfig;
 use crate::decision_kind::classify as classify_decision;
 use crate::features::DeckFeatures;
 use crate::planner::PolicyPrior;
-use engine::ai_support::{AiDecisionContext, CandidateAction};
+use engine::ai_support::CandidateAction;
 use engine::types::game_state::GameState;
 use engine::types::player::PlayerId;
 
@@ -44,8 +55,12 @@ use engine::types::player::PlayerId;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PolicyId {
     AntiSelfHarm,
+    ArtifactSynergyTactical,
     BoardDevelopment,
     EtbValue,
+    EnchantmentsPayoff,
+    EquipmentPayoff,
+    BlinkPayoff,
     CopyValue,
     Tutor,
     HandDisruption,
@@ -61,8 +76,10 @@ pub enum PolicyId {
     BlightValue,
     EvasionRemovalPriority,
     RecursionAwareness,
+    ReanimatorPayoff,
     BoardWipeTelegraph,
     LifeTotalResource,
+    LifegainPayoff,
     CardAdvantage,
     LandfallTiming,
     RampTiming,
@@ -75,6 +92,7 @@ pub enum PolicyId {
     HoldManaUpForInteraction,
     SweeperTiming,
     FreeOutletActivation,
+    FetchLandPatience,
     AristocratsKeepablesMulligan,
     AggroPressure,
     AggroKeepablesMulligan,
@@ -87,8 +105,26 @@ pub enum PolicyId {
     SpellslingerKeepablesMulligan,
     CombatTaxPayment,
     ReactiveSelfProtection,
+    SacrificeLandProtection,
+    SelfCostValue,
     ComboLineProgress,
     CedhKeepablesMulligan,
+    FixedDeckKeepMulligan,
+    PlaneswalkerLoyalty,
+    EquipmentPriority,
+    SpellskitePriority,
+    LandSequencing,
+    ConditionGatedActivation,
+    ControlChangeAwareness,
+    XValue,
+    LandAnimation,
+    MillTargeting,
+    MillPayoff,
+    EnergyPayoff,
+    ChaliceAvoidance,
+    PaymentSelection,
+    SeparatePilesTiming,
+    XCastGate,
 }
 
 /// Coarse routing kind for a candidate decision. Each policy declares which
@@ -140,6 +176,77 @@ pub enum PolicyVerdict {
     Score { delta: f64, reason: PolicyReason },
 }
 
+/// Score unit contract: `delta = 1.0` is one card of expected value.
+/// Policy helpers expose the declared band at each call site; Phase 3 lints
+/// direct `Score` literals so new policies route through this contract.
+pub const NUDGE_MAX: f64 = 0.3;
+pub const PREFERENCE_MAX: f64 = 1.5;
+pub const STRONG_MAX: f64 = 5.0;
+pub const CRITICAL_MAX: f64 = 15.0;
+
+impl PolicyVerdict {
+    pub fn score(delta: f64, reason: PolicyReason) -> Self {
+        let magnitude = delta.abs();
+        if magnitude == 0.0 {
+            Self::neutral(reason)
+        } else if magnitude <= NUDGE_MAX {
+            Self::nudge(delta, reason)
+        } else if magnitude <= PREFERENCE_MAX {
+            Self::preference(delta, reason)
+        } else if magnitude <= STRONG_MAX {
+            Self::strong(delta, reason)
+        } else {
+            Self::critical(delta.signum() * magnitude.min(CRITICAL_MAX), reason)
+        }
+    }
+
+    pub fn neutral(reason: PolicyReason) -> Self {
+        Self::Score { delta: 0.0, reason }
+    }
+
+    pub fn reject(reason: PolicyReason) -> Self {
+        Self::Reject { reason }
+    }
+
+    pub fn nudge(delta: f64, reason: PolicyReason) -> Self {
+        Self::score_in_band(delta, 0.0, NUDGE_MAX, reason)
+    }
+
+    pub fn preference(delta: f64, reason: PolicyReason) -> Self {
+        Self::score_in_band(delta, NUDGE_MAX, PREFERENCE_MAX, reason)
+    }
+
+    pub fn strong(delta: f64, reason: PolicyReason) -> Self {
+        Self::score_in_band(delta, PREFERENCE_MAX, STRONG_MAX, reason)
+    }
+
+    pub fn critical(delta: f64, reason: PolicyReason) -> Self {
+        Self::score_in_band(delta, STRONG_MAX, CRITICAL_MAX, reason)
+    }
+
+    fn score_in_band(
+        delta: f64,
+        min_exclusive: f64,
+        max_inclusive: f64,
+        reason: PolicyReason,
+    ) -> Self {
+        let magnitude = delta.abs();
+        debug_assert!(
+            magnitude > min_exclusive && magnitude <= max_inclusive,
+            "policy delta {delta} outside declared band ({min_exclusive}, {max_inclusive}]"
+        );
+        let clamped = if magnitude == 0.0 {
+            0.0
+        } else {
+            delta.signum() * magnitude.clamp(min_exclusive.min(f64::EPSILON), max_inclusive)
+        };
+        Self::Score {
+            delta: clamped,
+            reason,
+        }
+    }
+}
+
 /// The clean `TacticalPolicy` trait — four required methods, zero defaults.
 ///
 /// Scaling discipline (CR-equivalent invariant for the AI layer):
@@ -177,8 +284,11 @@ impl Default for PolicyRegistry {
     fn default() -> Self {
         let policies: Vec<Box<dyn TacticalPolicy>> = vec![
             Box::new(AntiSelfHarmPolicy),
+            Box::new(PayoffPolicy::new(&ARTIFACT_SYNERGY)),
             Box::new(BoardDevelopmentPolicy),
             Box::new(EtbValuePolicy),
+            Box::new(PayoffPolicy::new(&ENCHANTMENTS_PAYOFF)),
+            Box::new(PayoffPolicy::new(&EQUIPMENT_PAYOFF)),
             Box::new(CopyValuePolicy),
             Box::new(TutorPolicy),
             Box::new(HandDisruptionPolicy),
@@ -196,6 +306,7 @@ impl Default for PolicyRegistry {
             Box::new(RecursionAwarenessPolicy),
             Box::new(BoardWipeTelegraphPolicy),
             Box::new(LifeTotalResourcePolicy),
+            Box::new(PayoffPolicy::new(&LIFEGAIN_PAYOFF)),
             Box::new(CardAdvantagePolicy),
             Box::new(LandfallTimingPolicy),
             Box::new(RampTimingPolicy),
@@ -204,6 +315,7 @@ impl Default for PolicyRegistry {
             Box::new(HoldManaUpForInteractionPolicy),
             Box::new(SweeperTimingPolicy),
             Box::new(FreeOutletActivationPolicy),
+            Box::new(FetchLandPatiencePolicy),
             Box::new(AggroPressurePolicy),
             Box::new(TokensWidePolicy),
             Box::new(AnthemPriorityPolicy),
@@ -211,7 +323,26 @@ impl Default for PolicyRegistry {
             Box::new(SpellslingerCastingPolicy),
             Box::new(super::combat_tax::CombatTaxPaymentPolicy),
             Box::new(ReactiveSelfProtectionPolicy),
+            Box::new(SacrificeLandProtectionPolicy),
+            Box::new(SelfCostValuePolicy),
             Box::new(super::combo_line::ComboLinePolicy::new()),
+            Box::new(super::planeswalker_loyalty::PlaneswalkerLoyaltyPolicy),
+            Box::new(super::equipment_priority::EquipmentPriorityPolicy),
+            Box::new(super::spellskite_priority::SpellskitePriorityPolicy),
+            Box::new(super::land_sequencing::LandSequencingPolicy),
+            Box::new(super::condition_gated_activation::ConditionGatedActivationPolicy),
+            Box::new(XValuePolicy),
+            Box::new(XCastGatePolicy),
+            Box::new(super::control_change_awareness::ControlChangeAwarenessPolicy),
+            Box::new(super::land_animation::LandAnimationPolicy),
+            Box::new(super::mill_targeting::MillTargetingPolicy),
+            Box::new(PayoffPolicy::new(&MILL_PAYOFF)),
+            Box::new(PayoffPolicy::new(&ENERGY_PAYOFF)),
+            Box::new(ChaliceAvoidancePolicy),
+            Box::new(PaymentSelectionPolicy),
+            Box::new(SeparatePilesTimingPolicy),
+            Box::new(PayoffPolicy::new(&REANIMATOR_PAYOFF)),
+            Box::new(PayoffPolicy::new(&BLINK_PAYOFF)),
         ];
         let mut by_kind: HashMap<DecisionKind, Vec<usize>> = HashMap::new();
         for (idx, policy) in policies.iter().enumerate() {
@@ -263,6 +394,7 @@ impl PolicyRegistry {
         let mut out = Vec::with_capacity(indices.len());
         for &idx in indices {
             let policy = &self.policies[idx];
+            let policy_id = policy.id();
             let Some(activation) = policy.activation(session_features, ctx.state, ctx.ai_player)
             else {
                 continue;
@@ -270,12 +402,31 @@ impl PolicyRegistry {
             let verdict = policy.verdict(ctx);
             let scaled = match verdict {
                 PolicyVerdict::Reject { reason } => PolicyVerdict::Reject { reason },
-                PolicyVerdict::Score { delta, reason } => PolicyVerdict::Score {
-                    delta: delta * activation as f64,
-                    reason,
-                },
+                PolicyVerdict::Score { delta, reason } => {
+                    let scaled_delta = delta * activation as f64;
+                    debug_assert!(
+                        scaled_delta.abs() <= CRITICAL_MAX,
+                        "policy {:?} scaled delta {} exceeds critical band ceiling {}",
+                        policy_id,
+                        scaled_delta,
+                        CRITICAL_MAX
+                    );
+                    if scaled_delta.abs() > CRITICAL_MAX {
+                        tracing::warn!(
+                            target: "phase_ai::decision_trace",
+                            ?policy_id,
+                            scaled_delta,
+                            activation,
+                            "policy scaled delta exceeds critical band ceiling"
+                        );
+                    }
+                    PolicyVerdict::Score {
+                        delta: scaled_delta,
+                        reason,
+                    }
+                }
             };
-            out.push((policy.id(), scaled));
+            out.push((policy_id, scaled));
         }
         out
     }
@@ -302,15 +453,7 @@ impl PolicyRegistry {
         self.policies.iter().any(|p| p.id() == id)
     }
 
-    pub fn priors(
-        &self,
-        state: &GameState,
-        decision: &AiDecisionContext,
-        candidates: &[CandidateAction],
-        ai_player: PlayerId,
-        config: &AiConfig,
-        context: &crate::context::AiContext,
-    ) -> Vec<PolicyPrior> {
+    pub fn priors(&self, env: &PriorsEnv<'_>, candidates: &[CandidateAction]) -> Vec<PolicyPrior> {
         if candidates.is_empty() {
             return Vec::new();
         }
@@ -318,34 +461,61 @@ impl PolicyRegistry {
         let raw_scores: Vec<f64> = candidates
             .iter()
             .map(|candidate| {
-                let cast_facts = cast_facts_for_action(state, &candidate.action, ai_player);
+                let cast_facts = cast_facts_for_action(env.state, &candidate.action, env.ai_player);
                 self.score(&PolicyContext {
-                    state,
-                    decision,
+                    state: env.state,
+                    decision: env.decision,
                     candidate,
-                    ai_player,
-                    config,
-                    context,
+                    ai_player: env.ai_player,
+                    config: env.config,
+                    context: env.context,
                     cast_facts,
+                    search_depth: env.search_depth,
                 })
             })
             .collect();
         let min_score = raw_scores
             .iter()
             .copied()
-            .filter(|s| s.is_finite())
+            .filter(|score| score.is_finite())
             .fold(f64::INFINITY, f64::min);
+        if !min_score.is_finite() {
+            tracing::warn!(
+                target: "phase_ai::decision_trace",
+                candidate_count = candidates.len(),
+                "all policy candidates were rejected; using uniform forced-action priors"
+            );
+            let prior = 1.0 / candidates.len() as f64;
+            return candidates
+                .iter()
+                .cloned()
+                .map(|candidate| PolicyPrior { candidate, prior })
+                .collect();
+        }
         let shifted: Vec<f64> = raw_scores
             .iter()
             .map(|score| {
                 if score.is_finite() {
                     ((score - min_score) + 0.01).max(0.01)
                 } else {
-                    0.01
+                    0.0
                 }
             })
             .collect();
-        let total = shifted.iter().sum::<f64>().max(0.01);
+        let total = shifted.iter().sum::<f64>();
+        if total <= 0.0 {
+            tracing::warn!(
+                target: "phase_ai::decision_trace",
+                candidate_count = candidates.len(),
+                "policy priors summed to zero; using uniform forced-action priors"
+            );
+            let prior = 1.0 / candidates.len() as f64;
+            return candidates
+                .iter()
+                .cloned()
+                .map(|candidate| PolicyPrior { candidate, prior })
+                .collect();
+        }
 
         candidates
             .iter()
@@ -362,6 +532,12 @@ impl PolicyRegistry {
 #[cfg(test)]
 mod shared_invariant_tests {
     use super::*;
+    use crate::config::AiConfig;
+    use crate::policies::context::SearchDepth;
+    use engine::ai_support::{ActionMetadata, AiDecisionContext, CandidateAction, TacticalClass};
+    use engine::types::actions::GameAction;
+    use engine::types::game_state::{GameState, WaitingFor};
+    use engine::types::identifiers::{CardId, ObjectId};
 
     #[test]
     fn default_registry_contains_combo_line_progress() {
@@ -396,5 +572,118 @@ mod shared_invariant_tests {
             PolicyRegistry::default().policies.len(),
             "shared instance must contain the same policy set as a fresh default()"
         );
+    }
+
+    struct PriorTestPolicy;
+
+    impl TacticalPolicy for PriorTestPolicy {
+        fn id(&self) -> PolicyId {
+            PolicyId::AntiSelfHarm
+        }
+
+        fn decision_kinds(&self) -> &'static [DecisionKind] {
+            &[DecisionKind::ActivateAbility, DecisionKind::PlayLand]
+        }
+
+        fn activation(
+            &self,
+            _features: &DeckFeatures,
+            _state: &GameState,
+            _player: PlayerId,
+        ) -> Option<f32> {
+            Some(1.0)
+        }
+
+        fn verdict(&self, ctx: &PolicyContext<'_>) -> PolicyVerdict {
+            match ctx.candidate.action {
+                GameAction::PassPriority => PolicyVerdict::reject(PolicyReason::new("test_reject")),
+                _ => PolicyVerdict::nudge(0.1, PolicyReason::new("test_score")),
+            }
+        }
+    }
+
+    fn prior_test_registry() -> PolicyRegistry {
+        let policies: Vec<Box<dyn TacticalPolicy>> = vec![Box::new(PriorTestPolicy)];
+        let mut by_kind: HashMap<DecisionKind, Vec<usize>> = HashMap::new();
+        by_kind.insert(DecisionKind::ActivateAbility, vec![0]);
+        by_kind.insert(DecisionKind::PlayLand, vec![0]);
+        PolicyRegistry { policies, by_kind }
+    }
+
+    fn candidate(action: GameAction, tactical_class: TacticalClass) -> CandidateAction {
+        CandidateAction {
+            action,
+            metadata: ActionMetadata {
+                actor: Some(PlayerId(0)),
+                tactical_class,
+            },
+        }
+    }
+
+    fn priority_decision(candidates: Vec<CandidateAction>) -> AiDecisionContext {
+        AiDecisionContext {
+            waiting_for: WaitingFor::Priority {
+                player: PlayerId(0),
+            },
+            candidates,
+        }
+    }
+
+    #[test]
+    fn rejected_candidate_gets_zero_prior_when_any_candidate_is_allowed() {
+        let rejected = candidate(GameAction::PassPriority, TacticalClass::Pass);
+        let allowed = candidate(
+            GameAction::PlayLand {
+                object_id: ObjectId(1),
+                card_id: CardId(1),
+            },
+            TacticalClass::Land,
+        );
+        let candidates = vec![rejected.clone(), allowed.clone()];
+        let decision = priority_decision(candidates.clone());
+        let state = GameState::new_two_player(7);
+        let config = AiConfig::default();
+        let context = crate::context::AiContext::empty(&config.weights);
+
+        let env = PriorsEnv {
+            state: &state,
+            decision: &decision,
+            ai_player: PlayerId(0),
+            config: &config,
+            context: &context,
+            search_depth: SearchDepth::Lookahead,
+        };
+        let priors = prior_test_registry().priors(&env, &candidates);
+
+        assert_eq!(priors.len(), 2);
+        assert_eq!(priors[0].prior, 0.0);
+        assert!(priors[1].prior > 0.99);
+    }
+
+    #[test]
+    fn all_rejected_candidates_fall_back_to_uniform_priors() {
+        let candidates = vec![
+            candidate(GameAction::PassPriority, TacticalClass::Pass),
+            candidate(GameAction::PassPriority, TacticalClass::Pass),
+        ];
+        let decision = priority_decision(candidates.clone());
+        let state = GameState::new_two_player(7);
+        let config = AiConfig::default();
+        let context = crate::context::AiContext::empty(&config.weights);
+
+        let env = PriorsEnv {
+            state: &state,
+            decision: &decision,
+            ai_player: PlayerId(0),
+            config: &config,
+            context: &context,
+            search_depth: SearchDepth::Lookahead,
+        };
+        let priors = prior_test_registry().priors(&env, &candidates);
+
+        assert_eq!(priors.len(), 2);
+        assert!(priors
+            .iter()
+            .all(|prior| (prior.prior - 0.5).abs() < f64::EPSILON));
     }
 }

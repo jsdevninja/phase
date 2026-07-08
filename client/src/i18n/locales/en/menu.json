@@ -67,7 +67,31 @@
     "load": {
       "title": "Load Game State"
     },
-    "exit": "Exit"
+    "exit": "Exit",
+    "dashboard": {
+      "welcome": "Welcome back",
+      "enter": "Enter",
+      "continue": "Continue where you left off",
+      "resumeDraft": "Resume Draft",
+      "draftPod": "Draft Pod",
+      "activeDeck": "Active Deck",
+      "noActiveDeck": "Pick a deck to get started",
+      "fromFeeds": "From your feeds",
+      "feedsEmpty": "Subscribe to a feed to see fresh decks",
+      "cards": "{{count}} cards",
+      "mode": {
+        "ai": "vs AI",
+        "online": "Online",
+        "local": "Local",
+        "p2p-host": "P2P",
+        "p2p-join": "P2P"
+      },
+      "tagline": "An open-source Magic: The Gathering rules engine and game client",
+      "turn": "Turn {{n}}",
+      "yourTurn": "Your turn",
+      "opponentTurn": "Opponent's turn",
+      "yourLife": "You {{life}}"
+    }
   },
   "loadState": {
     "title": "Load Game State",
@@ -132,8 +156,11 @@
     "errorInvalidUrl": "Enter a valid Moxfield or Archidekt deck URL.",
     "errorNetworkFailure": "Couldn't reach the deck import service. Check your connection and try again.",
     "errorGeneric": "Failed to import deck.",
+    "errorNoCards": "Couldn't find any cards. Paste a deck in MTGA or .dck format.",
     "fileSupports": "Supports .dck, .dec, .txt, and MTGA format",
-    "chooseFile": "Choose File"
+    "chooseFile": "Choose File",
+    "importedSuccessTitle": "Deck imported",
+    "importedSuccessDescription": "\"{{name}}\" was added to your decks."
   },
   "precon": {
     "savePrompt": "Save preconstructed deck as:",
@@ -147,7 +174,9 @@
     "totalCount": "· {{count}} total",
     "searchPlaceholder": "Search by name, set code, or type…",
     "allTypes": "All ({{count}})",
+    "typeFilter": "Deck type",
     "loadingCatalog": "Loading deck catalog…",
+    "loadFailed": "Could not load the preconstructed deck catalog. Check your connection and try again.",
     "noMatch": "No decks match.",
     "selectDeck": "Select {{name}}",
     "cardCount_one": "{{count}} card",
@@ -171,7 +200,13 @@
     "unknown": "Unknown {{count}}",
     "unknownCardsTitle": "Unknown cards:\n{{cards}}",
     "unsupportedTitle": "Unsupported ({{unique}} unique, {{copies}} copies):\n{{cards}}",
-    "setIconAlt": "{{code}} set icon"
+    "setIconAlt": "{{code}} set icon",
+    "actionsMenu": "Deck options",
+    "star": "Star",
+    "unstar": "Unstar",
+    "moveToFolder": "Move to folder",
+    "unfiled": "Unfiled",
+    "newFolder": "New folder…"
   },
   "myDecks": {
     "headingManage": "My Decks",
@@ -184,6 +219,17 @@
     "manageFeeds": "Manage Feeds",
     "searchPlaceholder": "Search decks…",
     "formatLabel": "Format",
+    "sourceFilterLabel": "Deck source",
+    "sourceFilter": {
+      "all": "All sources",
+      "user": "My decks",
+      "feed": "Feeds",
+      "precon": "Precons"
+    },
+    "preconSetFilterLabel": "Precon set",
+    "preconSetFilterAll": "All sets",
+    "preconSetSearchPlaceholder": "Search sets…",
+    "preconSetNoMatches": "No matching sets",
     "browseAetherhub": "Browse {{format}} decks on Aetherhub",
     "showAllDecks": "Show all decks",
     "showLegalOnly": "Show legal only",
@@ -206,6 +252,7 @@
       "loadingDatabase": "Loading compatibility database…",
       "checkingDeck": "Checking {{deck}}…",
       "checkedDeck": "Checked {{deck}}",
+      "checkingRandom": "Checking random deck candidates…",
       "loadingCoverage": "Loading coverage for {{deck}}…",
       "checkingSelected": "Checking selected deck compatibility…",
       "evaluatingVisible": "Evaluating visible decks…",
@@ -220,13 +267,19 @@
     "sectionMyDecks": "My Decks",
     "sectionStarterDecks": "Starter Decks",
     "sectionLegalPrecons": "Legal Precons",
+    "randomDeckTile": "Random Deck",
+    "randomDeckTileBusy": "Choosing…",
     "importDeckTile": "Import Deck",
     "preconstructedTile": "Preconstructed",
     "browseAll": "Browse All",
     "loadMore": "Load More",
     "selectedDeck": "Selected deck",
     "chooseDeckToContinue": "Choose a deck to continue",
-    "filterAll": "All"
+    "filterAll": "All",
+    "sectionStarred": "Starred",
+    "sectionUnfiled": "Unfiled",
+    "collapseAll": "Collapse all",
+    "expandAll": "Expand all"
   },
   "subscriptions": {
     "emptyTitle": "No feed subscriptions",
@@ -242,5 +295,54 @@
   },
   "loadGameState": {
     "readFailed": "Failed to read file"
+  },
+  "nav": {
+    "label": "Primary navigation",
+    "home": "Home",
+    "play": "Play",
+    "online": "Online",
+    "draft": "Draft",
+    "decks": "Decks",
+    "alpha": "Alpha",
+    "profile": "Profile",
+    "settings": "Settings",
+    "whatsNew": "What's New"
+  },
+  "folder": {
+    "actionsMenu": "Folder options",
+    "rename": "Rename",
+    "delete": "Delete",
+    "newFolder": "New folder",
+    "newFolderPrompt": "Folder name:",
+    "createButton": "Create",
+    "renamePrompt": "Rename folder:",
+    "deleteConfirm": "Delete folder \"{{name}}\"? Its decks move to Unfiled.",
+    "emptyHint": "This folder is empty.",
+    "unfiledEmptyHint": "No unfiled decks."
+  },
+  "whatsNew": {
+    "title": "What's New",
+    "empty": "No updates yet — check back soon.",
+    "loading": "Loading updates…",
+    "failed": "Couldn't load updates. Check your connection and try again.",
+    "retry": "Try again",
+    "discordLink": "Read on Discord",
+    "unread": "New updates available",
+    "searchPlaceholder": "Search updates…",
+    "noResults": "No updates match your search.",
+    "pageStatus": "Page {{current}} of {{total}}",
+    "prevPage": "Previous",
+    "nextPage": "Next",
+    "showMore": "Show more",
+    "showLess": "Show less",
+    "tag": {
+      "new-cards": "New Cards",
+      "card-fixes": "Card Fixes",
+      "gameplay": "Gameplay",
+      "interface": "Interface",
+      "localization": "Localization",
+      "ai": "AI",
+      "multiplayer": "Multiplayer"
+    }
   }
 }

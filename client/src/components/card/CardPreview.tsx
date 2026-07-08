@@ -1,7 +1,10 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
-import type { GameObject, ManaCost } from "../../adapter/types.ts";
+import type { ChosenAttribute, GameObject, Keyword, ManaCost, Zone } from "../../adapter/types.ts";
+import { collectObjectActions } from "../../viewmodel/cardActionChoice.ts";
+import { abilityLabel, loyaltyBadge, stripLoyaltyCostPrefix } from "../../viewmodel/costLabel.ts";
+import { ManaFontIcon } from "../icons/ManaFontIcon.tsx";
 import { useCardImage } from "../../hooks/useCardImage.ts";
 import type { SourcePrinting } from "../../hooks/useCardImage.ts";
 import { useIsMobile } from "../../hooks/useIsMobile.ts";
@@ -11,10 +14,15 @@ import type { CardRuling } from "../../services/engineRuntime.ts";
 import { useGameStore } from "../../stores/gameStore.ts";
 import { useUiStore } from "../../stores/uiStore.ts";
 import { ManaCostPips } from "../mana/ManaCostPips.tsx";
+import { RichLabel } from "../mana/RichLabel.tsx";
+import { ReportCardButton, type CardReportContext } from "./ReportCardButton.tsx";
+import { GameplayTooltip } from "../ui/GameplayTooltip.tsx";
+import { CounterTooltip } from "../ui/CounterTooltip.tsx";
 import { computePTDisplay, formatCounterType, formatTypeLine, toRoman } from "../../viewmodel/cardProps.ts";
 import {
   getKeywordDisplayText,
   getKeywordName,
+  getKeywordReminderText,
   isGrantedKeyword,
   sortKeywords,
 } from "../../viewmodel/keywordProps.ts";
@@ -48,6 +56,11 @@ interface CardPreviewProps {
   position?: { x: number; y: number };
   scryfallId?: string;
   sourcePrinting?: SourcePrinting;
+  /** When true, the desktop preview docks to the screen edge (the default
+   *  top-right rail position) instead of following the cursor — keeps it from
+   *  covering the board. Drives the "side" card-preview preference. Ignored
+   *  when an explicit `position` is given or on mobile. */
+  dockSide?: boolean;
   /** Overrides the mobile-overlay dismiss handler. Contexts that drive the
    *  preview via their own state (e.g. the deck builder's hoveredCard) pass
    *  this so a tap-to-dismiss clears THAT state; defaults to the in-game
@@ -68,6 +81,7 @@ export function CardPreview({
   position,
   scryfallId,
   sourcePrinting,
+  dockSide,
   onDismiss,
   mobileLayout = "modal",
 }: CardPreviewProps) {
@@ -81,6 +95,7 @@ export function CardPreview({
       position={position}
       scryfallId={scryfallId}
       sourcePrinting={sourcePrinting}
+      dockSide={dockSide}
       onDismiss={onDismiss}
       mobileLayout={mobileLayout}
     />
@@ -94,6 +109,7 @@ function CardPreviewInner({
   position,
   scryfallId,
   sourcePrinting,
+  dockSide,
   onDismiss,
   mobileLayout,
 }: {
@@ -103,6 +119,7 @@ function CardPreviewInner({
   position?: { x: number; y: number };
   scryfallId?: string;
   sourcePrinting?: SourcePrinting;
+  dockSide?: boolean;
   onDismiss?: () => void;
   mobileLayout?: "modal" | "compact";
 }) {
@@ -113,6 +130,12 @@ function CardPreviewInner({
   const obj = useGameStore((s) =>
     inspectedObjectId != null ? s.gameState?.objects[inspectedObjectId] ?? null : null,
   );
+  // `card_report` context needs a live, participating game: `obj == null` (deck
+  // builder) has no zone and a possibly-stale `gameMode`, `gameId == null` means
+  // no game at all, and spectators don't report — building no context in these
+  // cases keeps both the event and the button's wrapper elements out entirely.
+  const gameId = useGameStore((s) => s.gameId);
+  const gameMode = useGameStore((s) => s.gameMode);
 
   // Auto-derive back face name from " // " separator when not explicitly provided
   // (e.g., deck builder passes "Delver of Secrets // Insectile Aberration" as cardName)
@@ -227,7 +250,9 @@ function CardPreviewInner({
   };
 
   useEffect(() => {
-    if (typeof window === "undefined" || position || isMobile) return undefined;
+    // `dockSide` keeps the preview pinned to `defaultDesktopStyle` (the
+    // top-right rail) by skipping the cursor-follow positioning entirely.
+    if (typeof window === "undefined" || position || isMobile || dockSide) return undefined;
 
     pointerRef.current = lastPointerPosition;
 
@@ -291,6 +316,7 @@ function CardPreviewInner({
     };
   }, [
     altHeld,
+    dockSide,
     gap,
     isMobile,
     margin,
@@ -300,6 +326,29 @@ function CardPreviewInner({
     viewportHeight,
     viewportWidth,
   ]);
+
+  // Identity + parse counts for the "report this card" button, carrying the
+  // DISPLAYED face (back face under Ctrl) so the report matches what the player
+  // sees. Undefined outside a live game (`obj == null` or `gameId == null`), so
+  // the button never renders in the deck builder. On mobile `showOtherFace` is
+  // always false, so this resolves to the front face there.
+  // No front-face fallback for the counts: if the back face's parse details
+  // haven't loaded, 0/0 ("no parse data") is honest — front-face counts under a
+  // back-face identity would corrupt the misparse-vs-known-gap triage columns.
+  const reportItems = showOtherFace ? backParseDetails : frontParseDetails;
+  const reportContext: CardReportContext | undefined =
+    obj != null && gameId !== null && gameMode !== "spectate"
+      ? {
+          oracleId:
+            (showOtherFace ? obj.back_face?.printed_ref?.oracle_id : obj.printed_ref?.oracle_id) ?? "",
+          faceName:
+            (showOtherFace ? obj.back_face?.printed_ref?.face_name : obj.printed_ref?.face_name) ?? "",
+          name: showOtherFace ? (obj.back_face?.printed_ref?.face_name ?? backFaceName ?? obj.name) : obj.name,
+          zone: obj.zone,
+          supported: (reportItems ?? []).filter((item) => item.supported).length,
+          total: (reportItems ?? []).length,
+        }
+      : undefined;
 
   // Mobile overlay mode: centered with backdrop
   if (isMobile) {
@@ -312,15 +361,32 @@ function CardPreviewInner({
         onDismiss={onDismiss ?? dismissPreview}
         sourcePrinting={sourcePrinting}
         layout={mobileLayout ?? "modal"}
+        report={reportContext}
       />
     );
   }
 
   const style: React.CSSProperties = position
-    ? {
-        left: Math.min(position.x + 16, window.innerWidth - 488),
-        top: Math.min(position.y - 200, window.innerHeight - 736),
-      }
+    ? (() => {
+        const estimatedWidth = Math.min(previewWidth, viewportWidth - margin * 2);
+        const estimatedHeight = Math.min(previewHeight, viewportHeight - margin * 2);
+        const unclampedLeft =
+          position.x > viewportWidth / 2
+            ? position.x - previewWidth - gap
+            : position.x + gap;
+        const unclampedTop = altHeld ? margin : position.y - estimatedHeight / 2;
+
+        return {
+          left: Math.min(
+            Math.max(margin, unclampedLeft),
+            Math.max(margin, viewportWidth - estimatedWidth - margin),
+          ),
+          top: Math.min(
+            Math.max(margin, unclampedTop),
+            Math.max(margin, viewportHeight - estimatedHeight - margin),
+          ),
+        };
+      })()
     : defaultDesktopStyle;
 
   return (
@@ -334,9 +400,11 @@ function CardPreviewInner({
         <ParsedAbilitiesPanel
           name={showOtherFace ? (engineBackFace?.name ?? backFaceName ?? "") : (obj?.name ?? engineFrontFace?.name ?? frontFaceName)}
           cardTypes={showOtherFace ? engineBackFace?.card_type : (obj?.card_types ?? engineFrontFace?.card_type)}
+          keywords={showOtherFace ? undefined : obj?.keywords}
           localizedTypeLine={showOtherFace ? engineBackFace?.localized_type_line : engineFrontFace?.localized_type_line}
           parseDetails={showOtherFace && backParseDetails ? backParseDetails : frontParseDetails}
           maxHeight={viewportHeight - margin * 2}
+          report={reportContext}
         />
       ) : (
         <CardImagePreview
@@ -371,6 +439,7 @@ function MobilePreviewOverlay({
   onDismiss,
   sourcePrinting,
   layout = "modal",
+  report,
 }: {
   cardName: string;
   backFaceName: string | null;
@@ -379,11 +448,17 @@ function MobilePreviewOverlay({
   onDismiss: () => void;
   sourcePrinting?: SourcePrinting;
   layout?: "modal" | "compact";
+  /** In-game report context; absent in the deck builder. Only the full modal
+   *  layout hosts the button — the compact peek dismisses on any tap. */
+  report?: CardReportContext;
 }) {
   const { t } = useTranslation("game");
   const { src, isRotated, isFlip } = useCardImage(cardName, {
     size: "normal",
     faceIndex,
+    isToken: obj?.display_source === "Token",
+    tokenFilters: obj?.display_source === "Token" ? tokenFiltersForObject(obj) : undefined,
+    tokenImageRef: obj?.display_source === "Token" ? obj.token_image_ref : undefined,
     oracleId: obj?.printed_ref?.oracle_id,
     faceName: obj?.printed_ref?.face_name,
     sourcePrinting,
@@ -473,6 +548,11 @@ function MobilePreviewOverlay({
               ⟳ {t("preview.flip")}
             </button>
           )}
+          {report && (
+            <div className="absolute right-3 top-3 rounded-full border border-white/20 bg-black/70 px-3 py-1.5 shadow-lg backdrop-blur">
+              <ReportCardButton key={report.oracleId || report.name} {...report} />
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -512,6 +592,13 @@ function CardImagePreview({
   debugObjectId?: number | null;
 }) {
   const { t } = useTranslation("game");
+  // Card art can 404 even when a URL resolves — future-dated sets whose images
+  // aren't on the CDN yet, or tokens whose preset (and image ref) is missing.
+  // Track the load failure so we render a named placeholder in the image slot
+  // instead of the browser's broken-image glyph, keeping the alt-view info
+  // panel usable. Reset whenever the src changes so navigating cards re-tries.
+  const [imgError, setImgError] = useState(false);
+  useEffect(() => setImgError(false), [src]);
   const frameClass = mobileMode
     ? isRotated
       ? "h-[min(40vw,300px)] w-[min(56vw,420px)] max-h-[75vh] max-w-[84vw]"
@@ -541,7 +628,37 @@ function CardImagePreview({
   // mana cost (e.g. The Prismatic Bridge's {W}{U}{B}{R}{G} instead of Esika's
   // {1}{G}{G}). See cardImageLookup / back_face wiring.
   const effectiveCost = useGameStore((s) => obj ? s.spellCosts[String(obj.id)] : undefined);
-  const displayCost = showOtherFace ? otherFaceCost : (effectiveCost ?? obj?.mana_cost);
+  const legalActionsByObject = useGameStore((s) => s.legalActionsByObject);
+  const activateLabels = useMemo<ActivateLabel[]>(() => {
+    if (!obj || obj.zone !== "Battlefield") return [];
+    const seen = new Set<string>();
+    const result: ActivateLabel[] = [];
+    for (const action of collectObjectActions(legalActionsByObject, obj.id)) {
+      if (action.type !== "ActivateAbility") continue;
+      const ability = obj.abilities[action.data.ability_index];
+      if (!ability) continue;
+      const rawLabel = abilityLabel(ability);
+      if (!rawLabel || seen.has(rawLabel)) continue;
+      seen.add(rawLabel);
+      // CR 606.1: a Loyalty ability cost renders as a mana-font badge; strip
+      // the "[+2]"-style prefix so the cost isn't shown twice.
+      const loyalty = loyaltyBadge(ability.cost);
+      result.push({
+        rawLabel,
+        label: loyalty ? stripLoyaltyCostPrefix(rawLabel) : rawLabel,
+        loyalty,
+      });
+    }
+    return result;
+  }, [legalActionsByObject, obj]);
+  const castManaZones: Zone[] = ["Hand", "Command", "Exile", "Graveyard", "Library"];
+  const showCastManaCost =
+    !showOtherFace && obj != null && castManaZones.includes(obj.zone);
+  const displayCost = showOtherFace
+    ? otherFaceCost
+    : showCastManaCost
+      ? (effectiveCost ?? obj?.mana_cost)
+      : null;
 
   if (isLoading || !src) {
     return (
@@ -554,12 +671,21 @@ function CardImagePreview({
   return (
     <div className={`${containerClass} border border-gray-600 overflow-hidden shadow-2xl ${showInfoPanel ? "rounded-t-[4%] rounded-b-lg bg-gray-900" : "rounded-[4%]"}`}>
       <div className={`${frameClass} relative rounded-[4%] overflow-hidden`}>
-        <img
-          src={src}
-          alt={cardName}
-          className={imageClass}
-          draggable={false}
-        />
+        {imgError ? (
+          <div
+            className={`${frameClass} flex items-center justify-center rounded-[4%] border border-gray-600 bg-gray-800 p-4 text-center`}
+          >
+            <span className="text-sm font-medium text-gray-300">{cardName}</span>
+          </div>
+        ) : (
+          <img
+            src={src}
+            alt={cardName}
+            className={imageClass}
+            draggable={false}
+            onError={() => setImgError(true)}
+          />
+        )}
         {displayCost && (
           <ManaCostPips cost={displayCost} size="lg" className="absolute right-[7.00%] top-[5.25%] z-10" />
         )}
@@ -578,7 +704,13 @@ function CardImagePreview({
           </div>
         )}
       </div>
-      {showInfoPanel && obj && <CardInfoPanel obj={obj} altAvailable={altAvailable} />}
+      {showInfoPanel && obj && (
+        <CardInfoPanel
+          obj={obj}
+          altAvailable={altAvailable}
+          activateLabels={activateLabels}
+        />
+      )}
       {backFaceHint && (
         <div className="bg-gray-900/80 text-center py-1 text-[10px] text-gray-400">{backFaceHint}</div>
       )}
@@ -616,7 +748,8 @@ function DetailPills({ details, badgeClass }: { details: [string, string][]; bad
     <div className="mt-1 flex flex-wrap gap-1">
       {details.map(([key, value]) => (
         <span key={key} className={`inline-block rounded-[4px] px-1.5 py-px text-[9px] leading-tight ${badgeClass}`}>
-          <span className="opacity-60">{key}:</span> {value}
+          <span className="opacity-60">{key}:</span>{" "}
+          <RichLabel text={value} size="xs" />
         </span>
       ))}
     </div>
@@ -641,11 +774,19 @@ function ParsedItemRow({ item, depth = 0 }: { item: ParsedItem; depth?: number }
               <span className={`text-[8px] font-bold uppercase tracking-wider ${statusColor} opacity-70`}>
                 {CATEGORY_ABBR[item.category]}
               </span>
-              <span className="text-[11px] leading-snug text-gray-200 font-medium">{item.label}</span>
+              <RichLabel
+                text={item.label}
+                size="xs"
+                className="text-[11px] leading-snug text-gray-200 font-medium"
+              />
               {!item.supported && <span className="text-[9px] text-rose-400">{t("preview.unsupported")}</span>}
             </div>
             {item.source_text && (
-              <div className="text-[10px] leading-snug text-gray-500 mt-0.5 italic">{item.source_text}</div>
+              <RichLabel
+                text={item.source_text}
+                size="xs"
+                className="mt-0.5 block text-[10px] italic leading-snug text-gray-500"
+              />
             )}
             <DetailPills details={item.details ?? []} badgeClass={catStyle.badge} />
           </div>
@@ -683,18 +824,24 @@ function SupportSummary({ items }: { items: ParsedItem[] }) {
 interface ParsedAbilitiesPanelProps {
   name: string;
   cardTypes?: { supertypes: string[]; core_types: string[]; subtypes: string[] } | null;
+  /** Live object keywords, used to collapse a Changeling's expanded subtype
+   *  list to "Changeling" in the type line (CR 702.73a). */
+  keywords?: Keyword[];
   /** Localized type line from the content sidecar; preferred over formatting
    *  `cardTypes` when present (non-English locale with a translated card). */
   localizedTypeLine?: string | null;
   parseDetails: ParsedItem[] | null;
   maxHeight?: number;
+  /** In-game report context for the displayed face; absent in the deck builder
+   *  (no live game), where the report button is not shown. */
+  report?: CardReportContext;
 }
 
-function ParsedAbilitiesPanel({ name, cardTypes, localizedTypeLine, parseDetails, maxHeight }: ParsedAbilitiesPanelProps) {
+function ParsedAbilitiesPanel({ name, cardTypes, keywords, localizedTypeLine, parseDetails, maxHeight, report }: ParsedAbilitiesPanelProps) {
   const { t } = useTranslation("game");
   const items = parseDetails ?? [];
   const rulings = useCardRulings(name);
-  const typeLine = localizedTypeLine ?? (cardTypes ? formatTypeLine(cardTypes) : null);
+  const typeLine = localizedTypeLine ?? (cardTypes ? formatTypeLine(cardTypes, keywords) : null);
 
   return (
     <div
@@ -711,6 +858,11 @@ function ParsedAbilitiesPanel({ name, cardTypes, localizedTypeLine, parseDetails
           <div className="text-[10px] text-gray-500 mt-0.5">{typeLine}</div>
         )}
         <SupportSummary items={items} />
+        {report && (
+          <div className="mt-1 flex justify-end">
+            <ReportCardButton key={report.oracleId || report.name} {...report} />
+          </div>
+        )}
       </div>
       <div className="px-2 py-2 space-y-0.5">
         {items.length === 0 && (
@@ -725,10 +877,28 @@ function ParsedAbilitiesPanel({ name, cardTypes, localizedTypeLine, parseDetails
   );
 }
 
-function CardInfoPanel({ obj, altAvailable }: { obj: GameObject; altAvailable: boolean }) {
+/** A battlefield-activatable ability's cost summary for the preview panel.
+ * `loyalty` is set only for planeswalker Loyalty costs (rendered as a badge). */
+type ActivateLabel = {
+  rawLabel: string;
+  label: string;
+  loyalty: { iconClasses: string; text: string } | null;
+};
+
+function CardInfoPanel({
+  obj,
+  altAvailable,
+  activateLabels,
+}: {
+  obj: GameObject;
+  altAvailable: boolean;
+  activateLabels: ActivateLabel[];
+}) {
   const { t } = useTranslation("game");
   const ptDisplay = computePTDisplay(obj);
-  const counters = Object.entries(obj.counters).filter(([type]) => type !== "loyalty");
+  const counters = Object.entries(obj.counters).flatMap(([type, count]) =>
+    type === "loyalty" || count == null ? [] : [[type, count] as const],
+  );
   const keywords = sortKeywords(obj.keywords);
   const colorsChanged =
     obj.color.length !== obj.base_color.length ||
@@ -747,6 +917,50 @@ function CardInfoPanel({ obj, altAvailable }: { obj: GameObject; altAvailable: b
   const deref = { objects, transientContinuousEffects };
   const keywordSources = buildGrantedKeywordSources(attribution, obj.id, deref);
   const ptSources = buildPTSources(attribution, obj.id, deref);
+  const chosenAttributes = obj.chosen_attributes ?? [];
+
+  const formatChosenAttribute = (attribute: ChosenAttribute): { label: string; value: string } => {
+    switch (attribute.type) {
+      case "Color":
+        return { label: t("preview.chosen.kind.color"), value: attribute.value };
+      case "CreatureType":
+        return { label: t("preview.chosen.kind.creatureType"), value: attribute.value };
+      case "BasicLandType":
+        return { label: t("preview.chosen.kind.basicLandType"), value: attribute.value };
+      case "CardType":
+        return { label: t("preview.chosen.kind.cardType"), value: attribute.value };
+      case "OddOrEven":
+        return { label: t("preview.chosen.kind.oddOrEven"), value: attribute.value };
+      case "CardName":
+        return { label: t("preview.chosen.kind.cardName"), value: attribute.value };
+      case "Number":
+        return { label: t("preview.chosen.kind.number"), value: String(attribute.value) };
+      case "Player":
+        return {
+          label: t("preview.chosen.kind.player"),
+          value: t("preview.chosen.playerValue", { id: attribute.value }),
+        };
+      case "TwoColors":
+        return {
+          label: t("preview.chosen.kind.twoColors"),
+          value: t("preview.chosen.twoColorsValue", {
+            first: attribute.value[0],
+            second: attribute.value[1],
+          }),
+        };
+      case "TributeOutcome":
+        return { label: t("preview.chosen.kind.tributeOutcome"), value: attribute.value };
+      case "Keyword":
+        return {
+          label: t("preview.chosen.kind.keyword"),
+          value: getKeywordDisplayText(attribute.value),
+        };
+      case "Label":
+        return { label: t("preview.chosen.kind.label"), value: attribute.value };
+      default:
+        return { label: t("preview.chosen.kind.fallback"), value: t("preview.chosen.unknown") };
+    }
+  };
 
   return (
     <div className="relative w-full border-t border-gray-600 bg-gray-900/95 px-3 py-2 text-xs text-gray-200">
@@ -765,25 +979,61 @@ function CardInfoPanel({ obj, altAvailable }: { obj: GameObject; altAvailable: b
       )}
       {/* Type line */}
       <div className="font-semibold text-gray-300">
-        {formatTypeLine(obj.card_types)}
+        <RichLabel text={formatTypeLine(obj.card_types, obj.keywords)} size="xs" />
       </div>
+
+      {activateLabels.length > 0 && (
+        <div className="mt-1 text-cyan-300/90">
+          {activateLabels.map((entry) =>
+            entry.loyalty ? (
+              <div key={entry.rawLabel} className="flex items-center gap-1">
+                <ManaFontIcon
+                  iconClass={entry.loyalty.iconClasses}
+                  fallbackText={entry.loyalty.text}
+                  label={entry.loyalty.text}
+                />
+                <RichLabel
+                  text={t("preview.activateCost", { cost: entry.label })}
+                  size="xs"
+                />
+              </div>
+            ) : (
+              <RichLabel
+                key={entry.rawLabel}
+                text={t("preview.activateCost", { cost: entry.label })}
+                size="xs"
+                className="block"
+              />
+            ),
+          )}
+        </div>
+      )}
 
       {/* Keywords */}
       {keywords.length > 0 && (
-        <div className="mt-1 flex flex-wrap gap-x-2 gap-y-0.5">
+        <div className="pointer-events-auto mt-1 flex flex-wrap gap-x-2 gap-y-0.5">
           {keywords.map((kw, i) => {
             const granted = isGrantedKeyword(kw, obj.base_keywords);
             const source = keywordSources.get(getKeywordName(kw));
+            const reminder = getKeywordReminderText(kw);
+            const tooltipId = reminder ? `card-preview-keyword-${obj.id}-${i}` : undefined;
             return (
               <span
                 key={i}
-                className={granted ? "text-indigo-300" : "text-white"}
+                tabIndex={reminder ? 0 : undefined}
+                aria-describedby={tooltipId}
+                className={`group relative cursor-default rounded-sm focus-visible:outline focus-visible:outline-1 focus-visible:outline-white/60 ${granted ? "text-indigo-300" : "text-white"}`}
               >
-                {getKeywordDisplayText(kw)}
+                <RichLabel text={getKeywordDisplayText(kw)} size="xs" />
                 {source && (
                   <span className="ml-1 text-[10px] text-indigo-400/80">
                     {t("preview.fromSource", { source })}
                   </span>
+                )}
+                {reminder && (
+                  <GameplayTooltip id={tooltipId} className="right-auto left-0 mb-1.5 w-52 px-2.5 py-1.5 text-[10px] font-normal text-slate-200 shadow-xl">
+                    <RichLabel text={reminder} size="xs" />
+                  </GameplayTooltip>
                 )}
               </span>
             );
@@ -795,9 +1045,11 @@ function CardInfoPanel({ obj, altAvailable }: { obj: GameObject; altAvailable: b
       {counters.length > 0 && (
         <div className="mt-1 flex flex-wrap gap-x-3 text-gray-400">
           {counters.map(([type, count]) => (
-            <span key={type}>
-              {formatCounterType(type)}: {count}
-            </span>
+            <CounterTooltip key={type} type={type} count={count}>
+              <span>
+                {formatCounterType(type)}: {count}
+              </span>
+            </CounterTooltip>
           ))}
         </div>
       )}
@@ -836,6 +1088,28 @@ function CardInfoPanel({ obj, altAvailable }: { obj: GameObject; altAvailable: b
           {t("preview.colors", { colors: obj.color.length > 0 ? obj.color.join(", ") : t("preview.colorless") })}
         </div>
       )}
+
+      {chosenAttributes.length > 0 && (
+        <div className="mt-1 text-gray-400">
+          <div className="font-semibold text-gray-300">{t("preview.chosen.title")}</div>
+          <div className="mt-0.5 space-y-0.5">
+            {chosenAttributes.map((attribute, index) => {
+              const formatted = formatChosenAttribute(attribute);
+              return (
+                <RichLabel
+                  key={`${attribute.type}-${index}`}
+                  text={t("preview.chosen.entry", {
+                    kind: formatted.label,
+                    value: formatted.value,
+                  })}
+                  size="xs"
+                  className="block"
+                />
+              );
+            })}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -861,7 +1135,7 @@ function RulingsSection({ rulings }: { rulings: CardRuling[] }) {
         {visible.map((ruling, i) => (
           <li key={`${ruling.date}-${i}`} className="leading-snug">
             <span className="mr-1 text-gray-500">[{ruling.date}]</span>
-            <span>{ruling.text}</span>
+            <RichLabel text={ruling.text} size="xs" />
           </li>
         ))}
       </ul>

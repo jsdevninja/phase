@@ -31,6 +31,10 @@ pub fn resolve(
         }
     };
 
+    // CR 805.8: With shared team turns, skipping a player skips that player's
+    // team turn once; store the team's seat-order representative as anchor.
+    let player = crate::game::topology::normalize_shared_turn_recipient(state, player);
+
     // CR 107.1: resolve `count` in the ability's context; clamp at zero.
     let n = resolve_quantity(state, count, ability.controller, ability.source_id).max(0) as u32;
     if n == 0 {
@@ -60,6 +64,7 @@ pub fn resolve(
 mod tests {
     use super::*;
     use crate::types::ability::{AbilityKind, QuantityExpr, SpellContext, TargetRef};
+    use crate::types::format::FormatConfig;
     use crate::types::identifiers::ObjectId;
     use crate::types::player::PlayerId;
 
@@ -77,7 +82,10 @@ mod tests {
             controller,
             original_controller: None,
             scoped_player: None,
+            target_chooser: None,
             source_id: ObjectId(1),
+            source_incarnation: None,
+            source_card_id: None,
             targets: vec![],
             kind: AbilityKind::Spell,
             sub_ability: None,
@@ -89,6 +97,7 @@ mod tests {
             optional: false,
             optional_for: None,
             multi_target: None,
+            target_constraints: Vec::new(),
             target_choice_timing: crate::types::ability::TargetChoiceTiming::Stack,
             description: None,
             player_scope: None,
@@ -96,6 +105,7 @@ mod tests {
             chosen_x: None,
             cost_paid_object: None,
             effect_context_object: None,
+            amassed_army_object: None,
             ability_index: None,
             may_trigger_origin: None,
             repeat_for: None,
@@ -108,7 +118,12 @@ mod tests {
             target_selection_mode: crate::types::ability::TargetSelectionMode::Chosen,
             chosen_players: Vec::new(),
             repeat_until: None,
+            replacement_applied: Default::default(),
             sub_link: crate::types::ability::SubAbilityLink::ContinuationStep,
+            modal: None,
+            mode_abilities: vec![],
+            dig_found_nothing_for_parent_target: false,
+            choose_from_zone_found_nothing_for_parent_target: false,
         }
     }
 
@@ -185,5 +200,30 @@ mod tests {
 
         // No side-effect on turns_to_skip (vector may stay empty).
         assert!(state.turns_to_skip.is_empty() || state.turns_to_skip[0] == 0);
+    }
+
+    #[test]
+    fn two_hg_skip_next_turn_uses_team_representative_once() {
+        let mut state = GameState::new(FormatConfig::two_headed_giant(), 4, 0);
+        let mut events = Vec::new();
+        let mut ability = make_ability(TargetFilter::Any, PlayerId(2));
+        ability.targets = vec![TargetRef::Player(PlayerId(1))];
+
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        assert_eq!(state.turns_to_skip[0], 1);
+        assert_eq!(state.turns_to_skip.get(1).copied().unwrap_or(0), 0);
+    }
+
+    #[test]
+    fn standard_skip_next_turn_targeted_player_is_not_normalized() {
+        let mut state = GameState::new(FormatConfig::standard(), 2, 0);
+        let mut events = Vec::new();
+        let mut ability = make_ability(TargetFilter::Any, PlayerId(0));
+        ability.targets = vec![TargetRef::Player(PlayerId(1))];
+
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        assert_eq!(state.turns_to_skip[1], 1);
     }
 }

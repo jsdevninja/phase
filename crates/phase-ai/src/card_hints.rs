@@ -10,6 +10,8 @@ use engine::types::player::PlayerId;
 use crate::cast_facts::{cast_facts_for_action, CastFacts};
 use crate::eval::{evaluate_creature, threat_level};
 use crate::policies::hand_disruption::disruption_window_score;
+#[cfg(test)]
+use engine::types::game_state::CastPaymentMode;
 
 /// Returns a priority score (0.0-1.0) indicating how urgently a card should be played now.
 ///
@@ -289,6 +291,8 @@ mod tests {
                 object_id: ObjectId(0),
                 card_id,
                 targets: Vec::new(),
+
+                payment_mode: CastPaymentMode::Auto,
             },
             PlayerId(0),
         );
@@ -313,6 +317,8 @@ mod tests {
                 object_id: ObjectId(0),
                 card_id,
                 targets: Vec::new(),
+
+                payment_mode: CastPaymentMode::Auto,
             },
             PlayerId(0),
         );
@@ -334,6 +340,7 @@ mod tests {
             vec![make_ability(Effect::Counter {
                 target: TargetFilter::Any,
                 source_rider: None,
+                countered_spell_zone: None,
             })],
         );
 
@@ -343,6 +350,8 @@ mod tests {
                 object_id: ObjectId(0),
                 card_id,
                 targets: Vec::new(),
+
+                payment_mode: CastPaymentMode::Auto,
             },
             PlayerId(0),
         );
@@ -387,6 +396,7 @@ mod tests {
             vec![make_ability(Effect::Counter {
                 target: TargetFilter::Any,
                 source_rider: None,
+                countered_spell_zone: None,
             })],
         );
 
@@ -396,6 +406,8 @@ mod tests {
                 object_id: ObjectId(0),
                 card_id,
                 targets: Vec::new(),
+
+                payment_mode: CastPaymentMode::Auto,
             },
             PlayerId(0),
         );
@@ -417,6 +429,7 @@ mod tests {
             vec![make_ability(Effect::Counter {
                 target: TargetFilter::Any,
                 source_rider: None,
+                countered_spell_zone: None,
             })],
         );
 
@@ -426,6 +439,8 @@ mod tests {
                 object_id: ObjectId(0),
                 card_id,
                 targets: Vec::new(),
+
+                payment_mode: CastPaymentMode::Auto,
             },
             PlayerId(0),
         );
@@ -447,6 +462,8 @@ mod tests {
                 object_id: ObjectId(0),
                 card_id,
                 targets: Vec::new(),
+
+                payment_mode: CastPaymentMode::Auto,
             },
             PlayerId(0),
         );
@@ -458,6 +475,8 @@ mod tests {
                 object_id: ObjectId(0),
                 card_id,
                 targets: Vec::new(),
+
+                payment_mode: CastPaymentMode::Auto,
             },
             PlayerId(0),
         );
@@ -490,6 +509,8 @@ mod tests {
                 object_id: ObjectId(0),
                 card_id,
                 targets: Vec::new(),
+
+                payment_mode: CastPaymentMode::Auto,
             },
             PlayerId(0),
         );
@@ -521,6 +542,8 @@ mod tests {
                 object_id: ObjectId(0),
                 card_id,
                 targets: Vec::new(),
+
+                payment_mode: CastPaymentMode::Auto,
             },
             PlayerId(0),
         );
@@ -552,6 +575,8 @@ mod tests {
                 object_id: ObjectId(0),
                 card_id,
                 targets: Vec::new(),
+
+                payment_mode: CastPaymentMode::Auto,
             },
             PlayerId(0),
         );
@@ -604,6 +629,8 @@ mod tests {
                 object_id: ObjectId(0),
                 card_id: vanilla,
                 targets: Vec::new(),
+
+                payment_mode: CastPaymentMode::Auto,
             },
             PlayerId(0),
         );
@@ -613,6 +640,8 @@ mod tests {
                 object_id: ObjectId(0),
                 card_id: etb,
                 targets: Vec::new(),
+
+                payment_mode: CastPaymentMode::Auto,
             },
             PlayerId(0),
         );
@@ -635,6 +664,7 @@ mod tests {
                 target_player: None,
                 selection_constraint: engine::types::ability::SearchSelectionConstraint::None,
                 split: None,
+                source_zones: vec![engine::types::zones::Zone::Library],
             })],
         );
 
@@ -644,6 +674,8 @@ mod tests {
                 object_id: ObjectId(0),
                 card_id,
                 targets: Vec::new(),
+
+                payment_mode: CastPaymentMode::Auto,
             },
             PlayerId(0),
         );

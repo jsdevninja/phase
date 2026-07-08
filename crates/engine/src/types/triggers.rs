@@ -56,7 +56,7 @@ pub enum TriggerEventKey {
     DamagePrevented,
     /// CR 121.1: One or more cards were drawn.
     CardsDrawn,
-    /// CR 119.3 + CR 118.4 (life gain/loss): A player's life total changed.
+    /// CR 119.3 (life gain/loss): A player's life total changed.
     LifeChanged,
     /// CR 106 (mana) + CR 605 (mana abilities): Mana was added to a player's
     /// mana pool, OR a permanent emitted a `TappedForMana` event. Coarse key —
@@ -112,6 +112,10 @@ pub enum TriggerEventKey {
     DieOrCoin,
     /// CR 725 (Monarch) + CR 726 (Initiative): Designation changed hands.
     MonarchOrInitiative,
+    /// CR 701.52a + CR 702.159a: An Attraction was visited after rolling to visit.
+    VisitAttraction,
+    /// Digital-only Specialize: a permanent specialized into a color-specific face.
+    Specializes,
     /// CR 104.3: A player lost the game.
     PlayerLost,
     /// CR 701.30: A clash occurred.
@@ -150,9 +154,26 @@ pub enum TriggerEventKey {
     ManifestDreadResolved,
     /// CR 701.44: An explore resolution.
     Explored,
+    /// CR 701.57a: A discover resolution.
+    DiscoverResolved,
+    /// CR 701.46a: An adapt resolution.
+    AdaptResolved,
+    /// CR 701.50f: A permanent connived (the connive process — draw, discard,
+    /// maybe +1/+1 — completed).
+    ConniveResolved,
+    /// CR 701.43d: A creature was exerted.
+    Exerted,
+    /// CR 702.154c: A creature enlisted another creature.
+    Enlisted,
+    /// CR 702.143a: A card was foretold.
+    Foretold,
     /// CR 701.14: A fight resolution (separate from generic deals-damage
     /// because the matcher dispatches on `EffectResolved { kind: Fight }`).
     Fight,
+    /// CR 702.26c: A permanent phased in.
+    PhaseIn,
+    /// CR 702.26b: A permanent phased out.
+    PhaseOut,
 }
 
 /// CR 508.3a: Filter for attack target type in "attacks [a target]" triggers.
@@ -162,6 +183,19 @@ pub enum AttackTargetFilter {
     Planeswalker,
     PlayerOrPlaneswalker,
     Battle,
+    /// CR 506.2 + CR 508.1a: "can't attack its owner" — the permanent may not
+    /// declare an attack against the player who owns it (distinct from controller).
+    Owner,
+    /// CR 506.2 + CR 508.1c: "can't attack its owner or planeswalkers its owner
+    /// controls" restricts attacks against the owning player and planeswalkers
+    /// that player controls.
+    OwnerOrPlaneswalker,
+    /// CR 508.1c + CR 508.5 + CR 109.4: "you or permanents you control" defends
+    /// you plus every attackable permanent you control — planeswalkers AND
+    /// battles (CR 310.5: battles can be attacked). Distinct from
+    /// `PlayerOrPlaneswalker`, which excludes battles. Control of the defended
+    /// planeswalker/battle is compared per CR 109.4.
+    PlayerOrPermanents,
 }
 
 /// All trigger modes from Forge's TriggerType enum (CR 603).
@@ -217,6 +251,10 @@ pub enum TriggerMode {
     AttackersDeclared,
     /// CR 508.3d: "Whenever you attack" — triggers for the attacking player.
     YouAttack,
+    /// CR 508.3d + CR 509.1h: "Whenever one or more [creatures] attack [you] and
+    /// aren't blocked" — fires after blockers are declared when at least one
+    /// matching attacker was not assigned blockers.
+    YouAttackUnblocked,
     AttackersDeclaredOneTarget,
     /// CR 509.1h: Triggers when an attacking creature becomes blocked.
     AttackerBlocked,
@@ -285,6 +323,8 @@ pub enum TriggerMode {
     /// CR 119.3: Triggers when a player loses life.
     LifeLost,
     LifeLostAll,
+    /// CR 119.3: Triggers when a player gains or loses life.
+    LifeChanged,
     PayLife,
     /// CR 702.24: Cumulative upkeep trigger.
     PayCumulativeUpkeep,
@@ -317,7 +357,7 @@ pub enum TriggerMode {
     // Monarch / initiative
     /// CR 725: Triggers when a player becomes the monarch.
     BecomeMonarch,
-    /// CR 725: Triggers when a player takes the initiative.
+    /// CR 726.2: Triggers when a player takes the initiative.
     TakesInitiative,
 
     // Game state
@@ -365,6 +405,12 @@ pub enum TriggerMode {
     /// (e.g., "an ability of an artifact source") live on `valid_card` — both
     /// reuse existing infrastructure shared with `KeywordAbilityActivated`.
     AbilityActivated,
+    /// CR 606.2 + CR 603.2: Triggers when a player activates a loyalty ability
+    /// (a planeswalker activated ability paid with loyalty counters). Listens to
+    /// `GameEvent::AbilityActivated` with `kind == ActivatedAbilityKind::Loyalty`.
+    /// The activated planeswalker is filtered via `valid_card` ("a Chandra
+    /// planeswalker", "enchanted planeswalker"); player scope via `valid_target`.
+    LoyaltyAbilityActivated,
     /// CR 702.100a: Evolve keyword trigger — when a creature enters with greater power/toughness.
     Evolve,
     /// CR 702.100b: Triggers when a creature evolves.
@@ -384,6 +430,9 @@ pub enum TriggerMode {
     // Land
     /// CR 305.1 + CR 505.6b: Triggers when a land is played.
     LandPlayed,
+    /// CR 601.1a + CR 701.18b: "Whenever you play a card" — playing a card means
+    /// playing it as a land OR casting it as a spell, so this fires on both events.
+    PlayCard,
 
     // Equipment / aura — CR 701.3 (Attach)
     /// CR 701.3: Triggers when an Aura, Equipment, or Fortification becomes attached.
@@ -394,6 +443,9 @@ pub enum TriggerMode {
     // Adapt / amass / learn / venture
     /// CR 701.46: Triggers when a creature adapts.
     Adapt,
+    /// CR 701.50f: Triggers when a permanent connives (after the connive process
+    /// completes).
+    Connives,
     /// CR 702.143: Triggers when a card is foretold.
     Foretell,
     /// CR 701.16: Triggers when a player investigates.
@@ -488,6 +540,10 @@ pub enum TriggerMode {
     EntersOrAttacks,
     /// "Whenever ~ attacks or blocks" — fires on both attack (CR 508.3a) and block (CR 509.1h) events.
     AttacksOrBlocks,
+    /// CR 702.55c: "~ enters or the creature it haunts dies" — parsed as one compound
+    /// trigger; the ETB half fires on the battlefield and synthesis clones the effect into
+    /// a `HauntedCreatureDies` trigger in exile for the haunted-dies half.
+    EntersOrHauntedCreatureDies,
 
     /// CR 603.8: State trigger — fires when a game-state condition becomes true, rather than
     /// in response to an event. Checked whenever a player would receive priority.
@@ -501,6 +557,14 @@ pub enum TriggerMode {
     Firebend,
     Waterbend,
     ElementalBend,
+
+    /// CR 702.55c: Haunt payoff — "When the creature this card haunts dies, …".
+    /// A dynamic, per-card trigger that fires while the card is in the exile zone
+    /// (`trigger_zones = [Exile]`): it matches a creature's death only when that
+    /// creature is the one the source card haunts, resolved through the
+    /// `ExileLinkKind::Haunt` link. Matched by
+    /// `game::haunt::match_haunted_creature_dies`.
+    HauntedCreatureDies,
 
     /// Fallback for unrecognized trigger mode strings.
     Unknown(String),
@@ -551,6 +615,7 @@ impl FromStr for TriggerMode {
             "ClassLevelGained" => TriggerMode::ClassLevelGained,
             "CommitCrime" => TriggerMode::CommitCrime,
             "ConjureAll" => TriggerMode::ConjureAll,
+            "Connives" => TriggerMode::Connives,
             "CollectEvidence" => TriggerMode::CollectEvidence,
             "CounterAdded" => TriggerMode::CounterAdded,
             "CounterAddedOnce" => TriggerMode::CounterAddedOnce,
@@ -585,6 +650,7 @@ impl FromStr for TriggerMode {
             "Enlisted" => TriggerMode::Enlisted,
             "AttacksOrBlocks" => TriggerMode::AttacksOrBlocks,
             "EntersOrAttacks" => TriggerMode::EntersOrAttacks,
+            "EntersOrHauntedCreatureDies" => TriggerMode::EntersOrHauntedCreatureDies,
             "Evolve" => TriggerMode::Evolve,
             "Evolved" => TriggerMode::Evolved,
             "ExcessDamage" => TriggerMode::ExcessDamage,
@@ -604,7 +670,10 @@ impl FromStr for TriggerMode {
             "Immediate" => TriggerMode::Immediate,
             "Investigated" => TriggerMode::Investigated,
             "LandPlayed" => TriggerMode::LandPlayed,
+            "PlayCard" => TriggerMode::PlayCard,
             "LeavesBattlefield" => TriggerMode::LeavesBattlefield,
+            "LoyaltyAbilityActivated" => TriggerMode::LoyaltyAbilityActivated,
+            "LifeChanged" => TriggerMode::LifeChanged,
             "LifeGained" => TriggerMode::LifeGained,
             "LifeLost" => TriggerMode::LifeLost,
             "LifeLostAll" => TriggerMode::LifeLostAll,
@@ -675,6 +744,7 @@ impl FromStr for TriggerMode {
             "VisitAttraction" => TriggerMode::VisitAttraction,
             "Vote" => TriggerMode::Vote,
             "YouAttack" => TriggerMode::YouAttack,
+            "YouAttackUnblocked" => TriggerMode::YouAttackUnblocked,
             "Waterbend" => TriggerMode::Waterbend,
             _ => TriggerMode::Unknown(s.to_string()),
         };
@@ -740,6 +810,23 @@ mod tests {
         assert_eq!(
             TriggerMode::from_str("NotARealTrigger").unwrap(),
             TriggerMode::Unknown("NotARealTrigger".to_string())
+        );
+    }
+
+    #[test]
+    fn loyalty_ability_activated_mode_string_round_trips() {
+        // CR 606.2: the new mode must survive Display -> from_str without
+        // degrading to `Unknown` (the from-string map has a `_ => Unknown`
+        // fallback, so a missing arm would silently no-fire the trigger).
+        let mode = TriggerMode::LoyaltyAbilityActivated;
+        assert_eq!(mode.to_string(), "LoyaltyAbilityActivated");
+        assert_eq!(
+            TriggerMode::from_str(&mode.to_string()).unwrap(),
+            TriggerMode::LoyaltyAbilityActivated
+        );
+        assert_eq!(
+            TriggerMode::from_str("LoyaltyAbilityActivated").unwrap(),
+            TriggerMode::LoyaltyAbilityActivated
         );
     }
 
@@ -817,6 +904,7 @@ mod tests {
             "ClassLevelGained",
             "CommitCrime",
             "ConjureAll",
+            "Connives",
             "CollectEvidence",
             "CounterAdded",
             "CounterAddedOnce",
@@ -849,6 +937,7 @@ mod tests {
             "ElementalBend",
             "Enlisted",
             "EntersOrAttacks",
+            "EntersOrHauntedCreatureDies",
             "Evolve",
             "Evolved",
             "ExcessDamage",
@@ -868,11 +957,14 @@ mod tests {
             "Immediate",
             "Investigated",
             "LandPlayed",
+            "PlayCard",
             "LeavesBattlefield",
+            "LifeChanged",
             "LifeGained",
             "LifeLost",
             "LifeLostAll",
             "LosesGame",
+            "LoyaltyAbilityActivated",
             "ManaAdded",
             "ManaExpend",
             "ManifestDread",
@@ -938,6 +1030,7 @@ mod tests {
             "Vote",
             "Waterbend",
             "YouAttack",
+            "YouAttackUnblocked",
         ];
 
         let mut known_count = 0;
@@ -948,8 +1041,8 @@ mod tests {
             }
         }
         assert!(
-            known_count >= 145,
-            "Expected 145+ known trigger modes, got {known_count}"
+            known_count >= 147,
+            "Expected 147+ known trigger modes, got {known_count}"
         );
     }
 }

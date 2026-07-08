@@ -30,6 +30,10 @@ expression: "&ir"
                   "core_type": "Creature"
                 },
                 {
+                  "type": "RemoveAllSubtypes",
+                  "set": "Creature"
+                },
+                {
                   "type": "AddSubtype",
                   "subtype": "Kithkin"
                 },
@@ -63,7 +67,6 @@ expression: "&ir"
         "duration": "Permanent",
         "description": "{R/W}: ~ becomes a Kithkin Spirit with base power and toughness 2/2.",
         "target_prompt": null,
-        "sorcery_speed": false,
         "condition": null,
         "optional_targeting": false,
         "optional": false,
@@ -93,6 +96,10 @@ expression: "&ir"
                 {
                   "type": "AddType",
                   "core_type": "Creature"
+                },
+                {
+                  "type": "RemoveAllSubtypes",
+                  "set": "Creature"
                 },
                 {
                   "type": "AddSubtype",
@@ -134,7 +141,6 @@ expression: "&ir"
         "duration": "Permanent",
         "description": "{R/W}{R/W}{R/W}: If ~ is a Spirit, it becomes a Kithkin Spirit Warrior with base power and toughness 4/4.",
         "target_prompt": null,
-        "sorcery_speed": false,
         "condition": {
           "type": "SourceMatchesFilter",
           "filter": {
@@ -172,6 +178,10 @@ expression: "&ir"
                 {
                   "type": "AddKeyword",
                   "keyword": "FirstStrike"
+                },
+                {
+                  "type": "RemoveAllSubtypes",
+                  "set": "Creature"
                 },
                 {
                   "type": "AddSubtype",
@@ -228,7 +238,6 @@ expression: "&ir"
         "duration": "Permanent",
         "description": "{R/W}{R/W}{R/W}{R/W}{R/W}{R/W}: If ~ is a Warrior, it becomes a Kithkin Spirit Warrior Avatar with base power and toughness 8/8, flying, and first strike.",
         "target_prompt": null,
-        "sorcery_speed": false,
         "condition": {
           "type": "SourceMatchesFilter",
           "filter": {

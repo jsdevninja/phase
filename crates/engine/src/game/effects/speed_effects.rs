@@ -5,7 +5,7 @@ use crate::types::events::GameEvent;
 use crate::types::game_state::GameState;
 use crate::types::player::PlayerId;
 
-fn players_for_filter(
+pub(crate) fn players_for_filter(
     state: &GameState,
     filter: &PlayerFilter,
     ability: &ResolvedAbility,
@@ -48,30 +48,79 @@ fn players_for_filter(
             .filter(|player| player.id != controller && player.life_gained_this_turn > 0)
             .map(|player| player.id)
             .collect(),
-        // CR 120.1 + CR 510.1: Each opponent who was dealt combat damage this
-        // turn (`damage_dealt_this_turn` ledger).
-        PlayerFilter::OpponentDealtCombatDamage => state
+        // CR 104.5 / CR 800.4: Players who lost have left the game; this
+        // filter is quantity-only and has no live speed-effect recipient.
+        PlayerFilter::HasLostTheGame => Vec::new(),
+        // CR 506.2 + CR 508.6: Count-only filter (Suppressor Skyguard); it has
+        // no live speed-effect recipient meaning.
+        PlayerFilter::OpponentOfTriggeringPlayerNotAttacked => Vec::new(),
+        // CR 120.1 + CR 510.1 + CR 120.9 + CR 608.2i + CR 120.2a/120.2b: Each
+        // opponent who was dealt damage of the given kind this turn, optionally
+        // restricted to a matching source.
+        PlayerFilter::OpponentDealtDamage { kind, source } => state
+            .players
+            .iter()
+            .filter(|player| !player.is_eliminated)
+            .filter(|player| {
+                crate::game::quantity::opponent_dealt_damage_matches(
+                    state, player.id, controller, *kind, source, source_id,
+                )
+            })
+            .map(|player| player.id)
+            .collect(),
+        // CR 508.6: each opponent the subject attacked within scope.
+        PlayerFilter::OpponentAttacked { subject, scope } => state
             .players
             .iter()
             .filter(|player| !player.is_eliminated)
             .filter(|player| {
                 player.id != controller
-                    && state.damage_dealt_this_turn.iter().any(|r| {
-                        r.is_combat
-                            && matches!(
-                                r.target,
-                                crate::types::ability::TargetRef::Player(pid) if pid == player.id
-                            )
-                    })
+                    && state.opponent_attacked(*subject, *scope, controller, source_id, player.id)
             })
             .map(|player| player.id)
             .collect(),
+        // CR 508.6 + CR 102.2 + CR 508.1b: each opponent of the controller who
+        // is attacking the enchanted/defending player this combat (the Commander
+        // 2017 "each opponent attacking that player does the same" curse rider).
+        // The "that player" anchor is the trigger source's AttachedTo host.
+        PlayerFilter::OpponentAttackingEnchantedPlayer => {
+            match crate::game::effects::enchanted_player_anchor(state, source_id) {
+                Some(enchanted) => state
+                    .players
+                    .iter()
+                    .filter(|player| !player.is_eliminated)
+                    .filter(|player| {
+                        player.id != controller
+                            && state.player_attacked_player_this_combat(player.id, enchanted)
+                    })
+                    .map(|player| player.id)
+                    .collect(),
+                None => Vec::new(),
+            }
+        }
         PlayerFilter::All => state
             .players
             .iter()
             .filter(|player| !player.is_eliminated)
             .map(|player| player.id)
             .collect(),
+        // CR 608.2c + CR 109.4 + CR 608.2h: every non-eliminated player except
+        // the anchor's set. The ability-aware path: the `exclude` anchor is
+        // resolved recursively through this same function so an
+        // ability-target-dependent anchor (ParentObjectTargetController) reads
+        // `ability.targets` / last-known info, which the generic
+        // `matches_player_scope` predicate cannot. This is the authoritative
+        // resolver for `AllExcept` effect-iteration (see the player_scope driver
+        // routing in `effects::mod.rs`).
+        PlayerFilter::AllExcept { exclude } => {
+            let excluded = players_for_filter(state, exclude, ability);
+            state
+                .players
+                .iter()
+                .filter(|player| !player.is_eliminated && !excluded.contains(&player.id))
+                .map(|player| player.id)
+                .collect()
+        }
         PlayerFilter::HighestSpeed => {
             let highest_speed = state
                 .players
@@ -109,7 +158,7 @@ fn players_for_filter(
             .iter()
             .filter(|player| !player.is_eliminated)
             .filter(|player| {
-                crate::game::players::matches_relation(player.id, controller, *relation)
+                crate::game::players::matches_relation(state, player.id, controller, *relation)
                     && crate::game::players::performed_action_this_way(state, player.id, *action)
             })
             .map(|player| player.id)
@@ -139,8 +188,31 @@ fn players_for_filter(
             state
                 .players
                 .iter()
-                .filter(|player| !player.is_eliminated && player.id != controller)
+                .filter(|player| {
+                    !player.is_eliminated
+                        && crate::game::players::is_opponent(state, controller, player.id)
+                })
                 .filter(|player| triggering.is_none_or(|pid| pid != player.id))
+                .map(|player| player.id)
+                .collect()
+        }
+        // CR 102.2 + CR 102.3 + CR 603.2: Each opponent of the triggering
+        // (casting) player, CR 102.3-aware via `players::is_opponent` (teammates
+        // in 2HG are not opponents). Fail closed (empty) when no trigger event
+        // anchors the caster.
+        PlayerFilter::OpponentOfTriggeringPlayer => {
+            let caster = state
+                .current_trigger_event
+                .as_ref()
+                .and_then(|e| crate::game::targeting::extract_player_from_event(e, state));
+            state
+                .players
+                .iter()
+                .filter(|player| {
+                    !player.is_eliminated
+                        && caster
+                            .is_some_and(|c| crate::game::players::is_opponent(state, c, player.id))
+                })
                 .map(|player| player.id)
                 .collect()
         }
@@ -173,25 +245,88 @@ fn players_for_filter(
                 .into_iter()
                 .collect()
         }
-        // CR 109.4 + CR 700.1: "each [player class] who [doesn't] control
-        // [filter]" — candidates satisfying both `relation` and the
-        // controls/controls-none predicate.
-        PlayerFilter::ControlsPermanent {
-            relation,
-            presence,
-            filter,
-        } => state
-            .players
-            .iter()
-            .filter(|player| !player.is_eliminated)
-            .filter(|player| {
-                crate::game::players::matches_relation(player.id, controller, *relation)
-                    && crate::game::effects::player_controls_matching_permanent(
-                        state, player.id, presence, filter, source_id,
-                    )
+        // CR 108.3 + CR 109.4: the owner of the first object target — owner-axis
+        // sibling of `ParentObjectTargetController`.
+        PlayerFilter::ParentObjectTargetOwner => {
+            crate::game::ability_utils::parent_target_owner(ability, state)
+                .filter(|pid| {
+                    state
+                        .players
+                        .iter()
+                        .any(|player| player.id == *pid && !player.is_eliminated)
+                })
+                .into_iter()
+                .collect()
+        }
+        // CR 608.2c + CR 109.4: the resolution-scoped chosen player at `index`.
+        PlayerFilter::ChosenPlayer { index } => ability
+            .chosen_players
+            .get(*index as usize)
+            .copied()
+            .filter(|pid| {
+                state
+                    .players
+                    .iter()
+                    .any(|player| player.id == *pid && !player.is_eliminated)
             })
-            .map(|player| player.id)
+            .into_iter()
             .collect(),
+        // CR 109.4 + CR 109.5: "each [player class] who controls [comparator]
+        // [count] [filter]" — candidates satisfying both `relation` and the
+        // controlled-permanent count comparison.
+        PlayerFilter::ControlsCount {
+            relation,
+            filter,
+            comparator,
+            count,
+        } => {
+            let threshold =
+                crate::game::quantity::resolve_quantity(state, count, controller, source_id);
+            state
+                .players
+                .iter()
+                .filter(|player| !player.is_eliminated)
+                .filter(|player| {
+                    crate::game::players::matches_relation(state, player.id, controller, *relation)
+                        && crate::game::effects::player_control_count_compares(
+                            state,
+                            player.id,
+                            filter,
+                            *comparator,
+                            threshold,
+                            source_id,
+                        )
+                })
+                .map(|player| player.id)
+                .collect()
+        }
+        // CR 402.1 / 119.1 / 122.1f / 404.1: "each [player class] whose [scalar
+        // attr] [comparator] [value]" — candidates satisfying both `relation`
+        // and the per-candidate scalar comparison. `attr` is read directly off
+        // each candidate; `value` is the controller-relative threshold,
+        // resolved once.
+        PlayerFilter::PlayerAttribute {
+            relation,
+            attr,
+            comparator,
+            value,
+        } => {
+            let threshold =
+                crate::game::quantity::resolve_quantity(state, value, controller, source_id);
+            state
+                .players
+                .iter()
+                .filter(|player| !player.is_eliminated)
+                .filter(|player| {
+                    crate::game::players::matches_relation(state, player.id, controller, *relation)
+                        && crate::game::effects::candidate_player_scalar_with_state(
+                            state, player, controller, attr,
+                        )
+                        .is_some_and(|lhs| comparator.evaluate(lhs, threshold))
+                })
+                .map(|player| player.id)
+                .collect()
+        }
     }
 }
 
@@ -255,4 +390,108 @@ pub fn resolve_change_speed(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::ability::{
+        Comparator, PlayerRelation, PlayerScope, QuantityExpr, QuantityRef, TargetRef,
+    };
+    use crate::types::format::FormatConfig;
+    use crate::types::identifiers::ObjectId;
+
+    /// CR 119.1 + CR 810.9a: `players_for_filter` with a `PlayerAttribute`
+    /// life-total predicate reads each candidate's TEAM total through the
+    /// migrated `candidate_player_scalar_with_state` call (Site 6). Controller
+    /// P0 (team A); opposing team B {2,3} has members at 5 and 6 (team 11).
+    /// A `LifeTotal >= 10` opponent predicate counts BOTH team-B members
+    /// because each reads the team total (11 >= 10), even though neither
+    /// individual reaches 10. Reverting Site 6 (stateless `Some(p.life)`)
+    /// reads 5 and 6 individually and the filter selects NOBODY.
+    #[test]
+    fn player_attribute_life_total_reads_team_total_in_2hg() {
+        let mut state = GameState::new(FormatConfig::two_headed_giant(), 4, 0);
+        state.players[2].life = 5;
+        state.players[3].life = 6; // team B total = 11
+
+        let filter = PlayerFilter::PlayerAttribute {
+            relation: PlayerRelation::Opponent,
+            attr: Box::new(QuantityRef::LifeTotal {
+                player: PlayerScope::ScopedPlayer,
+            }),
+            comparator: Comparator::GE,
+            value: Box::new(QuantityExpr::Fixed { value: 10 }),
+        };
+        let ability = ResolvedAbility::new(
+            Effect::StartYourEngines {
+                player_scope: PlayerFilter::Controller,
+            },
+            Vec::<TargetRef>::new(),
+            ObjectId(0),
+            PlayerId(0),
+        );
+
+        let mut selected = players_for_filter(&state, &filter, &ability);
+        selected.sort_by_key(|p| p.0);
+        assert_eq!(
+            selected,
+            vec![PlayerId(2), PlayerId(3)],
+            "both team-B members count: each reads the team total (11 >= 10)"
+        );
+
+        // Sibling: raise the threshold above the team total → neither counts.
+        let filter_high = PlayerFilter::PlayerAttribute {
+            relation: PlayerRelation::Opponent,
+            attr: Box::new(QuantityRef::LifeTotal {
+                player: PlayerScope::ScopedPlayer,
+            }),
+            comparator: Comparator::GE,
+            value: Box::new(QuantityExpr::Fixed { value: 12 }),
+        };
+        assert!(players_for_filter(&state, &filter_high, &ability).is_empty());
+    }
+
+    /// CR 608.2c + CR 109.4 + CR 608.2h: `players_for_filter` with
+    /// `AllExcept { ParentObjectTargetController }` returns every non-eliminated
+    /// player EXCEPT the controller of the ability's first object target. With a
+    /// 3-player state and a target object controlled by P1, the result is
+    /// {P0, P2} — the exclusion anchor reads `ability.targets` (which the generic
+    /// `matches_player_scope` predicate cannot), proving the ability-aware path.
+    #[test]
+    fn all_except_parent_target_controller_excludes_target_controller() {
+        use crate::game::zones::create_object;
+        use crate::types::identifiers::CardId;
+        use crate::types::zones::Zone;
+
+        let mut state = GameState::new(FormatConfig::standard(), 3, 0);
+        // Object owned and controlled by P1 — the parent target.
+        let target = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(1),
+            "Targeted Permanent".to_string(),
+            Zone::Battlefield,
+        );
+
+        let filter = PlayerFilter::AllExcept {
+            exclude: Box::new(PlayerFilter::ParentObjectTargetController),
+        };
+        let ability = ResolvedAbility::new(
+            Effect::StartYourEngines {
+                player_scope: PlayerFilter::Controller,
+            },
+            vec![TargetRef::Object(target)],
+            ObjectId(0),
+            PlayerId(0),
+        );
+
+        let mut selected = players_for_filter(&state, &filter, &ability);
+        selected.sort_by_key(|p| p.0);
+        assert_eq!(
+            selected,
+            vec![PlayerId(0), PlayerId(2)],
+            "AllExcept excludes the parent target's controller (P1)"
+        );
+    }
 }

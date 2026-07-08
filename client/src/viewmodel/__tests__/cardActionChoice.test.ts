@@ -93,7 +93,10 @@ describe("isManaObjectAction", () => {
   it("recognizes only engine-provided mana actions", () => {
     const object = makeGameObject({
       abilities: [
-        { effect: { type: "Mana" } },
+        // CR 605.1a: the engine classifies mana abilities and exposes the
+        // verdict as the derived `is_mana_ability` flag — isManaObjectAction
+        // reads the flag rather than introspecting the effect AST.
+        { is_mana_ability: true, effect: { type: "Mana" } },
         { effect: { type: "Draw" } },
       ],
     });
@@ -287,6 +290,24 @@ describe("abilityChoiceLabel", () => {
         object,
       ).label,
     ).toBe("Tap for {1}");
+  });
+
+  it("labels TapLandForMana as Tap for Mana", () => {
+    const object = makeGameObject({
+      name: "Emergence Zone",
+      card_types: {
+        supertypes: [],
+        core_types: ["Land"],
+        subtypes: [],
+      },
+    });
+
+    expect(
+      abilityChoiceLabel(
+        { type: "TapLandForMana", data: { object_id: 1 } },
+        object,
+      ).label,
+    ).toBe("Tap for Mana");
   });
 
   it("labels the spell face cast action with the front-face name", () => {

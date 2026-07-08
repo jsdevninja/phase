@@ -38,14 +38,15 @@ expression: "&ir"
                 }
               }
             },
-            "player": "targeted_controller"
+            "player": {
+              "type": "ParentTargetController"
+            }
           },
           "cost": null,
           "sub_ability": null,
           "duration": null,
           "description": null,
           "target_prompt": null,
-          "sorcery_speed": false,
           "condition": null,
           "optional_targeting": false,
           "optional": false,
@@ -55,7 +56,6 @@ expression: "&ir"
         "duration": null,
         "description": "Exile target creature. Its controller gains life equal to its power.",
         "target_prompt": null,
-        "sorcery_speed": false,
         "condition": null,
         "optional_targeting": false,
         "optional": false,

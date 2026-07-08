@@ -22,6 +22,7 @@ const VARIANT_KEYS: Partial<Record<CastingVariant["type"], string>> = {
   Escape: "variantEscape",
   Retrace: "variantRetrace",
   Harmonize: "variantHarmonize",
+  Mayhem: "variantMayhem",
   Flashback: "variantFlashback",
   Aftermath: "variantAftermath",
   GraveyardPermission: "variantGraveyardPermission",
@@ -34,6 +35,8 @@ const VARIANT_KEYS: Partial<Record<CastingVariant["type"], string>> = {
   Foretell: "variantForetell",
   Overload: "variantOverload",
   Bestow: "variantBestow",
+  Freerunning: "variantFreerunning",
+  Fuse: "variantFuse",
 };
 
 export function CastingVariantModal() {

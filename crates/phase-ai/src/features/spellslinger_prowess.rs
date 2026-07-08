@@ -37,6 +37,7 @@ use engine::types::keywords::Keyword;
 use engine::types::triggers::TriggerMode;
 
 use crate::ability_chain::collect_chain_effects;
+use crate::features::commitment;
 use crate::features::control::is_card_draw_parts;
 
 /// Maximum mana value to qualify as "low curve". CR 202.3b.
@@ -204,13 +205,23 @@ fn compute_commitment(
     copy_effect_count: u32,
     total_nonland: u32,
 ) -> f32 {
-    let denom = total_nonland.max(1) as f32;
-    let payoff_density =
-        (prowess_count as f32 + cast_payoff_count as f32 + 2.0 * nth_spell_payoff_count as f32)
-            / denom;
-    let spell_density = low_curve_spell_count as f32 / denom;
-    let copy_density = copy_effect_count as f32 / denom;
-    (1.6 * payoff_density + 1.0 * spell_density + 0.5 * copy_density).clamp(0.0, 1.0)
+    let payoff_count = prowess_count
+        .saturating_add(cast_payoff_count)
+        .saturating_add(nth_spell_payoff_count.saturating_mul(2));
+    commitment::weighted_sum(&[
+        (
+            1.6 / 60.0,
+            commitment::density_per_60(payoff_count, total_nonland),
+        ),
+        (
+            1.0 / 60.0,
+            commitment::density_per_60(low_curve_spell_count, total_nonland),
+        ),
+        (
+            0.5 / 60.0,
+            commitment::density_per_60(copy_effect_count, total_nonland),
+        ),
+    ])
 }
 
 // ─── Parts predicates ────────────────────────────────────────────────────────
@@ -361,8 +372,8 @@ mod tests {
     use super::*;
     use engine::game::DeckEntry;
     use engine::types::ability::{
-        AbilityDefinition, AbilityKind, ControllerRef, Effect, QuantityExpr, TargetFilter,
-        TriggerDefinition, TypedFilter,
+        AbilityDefinition, AbilityKind, ControllerRef, DigSource, Effect, QuantityExpr,
+        TargetFilter, TriggerDefinition, TypedFilter,
     };
     use engine::types::card::CardFace;
     use engine::types::card_type::{CardType, CoreType};
@@ -410,6 +421,7 @@ mod tests {
             amount: QuantityExpr::Fixed { value: 3 },
             target: TargetFilter::Any,
             damage_source: None,
+            excess: None,
         }
     }
 
@@ -418,6 +430,7 @@ mod tests {
             amount: QuantityExpr::Fixed { value: 3 },
             target: TargetFilter::Player,
             damage_source: None,
+            excess: None,
         }
     }
 
@@ -429,6 +442,7 @@ mod tests {
                 ..TypedFilter::default()
             }),
             damage_source: None,
+            excess: None,
         }
     }
 
@@ -436,6 +450,9 @@ mod tests {
         Effect::CopySpell {
             target: TargetFilter::Any,
             retarget: engine::types::ability::CopyRetargetPermission::KeepOriginalTargets,
+            copier: None,
+            additional_modifications: Vec::new(),
+            starting_loyalty_from_casualty_sacrifice: false,
         }
     }
 
@@ -620,10 +637,13 @@ mod tests {
             count: QuantityExpr::Fixed { value: 3 },
             destination: None,
             keep_count: Some(3),
+            keep_count_expr: None,
             up_to: false,
             filter: TargetFilter::Any,
             rest_destination: None,
             reveal: false,
+            enter_tapped: false,
+            source: DigSource::Library,
         }));
         let f = detect(&[entry(c, 4)]);
         assert_eq!(f.cantrip_count, 4);
@@ -640,10 +660,13 @@ mod tests {
             count: QuantityExpr::Fixed { value: 2 },
             destination: Some(Zone::Exile),
             keep_count: Some(2),
+            keep_count_expr: None,
             up_to: false,
             filter: TargetFilter::Any,
             rest_destination: None,
             reveal: false,
+            enter_tapped: false,
+            source: DigSource::Library,
         }));
         let f = detect(&[entry(c, 4)]);
         // impulse-dig should NOT count as cantrip

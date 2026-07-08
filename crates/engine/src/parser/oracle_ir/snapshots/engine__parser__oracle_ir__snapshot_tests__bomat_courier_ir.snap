@@ -1,5 +1,6 @@
 ---
 source: crates/engine/src/parser/oracle_ir/snapshot_tests.rs
+assertion_line: 806
 expression: "&ir"
 ---
 {
@@ -17,7 +18,6 @@ expression: "&ir"
         "duration": null,
         "description": "Haste",
         "target_prompt": null,
-        "sorcery_speed": false,
         "condition": null,
         "optional_targeting": false,
         "optional": false,
@@ -28,9 +28,12 @@ expression: "&ir"
       "PreLoweredSpell": {
         "kind": "Activated",
         "effect": {
-          "type": "Unimplemented",
-          "name": "put",
-          "description": "Put all cards exiled with ~ into their owners' hands"
+          "type": "ChangeZoneAll",
+          "origin": "Exile",
+          "destination": "Hand",
+          "target": {
+            "type": "ExiledBySource"
+          }
         },
         "cost": {
           "type": "Composite",
@@ -73,7 +76,6 @@ expression: "&ir"
         "duration": null,
         "description": "{R}, Discard your hand, Sacrifice ~: Put all cards exiled with ~ into their owners' hands.",
         "target_prompt": null,
-        "sorcery_speed": false,
         "condition": null,
         "optional_targeting": false,
         "optional": false,
@@ -101,7 +103,6 @@ expression: "&ir"
           "duration": null,
           "description": null,
           "target_prompt": null,
-          "sorcery_speed": false,
           "condition": null,
           "optional_targeting": false,
           "optional": false,

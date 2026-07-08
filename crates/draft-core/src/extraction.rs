@@ -43,13 +43,41 @@ struct MtgjsonSetData {
 
 #[derive(Deserialize)]
 struct MtgjsonBooster {
+    /// Play Booster product (MKM 2024 onward). Preferred when present.
     #[serde(default)]
-    play: Option<MtgjsonBoosterPlay>,
+    play: Option<MtgjsonBoosterConfig>,
+    /// Draft Booster product (the legacy limited product, ~2018–2024). Sets
+    /// printed before Play Boosters carry `draft` but no `play`.
+    #[serde(default)]
+    draft: Option<MtgjsonBoosterConfig>,
+    /// The unnamed "standard" booster MTGJSON emits for the oldest expansions
+    /// (Ice Age, Antiquities, Legends, …) that predate the draft/set/collector
+    /// product split. It is the de-facto draft booster for those sets.
+    #[serde(default)]
+    default: Option<MtgjsonBoosterConfig>,
+}
+
+impl MtgjsonBooster {
+    /// The draftable booster configuration, in product-recency order: modern
+    /// Play Booster, else legacy Draft Booster, else the `default` booster the
+    /// oldest expansions carry. All three share an identical MTGJSON shape
+    /// (sheets + weighted boosters), so any one drives extraction. The three
+    /// are mutually exclusive across the corpus, so the order only documents
+    /// intent. Platform-only products (`arena`, `mtgo`) and non-draft products
+    /// (`set`, `collector`, `jumpstart`) are deliberately excluded.
+    fn draftable(&self) -> Option<&MtgjsonBoosterConfig> {
+        // Eager `.or()` (not `.or_else`): `as_ref()` is trivial and side-effect
+        // free, so clippy::unnecessary_lazy_evaluations rejects a lazy closure.
+        self.play
+            .as_ref()
+            .or(self.draft.as_ref())
+            .or(self.default.as_ref())
+    }
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct MtgjsonBoosterPlay {
+struct MtgjsonBoosterConfig {
     sheets: HashMap<String, MtgjsonSheet>,
     boosters: Vec<MtgjsonBoosterVariant>,
     boosters_total_weight: u32,
@@ -130,8 +158,8 @@ fn build_card_index(sets: &[MtgjsonSetData]) -> HashMap<&str, &MtgjsonCard> {
 
 /// Extract a [`LimitedSetPool`] from raw MTGJSON per-set JSON content.
 ///
-/// Returns `Ok(None)` if the set has no `booster.play` section (not draftable).
-/// Sheet UUIDs are resolved against this set's own cards only — use
+/// Returns `Ok(None)` if the set has no draftable booster (`play`, `draft`, or
+/// `default`). Sheet UUIDs are resolved against this set's own cards only — use
 /// [`extract_all_set_pools`] when supplemental sheets need cross-set resolution.
 pub fn extract_set_pool(json_content: &str) -> Result<Option<LimitedSetPool>, ExtractionError> {
     let file: MtgjsonSetFile = serde_json::from_str(json_content)?;
@@ -141,20 +169,20 @@ pub fn extract_set_pool(json_content: &str) -> Result<Option<LimitedSetPool>, Ex
 
 /// Extract a [`LimitedSetPool`] from one set's parsed data, resolving sheet UUIDs
 /// against `card_index` (which may span multiple sets). Returns `None` if the set
-/// has no `booster.play` config. `prints` and `basic_lands` stay set-local — they
-/// describe *this* set's print run, not the corpus.
+/// has no draftable booster config (`play`/`draft`/`default`). `prints` and
+/// `basic_lands` stay set-local — they describe *this* set's print run, not the corpus.
 fn extract_set_pool_indexed(
     data: &MtgjsonSetData,
     card_index: &HashMap<&str, &MtgjsonCard>,
 ) -> Option<LimitedSetPool> {
-    let play = data.booster.as_ref().and_then(|b| b.play.as_ref())?;
+    let booster = data.booster.as_ref().and_then(MtgjsonBooster::draftable)?;
 
     // Track which UUIDs appear in any sheet (for prints eligibility).
     let mut uuids_in_sheets: HashSet<&str> = HashSet::new();
 
     // Build sheets, resolving UUIDs against the (possibly cross-set) index.
     let mut sheets = BTreeMap::new();
-    for (sheet_name, mtg_sheet) in &play.sheets {
+    for (sheet_name, mtg_sheet) in &booster.sheets {
         let mut cards = Vec::new();
         for (uuid, &weight) in &mtg_sheet.cards {
             uuids_in_sheets.insert(uuid.as_str());
@@ -191,7 +219,7 @@ fn extract_set_pool_indexed(
     }
 
     // Build pack variants
-    let pack_variants: Vec<PackVariant> = play
+    let pack_variants: Vec<PackVariant> = booster
         .boosters
         .iter()
         .map(|variant| {
@@ -216,8 +244,16 @@ fn extract_set_pool_indexed(
         })
         .collect();
 
-    // Build prints: cards that have boosterTypes containing "play" or appear in any sheet.
+    // Build prints: cards tagged for the booster pool or appearing in any sheet.
     // Set-local: this is *this* set's print run, not the cross-set index.
+    //
+    // `booster_eligible` means "can be opened in a pack of this set", which is
+    // exactly sheet membership — the same ground truth across every era. The
+    // per-card MTGJSON `boosterTypes` field cannot answer this: it carries pool
+    // tags (`default`/`deck`), never the set-level product key, so the old
+    // `contains("play")` check was `false` for every card in every set (Play
+    // Boosters included) and is unrelated to the `play`/`draft`/`default`
+    // product fallback in `MtgjsonBooster::draftable`.
     let prints: Vec<LimitedCardPrint> = data
         .cards
         .iter()
@@ -231,7 +267,7 @@ fn extract_set_pool_indexed(
             set_code: c.set_code.clone(),
             collector_number: c.number.clone(),
             rarity: parse_rarity(&c.rarity),
-            booster_eligible: c.booster_types.contains(&"play".to_string()),
+            booster_eligible: uuids_in_sheets.contains(c.uuid.as_str()),
         })
         .collect();
 
@@ -268,7 +304,7 @@ fn extract_set_pool_indexed(
         name: data.name.clone(),
         release_date: data.release_date.clone(),
         pack_variants,
-        pack_variants_total_weight: play.boosters_total_weight,
+        pack_variants_total_weight: booster.boosters_total_weight,
         sheets,
         prints,
         basic_lands,
@@ -284,24 +320,55 @@ fn extract_set_pool_indexed(
 pub fn extract_all_set_pools(
     sets_dir: &Path,
 ) -> Result<BTreeMap<String, LimitedSetPool>, ExtractionError> {
-    let entries: Vec<_> = std::fs::read_dir(sets_dir)
-        .map_err(|e| ExtractionError::Other(format!("cannot read directory: {e}")))?
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
-        .collect();
+    let read_dir = std::fs::read_dir(sets_dir)
+        .map_err(|e| ExtractionError::Other(format!("cannot read directory: {e}")))?;
+
+    // Collect the `.json` entries, surfacing directory-entry read errors instead
+    // of silently dropping them. Sort for a deterministic parse/progress/error
+    // order regardless of the OS-dependent `read_dir` order.
+    let mut entries: Vec<std::path::PathBuf> = Vec::new();
+    let mut failures: Vec<String> = Vec::new();
+    for entry in read_dir {
+        match entry {
+            Ok(e) => {
+                let path = e.path();
+                if path.extension().is_some_and(|ext| ext == "json") {
+                    entries.push(path);
+                }
+            }
+            Err(e) => failures.push(format!("could not read a directory entry: {e}")),
+        }
+    }
+    entries.sort();
     let total = entries.len();
 
     // Pass 1: parse every set file once. A cross-set UUID index needs them all
     // resident simultaneously (`specialGuest` etc. point at other sets' cards).
+    // Collect every per-file failure (named by path) rather than aborting on the
+    // first, so a corpus with several bad files reports them all in one run.
     let mut datas: Vec<MtgjsonSetData> = Vec::with_capacity(total);
-    for (i, entry) in entries.iter().enumerate() {
-        let path = entry.path();
+    for (i, path) in entries.iter().enumerate() {
         let filename = path.file_stem().unwrap_or_default().to_string_lossy();
         eprintln!("[{}/{}] Parsing {filename}...", i + 1, total);
-        let content = std::fs::read_to_string(&path)
-            .map_err(|e| ExtractionError::Other(format!("cannot read {}: {e}", path.display())))?;
-        let file: MtgjsonSetFile = serde_json::from_str(&content)?;
-        datas.push(file.data);
+        let content = match std::fs::read_to_string(path) {
+            Ok(content) => content,
+            Err(e) => {
+                failures.push(format!("cannot read {}: {e}", path.display()));
+                continue;
+            }
+        };
+        match serde_json::from_str::<MtgjsonSetFile>(&content) {
+            Ok(file) => datas.push(file.data),
+            Err(e) => failures.push(format!("cannot parse {}: {e}", path.display())),
+        }
+    }
+
+    if !failures.is_empty() {
+        return Err(ExtractionError::Other(format!(
+            "{} set file(s) could not be loaded:\n  - {}",
+            failures.len(),
+            failures.join("\n  - ")
+        )));
     }
 
     let card_index = build_card_index(&datas);
@@ -380,6 +447,37 @@ mod tests {
         .to_string()
     }
 
+    /// Pre-Play-Booster set: carries a legacy `draft` booster but no `play`.
+    /// This is the shape of the entire pre-2024 back catalog (DOM, ELD, WAR, …).
+    fn minimal_set_with_draft_booster() -> String {
+        r#"{
+            "data": {
+                "code": "OLD",
+                "name": "Old Set",
+                "releaseDate": "2019-01-01",
+                "booster": {
+                    "draft": {
+                        "sheets": {
+                            "common": {
+                                "cards": { "uuid-c1": 10, "uuid-c2": 10 },
+                                "totalWeight": 20
+                            }
+                        },
+                        "boosters": [
+                            { "contents": { "common": 10 }, "weight": 1 }
+                        ],
+                        "boostersTotalWeight": 1
+                    }
+                },
+                "cards": [
+                    { "uuid": "uuid-c1", "name": "Old Common A", "rarity": "common", "number": "1", "setCode": "OLD", "boosterTypes": [], "supertypes": [] },
+                    { "uuid": "uuid-c2", "name": "Old Common B", "rarity": "common", "number": "2", "setCode": "OLD", "boosterTypes": [], "supertypes": [] }
+                ]
+            }
+        }"#
+        .to_string()
+    }
+
     fn minimal_set_without_booster() -> String {
         r#"{
             "data": {
@@ -434,6 +532,92 @@ mod tests {
         assert!(
             result.is_none(),
             "set without booster.play should return None"
+        );
+    }
+
+    #[test]
+    fn test_extract_set_falls_back_to_draft_booster() {
+        // Pre-Play-Booster sets have only `booster.draft`; they must still be
+        // draftable. This covers the entire pre-2024 back catalog.
+        let json = minimal_set_with_draft_booster();
+        let pool = extract_set_pool(&json)
+            .unwrap()
+            .expect("set with only a draft booster should yield a pool");
+
+        assert_eq!(pool.code, "OLD");
+        assert_eq!(pool.sheets.len(), 1);
+        assert_eq!(pool.sheets["common"].cards.len(), 2);
+        assert_eq!(pool.pack_variants.len(), 1);
+        assert_eq!(pool.prints.len(), 2);
+        // Cards carry no `boosterTypes` tag yet are on the draft sheet, so they
+        // are booster-eligible: eligibility is sheet membership, not a tag.
+        assert!(pool.prints.iter().all(|p| p.booster_eligible));
+    }
+
+    #[test]
+    fn test_extract_set_falls_back_to_default_booster() {
+        // The oldest expansions (Ice Age, Antiquities, Legends, …) carry only a
+        // `default` booster — no `play`/`draft`. They must still be draftable.
+        let json = r#"{
+            "data": {
+                "code": "ICE",
+                "name": "Ice Age",
+                "releaseDate": "1995-06-01",
+                "booster": {
+                    "default": {
+                        "sheets": {
+                            "common": { "cards": { "uuid-c1": 1, "uuid-c2": 1 }, "totalWeight": 2 }
+                        },
+                        "boosters": [{ "contents": { "common": 2 }, "weight": 1 }],
+                        "boostersTotalWeight": 1
+                    }
+                },
+                "cards": [
+                    { "uuid": "uuid-c1", "name": "Ice Common A", "rarity": "common", "number": "1", "setCode": "ICE", "boosterTypes": [], "supertypes": [] },
+                    { "uuid": "uuid-c2", "name": "Ice Common B", "rarity": "common", "number": "2", "setCode": "ICE", "boosterTypes": [], "supertypes": [] }
+                ]
+            }
+        }"#;
+
+        let pool = extract_set_pool(json)
+            .unwrap()
+            .expect("set with only a default booster should yield a pool");
+        assert_eq!(pool.code, "ICE");
+        assert_eq!(pool.sheets["common"].cards.len(), 2);
+        assert_eq!(pool.prints.len(), 2);
+        assert!(pool.prints.iter().all(|p| p.booster_eligible));
+    }
+
+    #[test]
+    fn test_play_booster_preferred_over_draft() {
+        // A transitional set carrying both products must draft from `play`.
+        let json = r#"{
+            "data": {
+                "code": "DUAL",
+                "name": "Dual Set",
+                "booster": {
+                    "play": {
+                        "sheets": { "p": { "cards": { "uuid-p": 1 }, "totalWeight": 1 } },
+                        "boosters": [{ "contents": { "p": 1 }, "weight": 1 }],
+                        "boostersTotalWeight": 1
+                    },
+                    "draft": {
+                        "sheets": { "d": { "cards": { "uuid-d": 1 }, "totalWeight": 1 } },
+                        "boosters": [{ "contents": { "d": 1 }, "weight": 1 }],
+                        "boostersTotalWeight": 1
+                    }
+                },
+                "cards": [
+                    { "uuid": "uuid-p", "name": "Play Card", "rarity": "common", "number": "1", "setCode": "DUAL", "boosterTypes": [], "supertypes": [] },
+                    { "uuid": "uuid-d", "name": "Draft Card", "rarity": "common", "number": "2", "setCode": "DUAL", "boosterTypes": [], "supertypes": [] }
+                ]
+            }
+        }"#;
+
+        let pool = extract_set_pool(json).unwrap().unwrap();
+        assert!(
+            pool.sheets.contains_key("p") && !pool.sheets.contains_key("d"),
+            "play booster sheets must win over draft when both are present"
         );
     }
 
@@ -560,5 +744,68 @@ mod tests {
 
         let result = extract_set_pool(json).unwrap().unwrap();
         assert_eq!(result.basic_lands, vec!["Island", "Plains"]);
+    }
+
+    // --- extract_all_set_pools (directory-level loading) ---
+
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let pid = std::process::id();
+        let dir = std::env::temp_dir().join(format!("phase_draft_core_{pid}_{tag}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_file(dir: &std::path::Path, name: &str, contents: &str) {
+        std::fs::write(dir.join(name), contents).unwrap();
+    }
+
+    #[test]
+    fn all_pools_empty_dir_is_ok_and_empty() {
+        let dir = scratch_dir("empty");
+        let pools = extract_all_set_pools(&dir).unwrap();
+        assert!(pools.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn all_pools_loads_booster_set_and_skips_non_json_and_boosterless() {
+        let dir = scratch_dir("valid");
+        write_file(&dir, "tst.json", &minimal_set_with_booster());
+        write_file(&dir, "prm.json", &minimal_set_without_booster());
+        write_file(&dir, "README.txt", "not a set file");
+
+        let pools = extract_all_set_pools(&dir).unwrap();
+
+        // Only the set with a `booster.play` config yields a pool; the
+        // boosterless set and the non-`.json` file are skipped.
+        assert_eq!(pools.len(), 1);
+        assert!(pools.contains_key("tst"));
+        assert!(!pools.contains_key("prm"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn all_pools_reports_every_bad_file_in_one_error() {
+        let dir = scratch_dir("bad");
+        write_file(&dir, "good.json", &minimal_set_with_booster());
+        write_file(&dir, "bad1.json", "{ not valid json");
+        write_file(&dir, "bad2.json", r#"{"data": 123}"#);
+
+        let err = extract_all_set_pools(&dir).unwrap_err();
+        let msg = err.to_string();
+
+        // Both bad files are named in a single aggregated error rather than the
+        // load aborting on the first one.
+        assert!(msg.contains("bad1.json"), "expected bad1.json in: {msg}");
+        assert!(msg.contains("bad2.json"), "expected bad2.json in: {msg}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn all_pools_missing_directory_is_err() {
+        let missing = std::env::temp_dir().join("phase_draft_core_missing_dir_xyz");
+        let _ = std::fs::remove_dir_all(&missing);
+        assert!(extract_all_set_pools(&missing).is_err());
     }
 }

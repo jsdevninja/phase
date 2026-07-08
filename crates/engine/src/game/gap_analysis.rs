@@ -17,6 +17,7 @@ use std::collections::{BTreeMap, HashMap};
 const IMPERATIVE_EXTRA_VERBS: &[&str] = &[
     "spend",
     "double",
+    "triple",
     "destroy",
     "prevent",
     "attach",
@@ -51,6 +52,7 @@ const IMPERATIVE_EXTRA_VERBS: &[&str] = &[
     "switch",
     "populate",
     "clash",
+    "planeswalk",
 ];
 
 /// Pre-dispatch verbs handled in `parse_effect_clause` before imperative dispatch.
@@ -69,7 +71,6 @@ const NEW_MECHANIC_KEYWORDS: &[&str] = &[
     "draft",
     "drafted",
     "ante",
-    "augment",
     "sticker",
     "attraction",
     "unfinity",

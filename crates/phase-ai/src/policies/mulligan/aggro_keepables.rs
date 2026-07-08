@@ -33,9 +33,9 @@ impl MulliganPolicy for AggroKeepablesMulligan {
         hand: &[ObjectId],
         state: &GameState,
         features: &DeckFeatures,
-        _plan: &PlanSnapshot,
-        _turn_order: TurnOrder,
-        _mulligans_taken: u8,
+        _plan: &PlanSnapshot, // input-unused: aggro opener scoring is card-composition only
+        _turn_order: TurnOrder, // input-unused: aggro opener scoring is card-composition only
+        _mulligans_taken: u8, // input-unused: aggro opener scoring is card-composition only
     ) -> MulliganScore {
         let commitment = features.aggro_pressure.commitment;
         if commitment <= MULLIGAN_FLOOR {
@@ -223,6 +223,7 @@ mod tests {
                         amount: QuantityExpr::Fixed { value: 3 },
                         target: TargetFilter::Any,
                         damage_source: None,
+                        excess: None,
                     },
                 );
                 ability.kind = AbilityKind::Spell;

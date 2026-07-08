@@ -1,21 +1,30 @@
 use std::collections::HashSet;
 
+use crate::analysis::resource::ResourceAxis;
+use crate::game::filter::{matches_target_filter_including_phased_out, FilterContext};
 use crate::game::replacement::{self, ReplacementResult};
-use crate::types::ability::{ReplacementDefinition, RestrictionExpiry};
+use crate::types::ability::{
+    ControlWindow, EffectKind, ReplacementDefinition, RestrictionExpiry, TargetFilter,
+};
 use crate::types::counter::CounterType;
 use crate::types::events::GameEvent;
 use crate::types::format::GameFormat;
-use crate::types::game_state::{AutoPassMode, GameState, WaitingFor};
+use crate::types::game_state::{
+    AutoPassMode, ExtraPhase, GameState, PendingCounterAddition, PendingEffectResolved,
+    TurnBoundary, WaitingFor,
+};
 use crate::types::identifiers::ObjectId;
 use crate::types::phase::Phase;
 use crate::types::player::PlayerId;
 use crate::types::proposed_event::ProposedEvent;
-use crate::types::statics::{HandSizeModification, StaticMode};
+use crate::types::statics::{HandSizeModification, StaticMode, StaticModeKind};
 use crate::types::zones::Zone;
 
 use super::combat;
 use super::combat_damage;
 use super::day_night;
+use super::functioning_abilities::static_kind_present;
+use super::priority;
 use super::turn_control;
 use super::zones;
 
@@ -39,7 +48,30 @@ pub fn next_phase(phase: Phase) -> Phase {
     PHASE_ORDER[(idx + 1) % PHASE_ORDER.len()]
 }
 
-/// CR 500.4: Advance to the next phase/step, clearing mana pools.
+/// CR 500.1–500.4: The final step of the phase that contains `phase`. Anchors an
+/// inserted whole phase "after this phase" (CR 500.8): the insert lands after the
+/// containing phase's last step, and the turn resumes at that phase's natural
+/// successor (`next_phase(last_step_of_phase(this_phase))`). Used by the
+/// beginning-phase branch of `additional_phase::resolve` (Temple of Atropos).
+pub(crate) fn last_step_of_phase(phase: Phase) -> Phase {
+    match phase {
+        // CR 501.1: beginning phase = untap, upkeep, draw.
+        Phase::Untap | Phase::Upkeep | Phase::Draw => Phase::Draw,
+        // CR 505.1: each main phase is a single step.
+        Phase::PreCombatMain => Phase::PreCombatMain,
+        // CR 506.1: combat phase = begin, declare attackers/blockers, damage, end.
+        Phase::BeginCombat
+        | Phase::DeclareAttackers
+        | Phase::DeclareBlockers
+        | Phase::CombatDamage
+        | Phase::EndCombat => Phase::EndCombat,
+        Phase::PostCombatMain => Phase::PostCombatMain,
+        // CR 512.1: ending phase = end, cleanup.
+        Phase::End | Phase::Cleanup => Phase::Cleanup,
+    }
+}
+
+/// CR 500.5: Advance to the next phase/step, clearing mana pools.
 pub fn advance_phase(state: &mut GameState, events: &mut Vec<GameEvent>) {
     // CR 500.8: Extra phases are inserted *directly after* their anchor phase
     // (e.g., Aurelia's "after this phase" extra combat is inserted after the
@@ -48,12 +80,51 @@ pub fn advance_phase(state: &mut GameState, events: &mut Vec<GameEvent>) {
     // created entry occurs first ("the most recently created phase will occur
     // first" per CR 500.8). An entry with a non-matching anchor is preserved
     // until its anchor phase is reached.
-    let next = state
-        .extra_phases
-        .iter()
-        .rposition(|ep| ep.anchor == state.phase)
-        .map(|i| state.extra_phases.remove(i).phase)
-        .unwrap_or_else(|| next_phase(state.phase));
+    let leaving = state.phase;
+    let removed: Option<ExtraPhase>;
+    let next: Phase;
+    if leaving == Phase::Draw && !state.extra_phase_resume.is_empty() {
+        // CR 501.1: an inserted beginning phase's draw step is ending.
+        let anchor = *state.extra_phase_resume.last().unwrap();
+        if let Some(i) = state
+            .extra_phases
+            .iter()
+            .rposition(|ep| ep.anchor == anchor && ep.phase == Phase::Untap)
+        {
+            // CR 500.8: another beginning phase was queued after the same phase —
+            // run it next (the resume anchor stays on the stack). The anchor phase
+            // is never re-entered, so its beginning-of-phase triggers (Temple's
+            // postcombat-main trigger) do not re-fire.
+            state.extra_phases.remove(i);
+            removed = None;
+            next = Phase::Untap;
+        } else {
+            // CR 500.8: no more queued beginning phases — resume the turn after
+            // "this phase" (the anchor's natural successor).
+            state.extra_phase_resume.pop();
+            removed = None;
+            next = next_phase(anchor);
+        }
+    } else {
+        let taken = state
+            .extra_phases
+            .iter()
+            .rposition(|ep| ep.anchor == leaving)
+            .map(|i| state.extra_phases.remove(i));
+        next = taken
+            .as_ref()
+            .map(|ep| ep.phase)
+            .unwrap_or_else(|| next_phase(leaving));
+        // CR 501.1: entering a freshly-inserted beginning phase — remember where
+        // to resume once its draw step ends. (No other producer emits `phase:
+        // Untap`, so this uniquely identifies an inserted beginning phase.)
+        if let Some(ep) = &taken {
+            if ep.phase == Phase::Untap {
+                state.extra_phase_resume.push(ep.anchor);
+            }
+        }
+        removed = taken;
+    }
 
     // If wrapping from Cleanup to Untap, start next turn. Turn-level skip
     // replacements (CR 614.10) are handled inside `start_next_turn` — the
@@ -80,7 +151,83 @@ pub fn advance_phase(state: &mut GameState, events: &mut Vec<GameEvent>) {
         }
     }
 
+    // CR 500.8 + CR 508.1c: activate the scheduled combat's attacker restriction
+    // when (and only when) that BeginCombat begins. A natural combat consumes no
+    // extra-phase entry, so `removed` is `None` and the restriction clears —
+    // natural combats are never restricted. The field persists untouched through
+    // DeclareAttackers/DeclareBlockers/CombatDamage (entered with next != BeginCombat)
+    // and is cleared at end of combat (CR 511.3).
+    // CR 611.2c: also propagate the source ObjectId so that
+    // `passes_combat_attacker_restriction` can evaluate source-relative
+    // restriction predicates against the scheduling spell's actual object.
+    if next == Phase::BeginCombat {
+        state.current_combat_attacker_restriction = removed
+            .as_ref()
+            .and_then(|ep| ep.attacker_restriction.clone());
+        state.current_combat_attacker_restriction_source = removed
+            .as_ref()
+            .and_then(|ep| ep.attacker_restriction_source);
+    }
+
     enter_phase(state, next, events);
+}
+
+/// CR 724.1d: End the current turn by skipping straight to the cleanup step.
+/// Discards any extra phases/steps scheduled for this turn (they are skipped)
+/// and enters a fresh cleanup step — per CR 724.1d, even if the turn is ended
+/// during the cleanup step, a new cleanup step begins. Drives `Effect::EndTheTurn`
+/// (Time Stop, Sundial of the Infinite, Obeka, Glorious End, Discontinuity).
+pub fn end_turn_to_cleanup(state: &mut GameState, events: &mut Vec<GameEvent>) {
+    // CR 724.1d: "skip any phases or steps between this phase or step and the
+    // cleanup step" — drop scheduled extra phases for this (now-ending) turn.
+    state.extra_phases.clear();
+    // CR 500.8 + CR 724.1d: the turn is ending — any inserted-beginning-phase
+    // resume anchors for this turn are discarded along with the extra phases.
+    state.extra_phase_resume.clear();
+    // CR 724.1d + CR 511.3: if the turn ends during combat, all creatures are
+    // removed from combat and the combat phase is over. Clear any active
+    // additional-combat attacker restriction (Last Night Together / Bumi) — the
+    // normal cleanup path via Phase::EndCombat or end_combat_phase_to_postcombat
+    // is skipped, so we must expire the restriction here.
+    state.current_combat_attacker_restriction = None;
+    state.current_combat_attacker_restriction_source = None;
+    enter_phase(state, Phase::Cleanup, events);
+}
+
+/// CR 724.2d: End the current combat phase by removing everything from combat,
+/// expiring "until end of combat" effects, and skipping straight to the
+/// postcombat main phase. Mirrors the end-of-combat teardown the `EndCombat`
+/// step performs (see the `Phase::EndCombat` arm of `advance_phase`), but skips
+/// the intervening end-of-combat step so its "at end of combat" triggers do not
+/// fire (CR 724.2e). Drives `Effect::EndCombatPhase` (Mandate of Peace).
+pub fn end_combat_phase_to_postcombat(state: &mut GameState, events: &mut Vec<GameEvent>) {
+    // CR 724.2d / CR 511.3: Remove all creatures and planeswalkers from combat.
+    state.combat = None;
+    // CR 724.2d: Effects that last "until end of combat" expire — continuous
+    // effects, replacement definitions, and pending damage replacements alike,
+    // matching the normal end-of-combat prune.
+    super::layers::prune_end_of_combat_effects(state);
+    for obj in state.objects.iter_mut().map(|(_, v)| v) {
+        obj.replacement_definitions
+            .retain(|r| !matches!(r.expiry, Some(RestrictionExpiry::EndOfCombat)));
+    }
+    state
+        .pending_damage_replacements
+        .retain(|r| !matches!(r.expiry, Some(RestrictionExpiry::EndOfCombat)));
+
+    // CR 511.3 / CR 724.2d: the combat phase is over — clear any active
+    // additional-combat attacker restriction (Last Night Together / Bumi).
+    state.current_combat_attacker_restriction = None;
+    state.current_combat_attacker_restriction_source = None;
+
+    // CR 724.2d: Skip straight to the postcombat main phase, skipping any
+    // intervening steps (including the end-of-combat step — CR 724.2e). Any
+    // extra combat phases scheduled for this turn are also skipped.
+    state.extra_phases.clear();
+    // CR 500.8 + CR 724.2d: extra phases scheduled for this turn are skipped, so
+    // drop any inserted-beginning-phase resume anchors along with them.
+    state.extra_phase_resume.clear();
+    enter_phase(state, Phase::PostCombatMain, events);
 }
 
 /// Enter a phase directly: set phase, run the CR 703.4q step-end empty
@@ -105,6 +252,13 @@ fn enter_phase(state: &mut GameState, next: Phase, events: &mut Vec<GameEvent>) 
     if next == Phase::BeginCombat {
         state.combat_phases_started_this_turn =
             state.combat_phases_started_this_turn.saturating_add(1);
+    }
+    // CR 500.8 + CR 513.1: track end-step occurrences for "first end step of the
+    // turn" gates (Y'shtola Rhul). Counts every End step begun this turn,
+    // including extra end steps scheduled via AdditionalPhase, so the gate only
+    // holds for the first.
+    if next == Phase::End {
+        state.end_steps_started_this_turn = state.end_steps_started_this_turn.saturating_add(1);
     }
 
     // CR 500.5: Mana pools empty between phases/steps.
@@ -169,7 +323,36 @@ pub(super) fn drain_pending_phase_transition_progress(
         let scan_entries = scan_step_end_mana_handlers(state, player_id);
         state.pending_step_end_mana_handlers = scan_entries;
 
-        // Build per-unit decision payload from the player's surviving (non-expiry) pool.
+        // Build per-unit decision payload from the player's surviving pool.
+        //
+        // CR 500.5 + CR 703.4q (H2 invariant): expiry-bound units (e.g.
+        // Klauth's "you don't lose this mana as steps and phases end",
+        // Firebending's "Until end of combat, you don't lose this mana as
+        // steps and phases end" — CR 702.189a) have *already* had their fate
+        // decided by `clear_expiring_at_step_end` above — they were either
+        // dropped (their rule fired) or deliberately retained.
+        //
+        // CR 614.17 + CR 614.17c: "you don't lose this mana …" is a "can't"
+        // effect, not a replacement effect. It prevents the CR 106.4 /
+        // CR 703.4q lose-mana event for the protected units, and per
+        // CR 614.17c, once that event can't happen no other replacement
+        // effect — including a step-end mana handler (Upwelling, Horizon
+        // Stone, Kruphix) — can modify or replace it. So such units must NOT
+        // enter the empty-pool replacement pipeline at all; emitting a `Drop`
+        // decision here would empty the very mana the card promises to keep.
+        // Only `None`-expiry units flow into the pipeline as Drop-disposition
+        // decisions. The `enumerate` runs over the full pool so `pool_index`
+        // stays aligned with the retained expiry units that remain in
+        // `mana_pool.mana`.
+        // Debug-only: CR 500.5 end-of-step empty is suppressed for a player with
+        // the infinite-mana toggle active — every non-expiry unit is dispositioned
+        // `Keep` instead of `Drop` so the pool survives the step transition. This
+        // is the partner of `mana_payment::refill_infinite_mana`; together they
+        // keep a flagged player's pool continuously full.
+        let keep_for_infinite_mana = state
+            .unbounded_resources
+            .get(&player_id)
+            .is_some_and(|axes| axes.iter().any(|a| matches!(a, ResourceAxis::Mana(_))));
         let units: Vec<crate::types::mana::UnitDecision> = state
             .players
             .iter()
@@ -179,10 +362,15 @@ pub(super) fn drain_pending_phase_transition_progress(
                     .mana
                     .iter()
                     .enumerate()
+                    .filter(|(_, u)| u.expiry.is_none())
                     .map(|(idx, u)| crate::types::mana::UnitDecision {
                         pool_index: idx,
                         color: u.color,
-                        disposition: crate::types::mana::UnitDisposition::Drop,
+                        disposition: if keep_for_infinite_mana {
+                            crate::types::mana::UnitDisposition::Keep
+                        } else {
+                            crate::types::mana::UnitDisposition::Drop
+                        },
                     })
                     .collect()
             })
@@ -335,34 +523,218 @@ fn finish_enter_phase(state: &mut GameState, next: Phase, events: &mut Vec<GameE
         player.cards_drawn_this_step = 0;
     }
 
+    // CR 723.2 + CR 511.3 + CR 506.7d (by analogy): phase-scoped ("next combat
+    // phase") player control (Secret of Bloodbending). RELEASE runs BEFORE
+    // ACTIVATE so a back-to-back extra combat phase (CR 500.8) releases the FIRST
+    // phase's control before we correctly decline to rebind it — "next combat
+    // phase" is the FIRST only (CR 506.7d applies to spell-casting timing; cited
+    // here by analogy for the control window). The bound combat phase is over on
+    // entry to any phase that is NOT a later step of it: a fresh BeginCombat (new
+    // combat phase) or any non-combat phase (CR 511.3 → PostCombatMain, or
+    // CR 724.1d → Cleanup on an ended turn).
+    if state.turn_decision_controller.is_some() && (next == Phase::BeginCombat || !next.is_combat())
+    {
+        let active_key =
+            super::topology::normalize_shared_turn_recipient(state, state.active_player);
+        if let Some(idx) = state.scheduled_turn_controls.iter().position(|scheduled| {
+            scheduled.window == ControlWindow::NextCombatPhase
+                && Some(scheduled.controller) == state.turn_decision_controller
+                && scheduled.target_player == active_key
+        }) {
+            turn_control::release_control_at(state, idx);
+        }
+    }
+    // CR 723.2 + CR 507: ACTIVATE — the affected player's next combat phase
+    // begins. CR 723.1b + Scryfall ruling 2025-10-02: the phase window carries to
+    // the next combat phase the affected player actually takes (a skipped combat
+    // never enters `finish_enter_phase(BeginCombat)`, so the entry persists).
+    if next == Phase::BeginCombat {
+        let active_key =
+            super::topology::normalize_shared_turn_recipient(state, state.active_player);
+        if let Some(scheduled) = state
+            .scheduled_turn_controls
+            .iter()
+            .rfind(|scheduled| {
+                scheduled.window == ControlWindow::NextCombatPhase
+                    && scheduled.target_player == active_key
+            })
+            .copied()
+        {
+            state.turn_decision_controller = Some(scheduled.controller);
+        }
+    }
+
     // CR 117.3a: Active player receives priority at the beginning of most steps and phases.
     state.priority_player = turn_control::turn_decision_maker(state);
-    state.priority_passes.clear();
-    state.priority_pass_count = 0;
+    priority::clear_priority_passes(state);
     state.players_attacked_this_step.clear();
     // CR 400.7: LKI persists within a step but is invalidated on step transition.
     state.lki_cache.clear();
+    // CR 607.2b + CR 603.10e: linked-exile LKI is likewise step-scoped — it only
+    // needs to outlive the resolution of the ability whose source just left.
+    state.linked_exile_lki.clear();
 
     events.push(GameEvent::PhaseChanged { phase: next });
+
+    // CR 904.9: Immediately after the archenemy's precombat main phase begins,
+    // they set the top scheme of their scheme deck in motion (a turn-based action
+    // that doesn't use the stack). No-op outside an Archenemy game, when the active
+    // player isn't the archenemy, or when the scheme deck is empty.
+    if next == Phase::PreCombatMain
+        && super::topology::archenemy(state) == Some(state.active_player)
+    {
+        crate::game::archenemy::set_in_motion(state, events);
+    }
+}
+
+/// CR 101.4 + CR 103.1 + CR 500.1 + CR 500.7 + CR 805.4: Display-only turn
+/// projection. Slot 0 is the current live turn representative; later slots are
+/// the next turns that would actually begin after extra turns, skipped turns,
+/// shared-team turns, and controlled-turn cleanup are considered.
+pub fn projected_turn_order(state: &GameState, max_slots: usize) -> Vec<PlayerId> {
+    if max_slots == 0 {
+        return Vec::new();
+    }
+
+    let mut scratch = state.clone();
+    let mut slots = vec![super::topology::normalize_shared_turn_recipient(
+        &scratch,
+        scratch.active_player,
+    )];
+    let skip_budget: usize = scratch
+        .turns_to_skip
+        .iter()
+        .map(|&count| count as usize)
+        .sum();
+    let attempt_cap = max_slots
+        .saturating_add(skip_budget)
+        .saturating_add(scratch.extra_turns.len())
+        .saturating_add(scratch.scheduled_turn_controls.len().saturating_mul(2))
+        .saturating_add(16);
+    let mut attempts = 0usize;
+
+    while slots.len() < max_slots && attempts < attempt_cap {
+        attempts += 1;
+
+        let completed_player = scratch.active_player;
+        let completed_turn_key =
+            super::topology::normalize_shared_turn_recipient(&scratch, completed_player);
+        if scratch.turn_decision_controller.is_some() {
+            let completed_controller = scratch.turn_decision_controller;
+            let mut grant_extra_turn_after = false;
+            // CR 614.10a + CR 723.1: "next turn" control releases when that
+            // controlled turn is complete; any granted follow-up extra turn is
+            // scheduled before the next turn is selected.
+            while let Some(idx) = scratch
+                .scheduled_turn_controls
+                .iter()
+                .position(|scheduled| {
+                    scheduled.window == ControlWindow::NextTurn
+                        && scheduled.target_player == completed_turn_key
+                })
+            {
+                let entry = scratch.scheduled_turn_controls.remove(idx);
+                if Some(entry.controller) == completed_controller {
+                    grant_extra_turn_after |= entry.grant_extra_turn_after;
+                }
+            }
+            if grant_extra_turn_after {
+                scratch.extra_turns.push(completed_player);
+            }
+            scratch.turn_decision_controller = None;
+        }
+
+        scratch.turn_number += 1;
+
+        // CR 500.7: extra turns are LIFO; otherwise walk current turn order.
+        let is_extra_turn = if let Some(extra_turn_player) = scratch.extra_turns.pop() {
+            scratch.active_player =
+                super::topology::normalize_shared_turn_recipient(&scratch, extra_turn_player);
+            true
+        } else {
+            scratch.active_player =
+                super::topology::next_turn_representative(&scratch, scratch.active_player);
+            false
+        };
+
+        // CR 614.10: a skipped turn never emits a display slot. Leave the
+        // cursor on the skipped would-be active player so the next attempt
+        // mirrors `start_next_turn` recursion.
+        let skip_player =
+            super::topology::normalize_shared_turn_recipient(&scratch, scratch.active_player);
+        let idx = skip_player.0 as usize;
+        if idx < scratch.turns_to_skip.len() && scratch.turns_to_skip[idx] > 0 {
+            scratch.turns_to_skip[idx] -= 1;
+            continue;
+        }
+
+        // CR 614.1b + CR 614.10: condition-gated skip replacements can prevent
+        // the turn before it starts. This is a read-only probe; no replacement
+        // state or event log is mutated for the source state.
+        if replacement::begin_turn_would_be_prevented(
+            &scratch,
+            scratch.active_player,
+            is_extra_turn,
+        ) {
+            continue;
+        }
+
+        slots.push(scratch.active_player);
+
+        // CR 723.1: activate a full-turn control only after a non-skipped turn
+        // actually begins. Newest matching scheduled control wins.
+        let active_turn_key =
+            super::topology::normalize_shared_turn_recipient(&scratch, scratch.active_player);
+        scratch.turn_decision_controller = scratch
+            .scheduled_turn_controls
+            .iter()
+            .rfind(|scheduled| {
+                scheduled.window == ControlWindow::NextTurn
+                    && scheduled.target_player == active_turn_key
+            })
+            .map(|scheduled| scheduled.controller);
+    }
+
+    slots
 }
 
 /// Begin the next player's turn (CR 500.1 / CR 101.4 seat order).
 pub fn start_next_turn(state: &mut GameState, events: &mut Vec<GameEvent>) {
+    // CR 805.4b: defensively drop any stale draw-step queue entries. The
+    // queue is normally drained to empty before a turn ends, but a turn
+    // ended early (e.g. `Effect::EndTheTurn` — Time Stop, Obeka) could in
+    // principle leave it non-empty; without this it would be wrongly
+    // resumed at the START of the next turn's Draw step instead of being
+    // re-seeded for the new active player.
+    state.pending_team_draw_step.clear();
+
     let completed_player = state.active_player;
+    let completed_turn_key =
+        super::topology::normalize_shared_turn_recipient(state, completed_player);
     if state.turn_decision_controller.is_some() {
+        let completed_controller = state.turn_decision_controller;
         let mut grant_extra_turn_after = false;
-        state.scheduled_turn_controls.retain(|scheduled| {
-            if scheduled.target_player != completed_player {
-                return true;
+        // CR 723.1: A full-turn (NextTurn) control ends at the boundary of the
+        // turn it governed — route every removal through the single release
+        // authority. CR 723.1b: a NextCombatPhase entry for this player is LEFT
+        // IN PLACE (it binds to a combat phase, not a turn, and carries until the
+        // player actually takes a combat phase). The resolver dedups to ≤1 entry
+        // per target (CR 723.1a); the loop preserves the legacy retain semantics.
+        while let Some(idx) = state.scheduled_turn_controls.iter().position(|scheduled| {
+            scheduled.window == ControlWindow::NextTurn
+                && scheduled.target_player == completed_turn_key
+        }) {
+            let entry = turn_control::release_control_at(state, idx);
+            if Some(entry.controller) == completed_controller {
+                grant_extra_turn_after |= entry.grant_extra_turn_after;
             }
-            if Some(scheduled.controller) == state.turn_decision_controller {
-                grant_extra_turn_after |= scheduled.grant_extra_turn_after;
-            }
-            false
-        });
+        }
         if grant_extra_turn_after {
             state.extra_turns.push(completed_player);
         }
+        // CR 723.1: the completed controlled turn's controller is done. A carried
+        // NextCombatPhase control never reaches here (its controller is None until
+        // its own BeginCombat), so clearing unconditionally is safe.
         state.turn_decision_controller = None;
     }
 
@@ -373,17 +745,19 @@ pub fn start_next_turn(state: &mut GameState, events: &mut Vec<GameEvent>) {
     // in APNAP order). `is_extra_turn` flows into the replacement pipeline so
     // condition-gated skip effects (e.g., Stranglehold) can observe it.
     let is_extra_turn = if let Some(extra_turn_player) = state.extra_turns.pop() {
-        state.active_player = extra_turn_player;
+        state.active_player =
+            super::topology::normalize_shared_turn_recipient(state, extra_turn_player);
         true
     } else {
-        state.active_player = super::players::next_player(state, state.active_player);
+        state.active_player = super::topology::next_turn_representative(state, state.active_player);
         false
     };
 
     // CR 614.10: Simple turn-skip counter (effect-based, e.g., Meditate, Eater of
     // Days). This is a fast path for "you skip your next turn" that doesn't need
     // the replacement pipeline — there's no event-context predicate to evaluate.
-    let idx = state.active_player.0 as usize;
+    let skip_player = super::topology::normalize_shared_turn_recipient(state, state.active_player);
+    let idx = skip_player.0 as usize;
     if idx < state.turns_to_skip.len() && state.turns_to_skip[idx] > 0 {
         state.turns_to_skip[idx] -= 1;
         // Recursively start the next turn (skipping this one entirely).
@@ -417,11 +791,33 @@ pub fn start_next_turn(state: &mut GameState, events: &mut Vec<GameEvent>) {
 
     // CR 500: Track per-player turn count for "your Nth turn of the game" conditions.
     state.players[state.active_player.0 as usize].turns_taken += 1;
+    // CR 613.4a + CR 604.3: `turns_taken` is a layer-7a characteristic-defining
+    // input (Control Win Condition: "power and toughness are each equal to the
+    // number of turns you've taken this game", `QuantityRef::TurnsTaken`). Advancing
+    // the count changes that CDA's derived P/T, so the layer cache must be
+    // invalidated here — otherwise a clean cache would keep the stale value until an
+    // unrelated effect happens to dirty it. Mirrors the counter-ledger expiry
+    // invalidation below; unconditional because the increment always changes state.
+    state.layers_dirty.mark_full();
 
+    // CR 311.5 / CR 312.4 / CR 901.6: the planar controller is normally whoever
+    // the active player is. The turn has committed here (past both turn-skip
+    // early-returns above), so `active_player` is final for this invocation —
+    // sync the planar controller (and the active plane's `.controller`) to it.
+    // No-op outside a Planechase game.
+    crate::game::planechase::set_planar_controller(state, state.active_player, events);
+
+    // CR 723.1: activate a full-turn control when its target begins their turn.
+    // A NextCombatPhase entry is NOT activated here — it binds at the target's
+    // next BeginCombat (CR 723.2), handled in `finish_enter_phase`.
     if let Some(scheduled) = state
         .scheduled_turn_controls
         .iter()
-        .rfind(|scheduled| scheduled.target_player == state.active_player)
+        .rfind(|scheduled| {
+            scheduled.window == ControlWindow::NextTurn
+                && scheduled.target_player
+                    == super::topology::normalize_shared_turn_recipient(state, state.active_player)
+        })
         .copied()
     {
         state.turn_decision_controller = Some(scheduled.controller);
@@ -429,18 +825,20 @@ pub fn start_next_turn(state: &mut GameState, events: &mut Vec<GameEvent>) {
 
     // Reset priority
     state.priority_player = turn_control::turn_decision_maker(state);
-    state.priority_passes.clear();
-    state.priority_pass_count = 0;
+    priority::clear_priority_passes(state);
 
     // Reset per-turn counters
     // CR 305.2: Reset per-turn land play count.
     state.lands_played_this_turn = 0;
+    // CR 901.9 / CR 116.2i: planar die special-action costs reset each turn.
+    state.planar_die_actions_this_turn.clear();
     // CR 603.4: Snapshot spell count for werewolf "last turn" conditions before resetting.
     state.spells_cast_last_turn = Some(state.spells_cast_this_turn);
     // CR 500.1: Reset per-turn spell cast counters.
     state.spells_cast_this_turn = 0;
     state.triggers_fired_this_turn.clear();
     state.trigger_fire_counts_this_turn.clear();
+    state.triggers_fired_this_turn_per_opponent.clear();
     state.activated_abilities_this_turn.clear();
     // CR 602.5b: "Activate only once each turn" crew restriction resets each turn.
     state.crew_activated_this_turn.clear();
@@ -457,6 +855,9 @@ pub fn start_next_turn(state: &mut GameState, events: &mut Vec<GameEvent>) {
     // to the same turn, so both maps clear together at turn start.
     state.loyalty_abilities_activated_this_turn.clear();
     state.extra_loyalty_activations_this_turn.clear();
+    // CR 701.43d: the "exerted this turn" record gates the linked "when you do"
+    // trigger to once per turn; reset it alongside the other per-turn trackers.
+    state.exerted_this_turn.clear();
     // CR 514 + CR 603.4: Per-ability per-turn resolution counter resets at turn
     // boundary alongside other "this turn" trackers (mirrors the cleanup of
     // `trigger_fire_counts_this_turn`).
@@ -468,6 +869,17 @@ pub fn start_next_turn(state: &mut GameState, events: &mut Vec<GameEvent>) {
     state.hand_cast_free_permissions_used.clear();
     // CR 601.2a: Reset per-turn PlayFromExile source usage (Evelyn-style permissions).
     state.exile_play_permissions_used.clear();
+    // CR 601.2a + CR 113.6b: Reset per-turn ExileCastPermission once-per-turn
+    // tracking (Maralen, Fae Ascendant) and the rolling list of cards exiled
+    // with each tracked source this turn. Both are turn-scoped slices; the
+    // persistent `exile_links` pool is untouched and continues to back the
+    // open-ended "cards exiled with ~" filter for sources without a per-turn
+    // cap.
+    state.exile_cast_permissions_used.clear();
+    // CR 601.2a + CR 401.5: Reset per-turn TopOfLibraryCastPermission
+    // once-per-turn tracking (Assemble the Players, Johann, Apprentice Sorcerer).
+    state.top_of_library_cast_permissions_used.clear();
+    state.cards_exiled_with_source_this_turn.clear();
     // CR 702.94a: Reset per-player first-card-drawn-this-turn tracking for miracle.
     state.first_card_drawn_this_turn.clear();
     state.cards_drawn_this_turn.clear();
@@ -477,26 +889,78 @@ pub fn start_next_turn(state: &mut GameState, events: &mut Vec<GameEvent>) {
     // a card drawn last turn.
     state.pending_miracle_offers.clear();
     state.spells_cast_this_turn_by_player.clear();
+    state.lands_played_this_turn_by_player.clear();
     state.players_who_searched_library_this_turn.clear();
     state.player_actions_this_turn.clear();
     state.players_attacked_this_step.clear();
     state.players_attacked_this_turn.clear();
     state.attacking_creatures_this_turn.clear();
+    state.attacked_defenders_this_turn.clear();
+    state.creature_attacked_defenders_this_turn.clear();
     state.combat_phases_started_this_turn = 0;
+    // CR 614.10 + CR 614.10a + CR 500.11: A turn-scoped combat skip that was
+    // bound (`active`) to this player's PREVIOUS (now-ended) turn is satisfied —
+    // release the binding so this new turn has normal combat unless another
+    // pending skip rebinds below. `idx` is the player whose turn is beginning.
+    // Only the `active` binding is cleared — any still-`pending` skips have not
+    // yet bound to a turn and must survive (CR 614.10a: the second of two stacked
+    // skips waits for the next occurrence), to be promoted below if this turn
+    // isn't itself skipped.
+    if let Some(slot) = state.combat_phase_skip_next_turn.get_mut(idx) {
+        slot.active = false;
+    }
+    state.end_steps_started_this_turn = 0;
     state.creatures_attacked_this_turn.clear();
+    state.attacker_declarations_this_turn.clear();
     state.creatures_blocked_this_turn.clear();
     state.players_who_created_token_this_turn.clear();
     state.created_tokens_this_turn.clear();
+    // CR 122.6 + CR 514.2: The `counter_added_this_turn` ledger backs the
+    // turn-scoped `CountersPutOnThisTurn` filter predicate (CR 122.6 look-back),
+    // which feeds continuous statics such as Kid Loki's hexproof grant. Those
+    // "this turn" effects end at cleanup (CR 514.2), so clearing the ledger
+    // changes layer-relevant state. Route the expiry through the layer
+    // invalidation authority — mirroring the turn-boundary continuous-effect
+    // prunes (`prune_until_next_turn_effects`) — guarded on a non-empty ledger so
+    // we only invalidate when something actually depended on it; otherwise a
+    // static that gained a keyword from a counter placed last turn stays cached.
+    if !state.counter_added_this_turn.is_empty() {
+        state.layers_dirty.mark_full();
+    }
     state.counter_added_this_turn.clear();
     state.players_who_discarded_card_this_turn.clear();
     state.cards_discarded_this_turn_by_player.clear();
     state.players_who_sacrificed_artifact_this_turn.clear();
     state.sacrificed_permanents_this_turn.clear();
     state.zone_changes_this_turn.clear();
+    state.batched_zone_change_trigger_fired.clear();
     state.battlefield_entries_this_turn.clear();
+    // CR 701.26 + CR 603.4: reset per-object tap counts so "first time it became
+    // tapped this turn" intervening-ifs start fresh each turn.
+    state.object_tap_count_this_turn.clear();
     state.damage_dealt_this_turn.clear();
+    // CR 702.173a + CR 514: Clear the Freerunning eligibility ledger at
+    // cleanup. CR 702.173a's "was dealt combat damage this turn" predicate
+    // is turn-scoped, so the ledger must reset on the turn boundary.
+    state
+        .assassin_or_commander_dealt_combat_damage_this_turn
+        .clear();
+    // CR 702.76a + CR 514: Clear the Prowl creature-type ledger at cleanup — its
+    // "was dealt combat damage this turn" predicate is turn-scoped too.
+    state.creature_types_dealt_combat_damage_this_turn.clear();
     // CR 500.8: Clear any leftover extra phases from the previous turn.
     state.extra_phases.clear();
+    // CR 500.8 + CR 501.1: inserted-beginning-phase resume anchors are per-turn
+    // state; clear them on the turn boundary. (Note: `turn_direction` is durable
+    // and is deliberately NOT reset here — CR 103.1.)
+    state.extra_phase_resume.clear();
+    // CR 511.3 / CR 724.1d: Defensive reset of any combat attacker restriction
+    // that may not have been cleared via the normal EndCombat or EndTheTurn
+    // path (e.g., edge cases in ruleset extensions). The authoritative clear is
+    // in Phase::EndCombat and end_turn_to_cleanup; this is the belt-and-suspenders
+    // reset so stale restrictions never survive across turn boundaries.
+    state.current_combat_attacker_restriction = None;
+    state.current_combat_attacker_restriction_source = None;
     // CR 700.14: Reset cumulative mana spent on spells for Expend triggers.
     state.mana_spent_on_spells_this_turn.clear();
     // CR 601.2f: Clear one-shot cost reductions and spell modifiers from the previous turn.
@@ -524,6 +988,21 @@ pub fn start_next_turn(state: &mut GameState, events: &mut Vec<GameEvent>) {
         player.bending_types_this_turn.clear();
     }
 
+    // CR 614.10 + CR 614.10a + CR 500.11: Bind one pending turn-scoped combat
+    // skip to this turn now that the active player's first non-skipped turn has
+    // actually begun. This runs AFTER the per-turn reset region (so the `active`
+    // flag it sets is not immediately re-cleared) and AFTER the `turns_to_skip`
+    // fast-path early-return above (so per CR 614.10a the skip binds only to a
+    // turn that isn't itself skipped). Consume one `pending` skip and mark the
+    // turn `active`; any remaining pending skips wait for subsequent turns. While
+    // `active`, the replacement layer prevents every combat phase of this turn.
+    if let Some(slot) = state.combat_phase_skip_next_turn.get_mut(idx) {
+        if slot.pending > 0 {
+            slot.pending -= 1;
+            slot.active = true;
+        }
+    }
+
     // CR 302.6: At the start of a player's turn, any permanent they have
     // controlled continuously since before this moment has now been under
     // their control "since that player's most recent turn began" — clear
@@ -535,10 +1014,21 @@ pub fn start_next_turn(state: &mut GameState, events: &mut Vec<GameEvent>) {
         }
     }
 
-    // Clear all UntilEndOfTurn flags — no auto-pass survives a turn boundary.
-    state
-        .auto_pass
-        .retain(|_, mode| !matches!(mode, AutoPassMode::UntilEndOfTurn));
+    // CR 102.1 + CR 500.1: resolve each auto-pass boundary against the turn now
+    // beginning. EndOfCurrentTurn clears at every turn start (its turn has
+    // ended); MyNextTurnStart persists through opponents' turns and clears only
+    // when the session owner's own next turn begins (active == owner).
+    // UntilStackEmpty is turn-agnostic and untouched. If the owner's next turn
+    // is skipped (the `turns_to_skip` fast-path returns before this point),
+    // MyNextTurnStart clears at the next non-skipped turn start — matching how
+    // EndOfCurrentTurn already interacts with skips.
+    state.auto_pass.retain(|&pid, mode| match mode {
+        AutoPassMode::UntilStackEmpty { .. } => true,
+        AutoPassMode::UntilTurnBoundary { until } => match *until {
+            TurnBoundary::EndOfCurrentTurn => false,
+            TurnBoundary::MyNextTurnStart => pid != active,
+        },
+    });
 
     events.push(GameEvent::TurnStarted {
         player_id: state.active_player,
@@ -552,6 +1042,38 @@ pub fn start_next_turn(state: &mut GameState, events: &mut Vec<GameEvent>) {
 /// skipped — callers must gate this whole function on `should_skip_step`.
 pub fn execute_untap(state: &mut GameState, events: &mut Vec<GameEvent>) {
     execute_untap_with_choices(state, events, &HashSet::new());
+}
+
+/// CR 502.3: Bridge between the optional-decline prompt (`UntapChoice`) and the
+/// untap turn-based action. Given the permanents the player has chosen not to
+/// untap so far, this checks for a `MaxUntapPerType` cap whose eligible group
+/// still exceeds its limit. If one exists, it raises
+/// `WaitingFor::ChooseUntapSubset` so the active player directly determines
+/// which `max` permanents untap (CR 502.3); otherwise it performs the untap
+/// with the recorded declines and advances the phase. The caller continues
+/// `auto_advance` only when this returns `None` (no subset prompt raised).
+///
+/// Returns `Some(prompt)` if a bounded-subset selection is now pending, `None`
+/// if the untap already executed and the phase advanced.
+pub fn begin_untap_or_subset_prompt(
+    state: &mut GameState,
+    events: &mut Vec<GameEvent>,
+    chosen_not_to_untap: HashSet<ObjectId>,
+) -> Option<WaitingFor> {
+    let active = state.active_player;
+    if let Some((group, max)) = max_untap_subset_prompt(state, active, &chosen_not_to_untap) {
+        // Persist the declines so the subset resolution can fold the unchosen
+        // complement in alongside them when it finally executes the untap.
+        state.pending_untap_declines = chosen_not_to_untap.into_iter().collect();
+        return Some(WaitingFor::ChooseUntapSubset {
+            player: active,
+            group,
+            max,
+        });
+    }
+    execute_untap_with_choices(state, events, &chosen_not_to_untap);
+    advance_phase(state, events);
+    None
 }
 
 pub fn execute_untap_with_choices(
@@ -585,6 +1107,25 @@ pub fn execute_untap_with_choices(
     state.pending_damage_replacements.retain(|r| {
         !matches!(r.expiry, Some(RestrictionExpiry::UntilPlayerNextTurn { player }) if player == active)
     });
+    // CR 514.2 + CR 500.7: Arm "until the end of the player's next turn"
+    // restrictions (Kang's power-up prohibition) when that player's next turn
+    // begins — convert to `EndOfTurn` so the cleanup-step prune (`execute_cleanup`)
+    // ends them at THIS turn's cleanup, persisting through the whole turn.
+    // Mirrors `prune_until_next_turn_effects` (layers.rs). NOTE: if the granted
+    // turn is SKIPPED/PREVENTED before its untap step, this conversion never runs
+    // and the restriction is never armed/pruned — a documented narrow edge shared
+    // with the analogous `Duration::UntilEndOfNextTurnOf` arming.
+    {
+        use crate::types::ability::GameRestriction;
+        for restriction in state.restrictions.iter_mut() {
+            if let GameRestriction::ProhibitActivity { expiry, .. } = restriction {
+                if matches!(expiry, RestrictionExpiry::UntilEndOfNextTurnOf { player } if *player == active)
+                {
+                    *expiry = RestrictionExpiry::EndOfTurn;
+                }
+            }
+        }
+    }
     state.restrictions.retain(|restriction| {
         use crate::types::ability::GameRestriction;
 
@@ -592,7 +1133,10 @@ pub fn execute_untap_with_choices(
             GameRestriction::ProhibitActivity { expiry, .. } => {
                 !matches!(expiry, RestrictionExpiry::UntilPlayerNextTurn { player } if *player == active)
             }
-            GameRestriction::DamagePreventionDisabled { .. } => true,
+            // Not untap-anchored — CantEnterBattlefieldFrom expires at cleanup
+            // (CR 514.2), handled in the end-of-turn retain below.
+            GameRestriction::DamagePreventionDisabled { .. }
+            | GameRestriction::CantEnterBattlefieldFrom { .. } => true,
         }
     });
 
@@ -621,32 +1165,64 @@ pub fn execute_untap_with_choices(
         })
         .collect();
 
-    // CR 302.6: Also check intrinsic CantUntap statics on objects
-    // (permanent "doesn't untap" from auras/enchantments).
+    // CR 502.3 + CR 604.1: Also check permanent-sourced CantUntap statics
+    // (including attached-subject Aura restrictions) AND filter-scoped transient
+    // CantUntap (CR 611.1 — a spell/effect that installs "creatures don't untap
+    // …" by typed/filter target). The `cant_untap_ids` set above only catches
+    // SpecificObject transients; this loop covers the printed-static and
+    // filter-scoped-transient classes so the actual untap agrees with the
+    // cap-prompt group built by `untap_excluded_ids`.
+    // CR 502.3 + CR 604.1: hoist the CantUntap existence gate once before the
+    // per-permanent scan so the O(N) `check_static_ability` re-scan is skipped
+    // for every permanent when no functioning CantUntap static exists
+    // (O(N^2) -> O(N) on the every-turn untap step).
+    let has_cant_untap_static = static_kind_present(state, StaticModeKind::CantUntap);
     let intrinsic_cant_untap: HashSet<ObjectId> = state
         .battlefield
         .iter()
         .copied()
         .filter(|id| {
-            state.objects.get(id).is_some_and(|obj| {
-                // CR 702.26b + CR 604.1: `active_static_definitions` owns the gating.
-                obj.controller == active
-                    && super::functioning_abilities::active_static_definitions(state, obj).any(
-                        |sd| {
-                            sd.mode == StaticMode::CantUntap
-                                && super::static_abilities::check_static_ability(
-                                    state,
-                                    StaticMode::CantUntap,
-                                    &super::static_abilities::StaticCheckContext {
-                                        target_id: Some(*id),
-                                        ..Default::default()
-                                    },
-                                )
+            state
+                .objects
+                .get(id)
+                .is_some_and(|obj| obj.controller == active)
+                && ((has_cant_untap_static
+                    && super::static_abilities::check_static_ability(
+                        state,
+                        StaticMode::CantUntap,
+                        &super::static_abilities::StaticCheckContext {
+                            target_id: Some(*id),
+                            ..Default::default()
                         },
-                    )
-            })
+                    ))
+                    || super::static_abilities::transient_grants_static_mode_to_object(
+                        state,
+                        *id,
+                        &StaticMode::CantUntap,
+                    ))
         })
         .collect();
+
+    // CR 502.3: Apply `MaxUntapPerType` caps (Smoke / Damping Field / Winter Orb).
+    // Each cap holds excess matching permanents tapped. The player's declines
+    // (and CantUntap) already reduce each group; the cap then forces any
+    // remaining excess beyond `max` to stay tapped, in deterministic order. This
+    // is the authoritative enforcement: it holds whether or not the player was
+    // prompted to determine which untap (AI / auto-play paths may not decline).
+    let mut max_untap_skipped: HashSet<ObjectId> = HashSet::new();
+    let restrictions = max_untap_restrictions(state);
+    if !restrictions.is_empty() {
+        let mut already_skipped: HashSet<ObjectId> = HashSet::new();
+        already_skipped.extend(chosen_not_to_untap.iter().copied());
+        already_skipped.extend(cant_untap_ids.iter().copied());
+        already_skipped.extend(intrinsic_cant_untap.iter().copied());
+        for (filter, max) in &restrictions {
+            for id in max_untap_excess(state, active, filter, *max, &already_skipped) {
+                already_skipped.insert(id);
+                max_untap_skipped.insert(id);
+            }
+        }
+    }
 
     let to_untap: Vec<_> = state
         .battlefield
@@ -662,10 +1238,12 @@ pub fn execute_untap_with_choices(
         .collect();
 
     for id in to_untap {
-        // CR 502.3: Skip permanents that have CantUntap (transient or intrinsic).
+        // CR 502.3: Skip permanents that have CantUntap (transient or intrinsic)
+        // or are held tapped by a MaxUntapPerType cap.
         if chosen_not_to_untap.contains(&id)
             || cant_untap_ids.contains(&id)
             || intrinsic_cant_untap.contains(&id)
+            || max_untap_skipped.contains(&id)
         {
             continue;
         }
@@ -730,6 +1308,47 @@ pub fn execute_untap_with_choices(
     super::layers::prune_controller_untap_step_effects(state, active);
 }
 
+/// CR 502.3: Collect the active `MaxUntapPerType` restrictions (Smoke /
+/// Damping Field / Winter Orb class). Each governs the untap turn-based action
+/// globally for the active player, so the source's controller is irrelevant —
+/// any live source contributes its `(filter, max)` cap. Returns `(filter, max)`
+/// pairs cloned out of the statics so the caller can mutate `state` afterward.
+fn max_untap_restrictions(state: &GameState) -> Vec<(crate::types::ability::TargetFilter, u32)> {
+    super::functioning_abilities::battlefield_active_statics(state)
+        .filter_map(|(_, def)| match &def.mode {
+            StaticMode::MaxUntapPerType { filter, max } => Some((filter.clone(), *max)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// CR 502.3 SAFETY NET: For a single `MaxUntapPerType { filter, max }` cap,
+/// determine which of `player`'s tapped permanents matching `filter` must be
+/// held tapped because the cap would otherwise be exceeded. With the bounded
+/// subset selection (`WaitingFor::ChooseUntapSubset`) in place, the player's /
+/// AI's chosen complement is already folded into `already_skipped`, so this
+/// clamp should normally find nothing to skip. It is retained purely as a
+/// safety net: if a caller reaches `execute_untap_with_choices` without having
+/// resolved the subset prompt (a malformed selection, a future direct caller),
+/// the cap is still enforced in deterministic battlefield order rather than
+/// silently over-untapping past the CR 502.3 limit.
+fn max_untap_excess(
+    state: &GameState,
+    player: PlayerId,
+    filter: &crate::types::ability::TargetFilter,
+    max: u32,
+    already_skipped: &HashSet<ObjectId>,
+) -> Vec<ObjectId> {
+    let matching =
+        max_untap_eligible_group(state, player, filter, already_skipped, &HashSet::new());
+    matching.into_iter().skip(max as usize).collect()
+}
+
+/// CR 502.3: Candidates for the per-permanent optional-decline prompt
+/// (`WaitingFor::UntapChoice`). This is the "you may choose not to untap"
+/// Vedalken Shackles / Stoic Angel-tap class only — `StaticMode::MayChooseNotToUntap`.
+/// `MaxUntapPerType` caps are a SEPARATE decision (a required bounded subset
+/// selection) surfaced by [`max_untap_subset_prompt`], not folded in here.
 pub fn untap_choice_candidates(state: &GameState, player: PlayerId) -> Vec<ObjectId> {
     state
         .battlefield
@@ -753,6 +1372,140 @@ pub fn untap_choice_candidates(state: &GameState, player: PlayerId) -> Vec<Objec
                         },
                     )
             })
+        })
+        .collect()
+}
+
+/// CR 502.3: "the active player determines which permanents they control will
+/// untap." Compute the bounded-subset prompt for the FIRST `MaxUntapPerType`
+/// cap (Smoke / Stoic Angel / Damping Field / Winter Orb class) whose eligible
+/// group exceeds its cap, given the permanents already staying tapped
+/// (`chosen_not_to_untap` from the decline prompt, plus CantUntap). Returns the
+/// over-cap `group` and `max` so the engine raises `WaitingFor::ChooseUntapSubset`,
+/// making the player/AI directly select which `max` untap — NOT a deterministic
+/// excess-skip. Returns `None` when every cap's eligible group is at or under
+/// its cap (no choice needed).
+///
+/// Only the first over-cap cap is surfaced per call; after the player resolves
+/// it, the chosen complement folds into `chosen_not_to_untap` and the next cap
+/// (if any) is surfaced on the following pass, so stacked caps of different
+/// types each get their own player determination.
+pub fn max_untap_subset_prompt(
+    state: &GameState,
+    player: PlayerId,
+    chosen_not_to_untap: &HashSet<ObjectId>,
+) -> Option<(Vec<ObjectId>, usize)> {
+    // CR 502.3: with no `MaxUntapPerType` cap in play there is nothing to prompt,
+    // so bail before the O(N) `untap_excluded_ids` CantUntap scan — the common
+    // every-turn case has no cap and would otherwise pay for a scan whose result
+    // is discarded.
+    if max_untap_restrictions(state).is_empty() {
+        return None;
+    }
+    let cant_untap = untap_excluded_ids(state, player);
+    for (filter, max) in max_untap_restrictions(state) {
+        let group =
+            max_untap_eligible_group(state, player, &filter, chosen_not_to_untap, &cant_untap);
+        if group.len() > max as usize {
+            return Some((group, max as usize));
+        }
+    }
+    None
+}
+
+/// CR 502.3: Permanents the active player controls that cannot untap regardless
+/// of any cap decision (transient or intrinsic `CantUntap`). Surfacing these in
+/// a max-untap choice would be misleading — the player cannot select them to
+/// untap — so they are excluded from both the prompt group and the cap math.
+fn untap_excluded_ids(state: &GameState, player: PlayerId) -> HashSet<ObjectId> {
+    use crate::types::ability::ContinuousModification;
+    let mut excluded: HashSet<ObjectId> = state
+        .transient_continuous_effects
+        .iter()
+        .filter(|e| {
+            e.modifications.iter().any(|m| {
+                matches!(
+                    m,
+                    ContinuousModification::AddStaticMode {
+                        mode: StaticMode::CantUntap,
+                    }
+                )
+            })
+        })
+        .filter_map(|e| {
+            if let crate::types::ability::TargetFilter::SpecificObject { id } = &e.affected {
+                Some(*id)
+            } else {
+                None
+            }
+        })
+        .collect();
+    // CR 502.3 + CR 604.1: hoist the CantUntap existence gate once before the
+    // per-permanent scan (O(N^2) -> O(N) when no functioning CantUntap exists).
+    let has_cant_untap_static = static_kind_present(state, StaticModeKind::CantUntap);
+    for id in state.battlefield.iter().copied() {
+        let Some(obj) = state.objects.get(&id) else {
+            continue;
+        };
+        if obj.controller != player {
+            continue;
+        }
+        // CR 502.3 + CR 604.1: permanent-sourced printed/static CantUntap
+        // (including attached-subject Aura restrictions).
+        let intrinsic = has_cant_untap_static
+            && super::static_abilities::check_static_ability(
+                state,
+                StaticMode::CantUntap,
+                &super::static_abilities::StaticCheckContext {
+                    target_id: Some(id),
+                    ..Default::default()
+                },
+            );
+        // CR 502.3 + CR 611.1: filter-scoped transient CantUntap (a spell/effect
+        // installing "creatures don't untap …" by typed/filter target rather
+        // than a single SpecificObject). Build for the whole class so any such
+        // affected permanent is removed from the max-untap cap group and math —
+        // the exact-id SpecificObject case is already folded in above.
+        let transient_filtered = super::static_abilities::transient_grants_static_mode_to_object(
+            state,
+            id,
+            &StaticMode::CantUntap,
+        );
+        if intrinsic || transient_filtered {
+            excluded.insert(id);
+        }
+    }
+    excluded
+}
+
+/// CR 502.3: The active player's tapped permanents matching a single cap's
+/// `filter` that can still legally untap (not declined, not CantUntap). This is
+/// the set the player chooses among when over the cap.
+fn max_untap_eligible_group(
+    state: &GameState,
+    player: PlayerId,
+    filter: &crate::types::ability::TargetFilter,
+    chosen_not_to_untap: &HashSet<ObjectId>,
+    cant_untap: &HashSet<ObjectId>,
+) -> Vec<ObjectId> {
+    use crate::game::filter::{matches_target_filter, FilterContext};
+    // The max-untap filter is a printed type quality (creature / artifact /
+    // nonbasic land) with no controller-relative clause; ownership is enforced
+    // by the explicit `obj.controller == player` check below, so a neutral
+    // context is correct (CR 502.3 caps the active player's own permanents).
+    let ctx = FilterContext::neutral();
+    state
+        .battlefield
+        .iter()
+        .copied()
+        .filter(|id| {
+            state
+                .objects
+                .get(id)
+                .is_some_and(|obj| obj.controller == player && obj.tapped)
+                && !chosen_not_to_untap.contains(id)
+                && !cant_untap.contains(id)
+                && matches_target_filter(state, *id, filter, &ctx)
         })
         .collect()
 }
@@ -845,9 +1598,60 @@ fn execute_seedborn_statics(state: &mut GameState, events: &mut Vec<GameEvent>, 
 /// CR 504.1: During the draw step, the active player draws a card.
 /// CR 614.1a: Routes through the replacement pipeline so effects like Dredge apply.
 /// Returns `Some(WaitingFor)` if a replacement effect needs player interaction.
+/// CR 504.1: The active player's mandatory draw-step draw. CR 805.4b: under
+/// the shared team turns option, every player on the active team draws
+/// during the team's draw step — so the active player's teammate(s) also
+/// draw here.
+///
+/// Seeds `state.pending_team_draw_step` with the players who owe a draw
+/// THIS step (skipped if the queue is already non-empty — that means a
+/// caller is resuming a step that paused mid-draw, and re-seeding would
+/// redraw an already-completed player) and delegates to
+/// `drain_pending_team_draw_step`, the single authority for actually
+/// performing the queued draws. That function is also called directly by
+/// `handle_replacement_choice`'s resume epilogue, so a draw that pauses on a
+/// CR 616.1 competing-replacement choice still reaches every queued
+/// teammate once the choice resolves — this function only needs to run once
+/// per step, at first entry.
 pub fn execute_draw(state: &mut GameState, events: &mut Vec<GameEvent>) -> Option<WaitingFor> {
-    let active = state.active_player;
+    if state.pending_team_draw_step.is_empty() {
+        state.pending_team_draw_step.push(state.active_player);
+        if state.format_config.topology().has_shared_team_turns() {
+            state
+                .pending_team_draw_step
+                .extend(super::players::teammates(state, state.active_player));
+        }
+    }
+    drain_pending_team_draw_step(state, events)
+}
 
+/// CR 504.1 + CR 805.4b: Drain `state.pending_team_draw_step` front-to-back,
+/// performing each queued player's turn-based draw-step draw exactly once.
+///
+/// A draw that pauses on a CR 616.1 competing-replacement choice (`Some`
+/// returned) leaves its player at the FRONT of the queue — NOT popped — so
+/// the next call (from `handle_replacement_choice`'s epilogue, once the
+/// choice resolves) retries exactly that player's draw rather than skipping
+/// it or re-drawing a player who already completed. Only a fully completed
+/// draw (`None` from `execute_draw_for`) advances the queue.
+pub(crate) fn drain_pending_team_draw_step(
+    state: &mut GameState,
+    events: &mut Vec<GameEvent>,
+) -> Option<WaitingFor> {
+    while let Some(&player) = state.pending_team_draw_step.first() {
+        if let Some(wf) = execute_draw_for(state, player, events) {
+            return Some(wf);
+        }
+        state.pending_team_draw_step.remove(0);
+    }
+    None
+}
+
+fn execute_draw_for(
+    state: &mut GameState,
+    active: PlayerId,
+    events: &mut Vec<GameEvent>,
+) -> Option<WaitingFor> {
     // CR 121.1 + CR 614.1a + CR 614.6 + CR 704.3: Route through the
     // single-authority `draw_through_replacement` helper so post-replacement
     // continuations (Jace WinTheGame, Abundance reveal-until) drain in the
@@ -879,12 +1683,14 @@ pub fn execute_draw(state: &mut GameState, events: &mut Vec<GameEvent>) -> Optio
             };
             let allowed = crate::game::effects::draw::allowed_draw_count(state, player_id, count);
 
-            let cards_to_draw: Vec<_> = state
-                .players
-                .iter()
-                .find(|p| p.id == player_id)
-                .map(|p| p.library.iter().take(allowed as usize).copied().collect())
-                .unwrap_or_default();
+            // CR 121.1 + CR 613.11: route card selection through the single
+            // `select_cards_to_draw` authority so a `DrawFromBottom` static is
+            // honored on the turn-based draw step too.
+            let cards_to_draw = crate::game::effects::draw::select_cards_to_draw(
+                state,
+                player_id,
+                allowed as usize,
+            );
 
             // CR 704.5b: Attempting to draw from an empty library causes a game loss.
             if allowed > 0 && cards_to_draw.len() < allowed as usize {
@@ -929,6 +1735,69 @@ pub fn execute_draw(state: &mut GameState, events: &mut Vec<GameEvent>) -> Optio
     None
 }
 
+/// CR 514.2: Remove marked damage from every battlefield permanent as the
+/// cleanup-step turn-based action, EXCEPT permanents matched by an active
+/// "Damage isn't removed from [filter] during cleanup steps" static (Ancient
+/// Adamantoise, Patient Zero, Uthgardt Fury, …), whose marked damage persists
+/// across turns. Shared by both cleanup exits — the direct `execute_cleanup`
+/// (no discard) and the deferred `finish_cleanup_discard` (after the active
+/// player discards to maximum hand size) — so the protection holds on either
+/// path.
+fn clear_cleanup_damage(state: &mut GameState, events: &mut Vec<GameEvent>) {
+    // CR 514.2: An active "Damage isn't removed from [filter] during cleanup
+    // steps" static suppresses removal for the permanents it matches; gather
+    // that protected set first.
+    let damage_persists: HashSet<ObjectId> = {
+        let sources: Vec<(ObjectId, PlayerId, TargetFilter)> =
+            super::functioning_abilities::battlefield_active_statics(state)
+                .filter(|(_, def)| matches!(def.mode, StaticMode::DamageNotRemovedDuringCleanup))
+                .filter_map(|(obj, def)| {
+                    def.affected
+                        .as_ref()
+                        .map(|f| (obj.id, obj.controller, f.clone()))
+                })
+                .collect();
+
+        // CR 514.2 + CR 702.26b: removing marked damage is a turn-based cleanup
+        // action over the whole battlefield, including phased-out permanents — it
+        // is not targeting — so the protected membership is evaluated with the
+        // phased-out-aware matcher to mirror the unconditional removal below.
+        let mut protected = std::collections::HashSet::new();
+        for (source_id, source_controller, filter) in sources {
+            let ctx = FilterContext::from_source_with_controller(source_id, source_controller);
+            for id in state.battlefield.iter().copied() {
+                if matches_target_filter_including_phased_out(state, id, &filter, &ctx) {
+                    protected.insert(id);
+                }
+            }
+        }
+        protected
+    };
+
+    // CR 514.2: Damage on creatures is removed at cleanup.
+    let to_clear: Vec<_> = state
+        .battlefield
+        .iter()
+        .copied()
+        .filter(|id| !damage_persists.contains(id))
+        .filter(|id| {
+            state
+                .objects
+                .get(id)
+                .map(|obj| obj.damage_marked > 0)
+                .unwrap_or(false)
+        })
+        .collect();
+
+    for id in to_clear {
+        if let Some(obj) = state.objects.get_mut(&id) {
+            obj.damage_marked = 0;
+            obj.dealt_deathtouch_damage = false;
+            events.push(GameEvent::DamageCleared { object_id: id });
+        }
+    }
+}
+
 /// Execute the cleanup step. Returns `Some(WaitingFor)` if the player must
 /// choose which cards to discard down to maximum hand size, or `None` if
 /// cleanup completes immediately.
@@ -949,8 +1818,70 @@ pub fn execute_cleanup(state: &mut GameState, events: &mut Vec<GameEvent>) -> Op
         .pending_damage_replacements
         .retain(|r| !expires_at_eot(r));
 
+    // CR 514.2 + CR 613.1b: control-changing "until end of turn" effects end
+    // here. Snapshot the objects whose controller is about to revert so the
+    // reversion emits a `ControllerChanged` event, letting "when you lose
+    // control of that <permanent> this turn" delayed triggers (Stolen Uniform)
+    // observe the loss. The gain side already emits this event; the silent
+    // layer-2 revert did not, so the loss trigger could never fire.
+    let control_reverting: Vec<(ObjectId, PlayerId)> = state
+        .transient_continuous_effects
+        .iter()
+        .filter(|e| {
+            e.duration == crate::types::ability::Duration::UntilEndOfTurn
+                && e.modifications.iter().any(|m| {
+                    matches!(
+                        m,
+                        crate::types::ability::ContinuousModification::ChangeController
+                    )
+                })
+        })
+        .filter_map(|e| match &e.affected {
+            TargetFilter::SpecificObject { id } => {
+                state.objects.get(id).map(|o| (*id, o.controller))
+            }
+            _ => None,
+        })
+        .collect();
+
     // CR 514.2: Prune "until end of turn" transient continuous effects.
     super::layers::prune_end_of_turn_effects(state);
+
+    // CR 613.1b: recompute layer-2 control now the effect is gone, then emit the
+    // loss event for every object whose controller actually reverted.
+    if !control_reverting.is_empty() {
+        super::layers::flush_layers(state);
+        let mut seen_reverting = HashSet::new();
+        for (object_id, old_controller) in control_reverting {
+            if !seen_reverting.insert(object_id) {
+                continue;
+            }
+            if let Some(new_controller) = state.objects.get(&object_id).map(|o| o.controller) {
+                if new_controller != old_controller {
+                    events.push(GameEvent::ControllerChanged {
+                        object_id,
+                        old_controller,
+                        new_controller,
+                    });
+                }
+            }
+        }
+
+        // CR 514.3a: a triggered ability that triggers during cleanup (the
+        // "when you lose control ... this turn" reflexive) is put on the stack
+        // and the active player gets priority; another cleanup step begins once
+        // the stack empties. Fire delayed triggers on the loss event(s) BEFORE
+        // the stated-duration prune below can remove them, then hand back
+        // priority so the trigger resolves.
+        let stack_before = state.stack.len();
+        let delayed_events = super::triggers::check_delayed_triggers(state, events);
+        events.extend(delayed_events);
+        if state.stack.len() > stack_before {
+            return Some(WaitingFor::Priority {
+                player: state.active_player,
+            });
+        }
+    }
     // CR 514.2 + CR 611.2a: Expire `PlayFromExile` permissions whose duration
     // was `UntilEndOfTurn` (impulse-draw "you may play it this turn").
     super::layers::prune_end_of_turn_casting_permissions(state);
@@ -960,7 +1891,8 @@ pub fn execute_cleanup(state: &mut GameState, events: &mut Vec<GameEvent>) -> Op
         use crate::types::ability::{GameRestriction, RestrictionExpiry};
         match r {
             GameRestriction::DamagePreventionDisabled { expiry, .. }
-            | GameRestriction::ProhibitActivity { expiry, .. } => {
+            | GameRestriction::ProhibitActivity { expiry, .. }
+            | GameRestriction::CantEnterBattlefieldFrom { expiry, .. } => {
                 !matches!(expiry, RestrictionExpiry::EndOfTurn)
             }
         }
@@ -968,20 +1900,32 @@ pub fn execute_cleanup(state: &mut GameState, events: &mut Vec<GameEvent>) -> Op
 
     // CR 603.7b + CR 513.2: Remove "this turn" delayed triggers at cleanup.
     // WheneverEvent (multi-fire, one_shot=false) triggers persist until cleanup.
-    // WhenNextEvent (one-shot) triggers that didn't fire also expire — their
-    // "this turn" duration means they must not carry over to the next turn.
-    // Per CR 513.2 an unfired `AtNextPhase{End}` delayed trigger is NOT a
-    // "this turn" trigger: the end step "doesn't back up", so it legitimately
+    // A `WhenNextEvent` one-shot that didn't fire expires ONLY when its lifetime
+    // is `ThisTurn` (CR 603.7b "stated duration, such as 'this turn'") — its
+    // "this turn" duration means it must not carry over. A `Persistent`
+    // `WhenNextEvent` (CR 603.7b, no stated duration — open-ended re-entry, The
+    // Pandorica's "when ~ becomes untapped or leaves the battlefield") has NO
+    // "this turn" limit and must survive.
+    // Per CR 513.2 an unfired `AtNextPhase{End}` delayed trigger is likewise NOT
+    // a "this turn" trigger: the end step "doesn't back up", so it legitimately
     // persists to the next turn's end step — it must survive this retain.
     state.delayed_triggers.retain(|dt| {
         dt.one_shot
             && !matches!(
                 dt.condition,
-                crate::types::ability::DelayedTriggerCondition::WhenNextEvent { .. }
+                crate::types::ability::DelayedTriggerCondition::WhenNextEvent {
+                    // CR 603.7b + CR 603.12: both a stated-"this turn" one-shot and
+                    // any reflexive that (defensively) escaped its creation-batch
+                    // discard are bounded to the creating turn — prune at cleanup.
+                    lifetime: crate::types::ability::DelayedTriggerLifetime::ThisTurn
+                        | crate::types::ability::DelayedTriggerLifetime::Reflexive,
+                    ..
+                }
             )
     });
 
-    // CR 730.2: Check day/night transition at cleanup.
+    // CR 502.2 / CR 731.2: Check the prior active player's day/night transition
+    // before advancing the active player.
     day_night::check_day_night_transition(state, events);
 
     let active = state.active_player;
@@ -1019,34 +1963,19 @@ pub fn execute_cleanup(state: &mut GameState, events: &mut Vec<GameEvent>) -> Op
         }
     }
 
-    // CR 514.2: Damage on creatures is removed at cleanup.
-    let to_clear: Vec<_> = state
-        .battlefield
-        .iter()
-        .copied()
-        .filter(|id| {
-            state
-                .objects
-                .get(id)
-                .map(|obj| obj.damage_marked > 0)
-                .unwrap_or(false)
-        })
-        .collect();
-
-    for id in to_clear {
-        if let Some(obj) = state.objects.get_mut(&id) {
-            obj.damage_marked = 0;
-            obj.dealt_deathtouch_damage = false;
-            events.push(GameEvent::DamageCleared { object_id: id });
-        }
-    }
+    // CR 514.2: Remove cleanup damage, preserving any permanent protected by a
+    // "Damage isn't removed during cleanup steps" static (shared with the
+    // deferred discard path so the protection holds regardless of discard).
+    clear_cleanup_damage(state, events);
 
     // CR 702.171b: "Once a permanent has become saddled, it stays saddled until
     // the end of the turn or it leaves the battlefield." Clear the designation
     // at cleanup (CR 514).
     for obj in state.objects.iter_mut().map(|(_, v)| v) {
         if obj.is_saddled {
+            // CR 702.171b: the designation (and the saddling-creature record) ends at end of turn.
             obj.is_saddled = false;
+            obj.saddled_by.clear();
         }
     }
 
@@ -1144,27 +2073,11 @@ pub fn finish_cleanup_discard(
         }
     }
 
-    // Clear damage on all battlefield creatures (deferred from execute_cleanup)
-    let to_clear: Vec<_> = state
-        .battlefield
-        .iter()
-        .copied()
-        .filter(|id| {
-            state
-                .objects
-                .get(id)
-                .map(|obj| obj.damage_marked > 0)
-                .unwrap_or(false)
-        })
-        .collect();
-
-    for id in to_clear {
-        if let Some(obj) = state.objects.get_mut(&id) {
-            obj.damage_marked = 0;
-            obj.dealt_deathtouch_damage = false;
-            events.push(GameEvent::DamageCleared { object_id: id });
-        }
-    }
+    // CR 514.2: Clear cleanup damage deferred from execute_cleanup — through the
+    // same shared helper so a "Damage isn't removed during cleanup steps" static
+    // (Patient Zero, Ancient Adamantoise, …) still preserves protected marked
+    // damage even when the active player had to discard to maximum hand size.
+    clear_cleanup_damage(state, events);
     false
 }
 
@@ -1194,16 +2107,28 @@ pub fn should_skip_draw(state: &GameState) -> bool {
         || should_skip_step_static(state, Phase::Draw)
 }
 
-/// CR 614.1b + CR 614.10: Check whether the active player should skip the given step
-/// due to a "skip your [step] step" static ability on a permanent they control.
+/// CR 614.1b + CR 614.10: Check whether the active player should skip the given
+/// step due to a static step-skip replacement that affects them.
 fn should_skip_step_static(state: &GameState, step: Phase) -> bool {
     let active = state.active_player;
+    let context = super::static_abilities::StaticCheckContext {
+        player_id: Some(active),
+        ..Default::default()
+    };
     // CR 702.26b + CR 604.1: `active_static_definitions` owns the gating.
     state.battlefield.iter().any(|id| {
         state.objects.get(id).is_some_and(|obj| {
-            obj.controller == active
-                && super::functioning_abilities::active_static_definitions(state, obj)
-                    .any(|sd| sd.mode == StaticMode::SkipStep { step })
+            super::functioning_abilities::active_static_definitions(state, obj).any(|sd| {
+                if sd.mode != (StaticMode::SkipStep { step }) {
+                    return false;
+                }
+
+                if let Some(ref affected) = sd.affected {
+                    super::static_abilities::static_filter_matches(state, &context, affected, *id)
+                } else {
+                    obj.controller == active
+                }
+            })
         })
     })
 }
@@ -1232,9 +2157,9 @@ fn should_skip_step_now(state: &mut GameState, step: Phase) -> bool {
     should_skip_step_static(state, step) || consume_next_step_skip(state, step)
 }
 
-/// CR 714.3b: As the precombat main phase begins, put a lore counter on each Saga
+/// CR 714.3c: As the precombat main phase begins, put a lore counter on each Saga
 /// the active player controls. This is a turn-based action, not a triggered ability.
-fn add_lore_counters_to_sagas(state: &mut GameState, events: &mut Vec<GameEvent>) {
+fn add_lore_counters_to_sagas(state: &mut GameState, events: &mut Vec<GameEvent>) -> bool {
     let active = state.active_player;
     let saga_ids: Vec<_> = state
         .battlefield
@@ -1252,26 +2177,77 @@ fn add_lore_counters_to_sagas(state: &mut GameState, events: &mut Vec<GameEvent>
         .collect();
 
     // CR 614.1: Route through replacement pipeline so Vorinclex-class effects apply.
-    for saga_id in saga_ids {
-        super::effects::counters::add_counter_with_replacement(
+    for (index, saga_id) in saga_ids.iter().copied().enumerate() {
+        if !super::effects::counters::add_counter_with_replacement(
             state,
             active,
             saga_id,
             CounterType::Lore,
             1,
             events,
-        );
+        ) {
+            let remaining = saga_ids[index + 1..]
+                .iter()
+                .copied()
+                .map(|object_id| PendingCounterAddition::Object {
+                    actor: active,
+                    object_id,
+                    counter_type: CounterType::Lore,
+                    count: 1,
+                })
+                .collect();
+            super::effects::counters::stash_pending_counter_additions(
+                state,
+                remaining,
+                PendingEffectResolved::with_post_actions_without_effect(
+                    EffectKind::GenericEffect,
+                    saga_id,
+                    Vec::new(),
+                ),
+            );
+            return false;
+        }
     }
+    true
 }
 
 /// CR 503.1 / CR 504.2 / CR 507.1 / CR 513.1: Process phase triggers for the current step.
 /// Fabricates a PhaseChanged event for `state.phase` and runs trigger matching.
-/// Returns `true` if any triggers were placed on the stack or are pending target selection.
-fn process_phase_triggers(state: &mut GameState) -> bool {
-    let phase_event = [GameEvent::PhaseChanged { phase: state.phase }];
-    let stack_before = state.stack.len();
-    super::triggers::process_triggers(state, &phase_event);
-    state.stack.len() > stack_before || state.pending_trigger.is_some()
+///
+/// Returns `(fired, ordering_prompt)`:
+/// * `fired` is `true` if any triggers were placed on the stack, are pending
+///   target selection, or are awaiting CR 603.3b ordering. The combat arms
+///   (BeginCombat / EndCombat) use this to decide whether to set up / tear down
+///   combat and grant a priority window.
+/// * `ordering_prompt` is `Some(...)` when the phase must pause before priority:
+///   - `WaitingFor::OrderTriggers { .. }` when 2+ simultaneous triggers controlled
+///     by the same player fired and that player must order them (CR 603.3b), or
+///   - an active trigger prompt (`TriggerTargetSelection`, etc.) when
+///     `pending_trigger` / `deferred_triggers` still hold unresolved work (CR
+///     603.3). The caller MUST surface this prompt instead of granting priority.
+fn process_phase_triggers(
+    state: &mut GameState,
+    events: &[GameEvent],
+    events_out: &mut Vec<GameEvent>,
+) -> (bool, Option<WaitingFor>) {
+    let phase_events: Vec<GameEvent> = events
+        .iter()
+        .filter(|event| matches!(event, GameEvent::PhaseChanged { phase } if *phase == state.phase))
+        .cloned()
+        .collect();
+    let (phase_events, delayed_events) = if phase_events.is_empty() {
+        let fallback = vec![GameEvent::PhaseChanged { phase: state.phase }];
+        (fallback.clone(), fallback)
+    } else {
+        (phase_events, events.to_vec())
+    };
+    let outcome = super::triggers::process_triggers_with_delayed_phase_events(
+        state,
+        &phase_events,
+        &delayed_events,
+        events_out,
+    );
+    (outcome.fired, outcome.prompt)
 }
 
 pub fn auto_advance(state: &mut GameState, events: &mut Vec<GameEvent>) -> WaitingFor {
@@ -1284,6 +2260,7 @@ pub fn auto_advance(state: &mut GameState, events: &mut Vec<GameEvent>) -> Waiti
         // trips through `GameAction::ChooseReplacement`; the drain resumes
         // via the `EmptyManaPool` arm of `handle_replacement_choice`.
         if state.pending_phase_transition_progress.is_some() {
+            state.deferred_step_trigger_resume = Some(state.phase);
             return state.waiting_for.clone();
         }
 
@@ -1308,7 +2285,18 @@ pub fn auto_advance(state: &mut GameState, events: &mut Vec<GameEvent>) -> Waiti
                             chosen_not_to_untap: Vec::new(),
                         };
                     }
-                    execute_untap(state, events);
+                    // CR 502.3: With no optional-decline candidates, either
+                    // surface a required bounded `ChooseUntapSubset` prompt (a
+                    // MaxUntapPerType cap is over its limit) or untap + advance.
+                    // `begin_untap_or_subset_prompt` advances the phase itself
+                    // when it untaps, so only fall through to `advance_phase`
+                    // below when no subset prompt is raised.
+                    if let Some(prompt) =
+                        begin_untap_or_subset_prompt(state, events, HashSet::new())
+                    {
+                        return prompt;
+                    }
+                    continue;
                 }
                 // CR 502.4 / CR 117.3a: No player receives priority during the untap step.
                 advance_phase(state, events);
@@ -1318,8 +2306,32 @@ pub fn auto_advance(state: &mut GameState, events: &mut Vec<GameEvent>) -> Waiti
                     advance_phase(state, events);
                     continue;
                 }
+                // CR 704.3: Check SBAs before beginning-of-upkeep triggers so that
+                // city blessing (CR 702.131b) and other SBA-granted designations are
+                // applied before trigger conditions like "if you have the city's blessing"
+                // are evaluated (Twilight Prophet #1375).
+                let waiting_before_sba = state.waiting_for.clone();
+                super::sba::check_state_based_actions(state, events);
+                if state.waiting_for != waiting_before_sba
+                    && !matches!(state.waiting_for, WaitingFor::Priority { .. })
+                {
+                    return state.waiting_for.clone();
+                }
+                if let Some(prompt) =
+                    crate::game::contraptions::perform_contraption_upkeep_turn_based_action(
+                        state, events,
+                    )
+                {
+                    return prompt;
+                }
                 // CR 503.1a: "At the beginning of [your] upkeep" triggers fire here.
-                process_phase_triggers(state);
+                // CR 603.3b: 2+ same-controller upkeep triggers (multiple suspended
+                // cards, two Howling Mines) require an ordering choice that must be
+                // surfaced before priority — see `process_phase_triggers`.
+                let event_snapshot = events.clone();
+                if let (_, Some(prompt)) = process_phase_triggers(state, &event_snapshot, events) {
+                    return prompt;
+                }
                 // CR 503.2 + CR 117.1c: The active player ALWAYS receives priority
                 // during the upkeep step, regardless of whether triggers fired.
                 // Whether to auto-pass through this priority window (or honor the
@@ -1338,7 +2350,15 @@ pub fn auto_advance(state: &mut GameState, events: &mut Vec<GameEvent>) -> Waiti
                 // gate so it stays in sync with `should_skip_draw`.
                 // CR 614.10a + CR 614.1b: Other "skip your draw step" effects
                 // (replacements or static abilities) also remove the whole step.
-                if (state.turn_number == 1 && first_player_skips_first_draw(state))
+                // CR 103.8a: only the STARTING player's FIRST (natural) draw step
+                // is skipped. An inserted beginning phase's draw step
+                // (`extra_phase_resume` non-empty) is not that first draw and must
+                // not be skipped (Temple of Atropos as the turn-1 starting plane).
+                // `should_skip_step_now` (continuous "skip your draw step" effects,
+                // CR 614.10a) is intentionally NOT exempted — those skip every draw.
+                if (state.turn_number == 1
+                    && first_player_skips_first_draw(state)
+                    && state.extra_phase_resume.is_empty())
                     || should_skip_step_now(state, Phase::Draw)
                 {
                     advance_phase(state, events);
@@ -1348,7 +2368,11 @@ pub fn auto_advance(state: &mut GameState, events: &mut Vec<GameEvent>) -> Waiti
                     return wf;
                 }
                 // CR 504.2: "At the beginning of [your] draw step" triggers fire here.
-                process_phase_triggers(state);
+                // CR 603.3b: surface a same-controller ordering prompt before priority.
+                let event_snapshot = events.clone();
+                if let (_, Some(prompt)) = process_phase_triggers(state, &event_snapshot, events) {
+                    return prompt;
+                }
                 // CR 504.3 + CR 117.1c: The active player ALWAYS receives priority
                 // during the draw step (after the turn-based draw and any triggers).
                 // See the Upkeep arm above for the rationale — same pattern.
@@ -1357,10 +2381,13 @@ pub fn auto_advance(state: &mut GameState, events: &mut Vec<GameEvent>) -> Waiti
                 };
             }
             Phase::PreCombatMain | Phase::PostCombatMain => {
-                // CR 714.3b: As the precombat main phase begins, add a lore counter
+                // CR 714.3c: As the precombat main phase begins, add a lore counter
                 // to each Saga the active player controls (turn-based action).
                 if state.phase == Phase::PreCombatMain {
-                    add_lore_counters_to_sagas(state, events);
+                    if !add_lore_counters_to_sagas(state, events) {
+                        return state.waiting_for.clone();
+                    }
+                    super::attractions::perform_roll_to_visit_turn_based_action(state, events);
                     // CR 702.xxx: Paradigm (Strixhaven) — turn-based action at
                     // the start of the active player's first precombat main
                     // phase: offer to cast a copy of each exiled paradigm
@@ -1375,10 +2402,10 @@ pub fn auto_advance(state: &mut GameState, events: &mut Vec<GameEvent>) -> Waiti
                 }
                 // CR 603.2b + CR 603.3: beginning-of-main-phase triggers are
                 // put on the stack before the active player receives priority.
-                if process_phase_triggers(state) {
-                    return WaitingFor::Priority {
-                        player: state.active_player,
-                    };
+                // CR 603.3b: surface a same-controller ordering prompt first.
+                let event_snapshot = events.clone();
+                if let (_, Some(prompt)) = process_phase_triggers(state, &event_snapshot, events) {
+                    return prompt;
                 }
                 // CR 505.6: The active player receives priority during a main phase.
                 return WaitingFor::Priority {
@@ -1390,9 +2417,17 @@ pub fn auto_advance(state: &mut GameState, events: &mut Vec<GameEvent>) -> Waiti
                 // Process triggers regardless of attackers — CR 507.1 says the step
                 // happens unconditionally; trigger conditions (e.g., ControlCount)
                 // are checked by the trigger system, not by skipping the step.
-                let triggers_fired = process_phase_triggers(state);
+                let event_snapshot = events.clone();
+                let (triggers_fired, ordering_prompt) =
+                    process_phase_triggers(state, &event_snapshot, events);
                 if triggers_fired {
                     state.combat = Some(crate::game::combat::CombatState::default());
+                    // CR 603.3b: surface a same-controller ordering prompt before
+                    // priority; combat state is set first so it exists when the
+                    // ordered begin-combat triggers later resolve.
+                    if let Some(prompt) = ordering_prompt {
+                        return prompt;
+                    }
                     return WaitingFor::Priority {
                         player: state.active_player,
                     };
@@ -1422,10 +2457,8 @@ pub fn auto_advance(state: &mut GameState, events: &mut Vec<GameEvent>) -> Waiti
             }
             Phase::DeclareBlockers => {
                 // CR 509.1: Defending player declares blockers as a turn-based action.
-                let has_attackers = state
-                    .combat
-                    .as_ref()
-                    .is_some_and(|c| !c.attackers.is_empty());
+                super::combat::prune_attackers_not_in_play(state);
+                let has_attackers = super::combat::has_attackers_in_play(state);
                 if has_attackers {
                     // CR 509.1 + CR 117.1c: The declare blockers turn-based action always
                     // runs — even when no legal blocks are available — and the active
@@ -1458,15 +2491,45 @@ pub fn auto_advance(state: &mut GameState, events: &mut Vec<GameEvent>) -> Waiti
                 }
             }
             Phase::CombatDamage => {
+                // CR 510.1a + CR 613.4c: Combat damage equals a creature's power as determined
+                // by the layer system (layer 7c applies P/T counters). Flush here so
+                // combat_damage_amount reads evaluated power, not stale base power. commit_attackers
+                // (combat.rs) marks layers dirty; the post-action pipeline flush runs after
+                // resolve_combat_damage returns — too late without this pre-flush.
+                super::layers::flush_layers(state);
                 // CR 510.1 / CR 510.2: Combat damage assigned and dealt as a turn-based action.
                 // resolve_combat_damage may pause for interactive assignment (2+ blockers).
                 if let Some(waiting) = combat_damage::resolve_combat_damage(state, events) {
                     state.waiting_for = waiting.clone();
                     return waiting;
                 }
+                // CR 603.3b: combat-damage triggers ran inside resolve_combat_damage
+                // (process_combat_damage_triggers -> process_triggers). If 2+ triggers
+                // controlled by the same player fired simultaneously, process_triggers
+                // populated `pending_trigger_order` and set `waiting_for` to the
+                // OrderTriggers prompt. Those triggers sit in `pending_trigger_order`, NOT
+                // on the stack, so the `!state.stack.is_empty()` guard below would advance
+                // past the prompt and strand them forever (the turn-18 hang). Surface the
+                // ordering prompt now, mirroring finish_declare_attackers (engine_combat.rs).
+                // NOTE: a first-strike sub-step OrderTriggers prompt is surfaced earlier,
+                // via the `Some(waiting)` return from resolve_combat_damage above (CR 510.4
+                // Part A in combat_damage.rs); the mandatory regular sub-step is then resumed
+                // by the empty-stack completeness gate in priority.rs. This guard handles the
+                // regular-step case, where resolve_combat_damage returns None but set
+                // `waiting_for` to the OrderTriggers prompt internally.
+                if matches!(state.waiting_for, WaitingFor::OrderTriggers { .. }) {
+                    return state.waiting_for.clone();
+                }
                 // CR 704.3 / CR 800.4: SBAs may have ended the game during combat damage.
                 if matches!(state.waiting_for, WaitingFor::GameOver { .. }) {
                     return state.waiting_for.clone();
+                }
+                // CR 603.3b + issue #1350: deferred triggers collapsed during
+                // elimination must drain before advancing past combat damage.
+                if !state.deferred_triggers.is_empty() || state.pending_trigger.is_some() {
+                    return WaitingFor::Priority {
+                        player: state.active_player,
+                    };
                 }
                 // If triggers were placed on the stack (DamageReceived, dies, etc.),
                 // grant priority so they can resolve before advancing.
@@ -1480,9 +2543,15 @@ pub fn auto_advance(state: &mut GameState, events: &mut Vec<GameEvent>) -> Waiti
             }
             Phase::EndCombat => {
                 // CR 511.1: "At end of combat" triggers fire here.
-                let triggers_fired = process_phase_triggers(state);
+                let event_snapshot = events.clone();
+                let (triggers_fired, ordering_prompt) =
+                    process_phase_triggers(state, &event_snapshot, events);
                 // CR 511.3: At end of combat, all creatures are removed from combat.
                 state.combat = None;
+                // CR 511.3: the combat phase is over — its attacker restriction
+                // (Last Night Together / Bumi) ends with it.
+                state.current_combat_attacker_restriction = None;
+                state.current_combat_attacker_restriction_source = None;
                 super::layers::prune_end_of_combat_effects(state);
                 for obj in state.objects.iter_mut().map(|(_, v)| v) {
                     obj.replacement_definitions
@@ -1492,6 +2561,10 @@ pub fn auto_advance(state: &mut GameState, events: &mut Vec<GameEvent>) -> Waiti
                     .pending_damage_replacements
                     .retain(|r| !matches!(r.expiry, Some(RestrictionExpiry::EndOfCombat)));
                 if triggers_fired {
+                    // CR 603.3b: surface a same-controller ordering prompt before priority.
+                    if let Some(prompt) = ordering_prompt {
+                        return prompt;
+                    }
                     return WaitingFor::Priority {
                         player: state.active_player,
                     };
@@ -1515,7 +2588,11 @@ pub fn auto_advance(state: &mut GameState, events: &mut Vec<GameEvent>) -> Waiti
                 super::layers::prune_until_next_end_step_effects(state, state.active_player);
                 // CR 513.1: End step — active player receives priority.
                 // CR 513.1a: "At the beginning of [your] end step" triggers fire here.
-                process_phase_triggers(state);
+                // CR 603.3b: surface a same-controller ordering prompt before priority.
+                let event_snapshot = events.clone();
+                if let (_, Some(prompt)) = process_phase_triggers(state, &event_snapshot, events) {
+                    return prompt;
+                }
                 return WaitingFor::Priority {
                     player: state.active_player,
                 };
@@ -1537,7 +2614,8 @@ pub fn auto_advance(state: &mut GameState, events: &mut Vec<GameEvent>) -> Waiti
 mod tests {
     use super::*;
     use crate::game::zones::create_object;
-    use crate::types::identifiers::CardId;
+    use crate::types::card_type::Supertype;
+    use crate::types::identifiers::{CardId, ObjectId};
     use crate::types::player::PlayerId;
     use std::sync::Arc;
 
@@ -1552,9 +2630,23 @@ mod tests {
         let mut state = GameState::new(crate::types::format::FormatConfig::free_for_all(), 4, 42);
         state.active_player = PlayerId(0);
         state.phase = Phase::DeclareBlockers;
+        let attacker = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Attacker".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&attacker)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(crate::types::card_type::CoreType::Creature);
         state.combat = Some(combat::CombatState {
             attackers: vec![combat::AttackerInfo::new(
-                ObjectId(1),
+                attacker,
                 combat::AttackTarget::Player(PlayerId(2)),
                 PlayerId(2),
             )],
@@ -1760,6 +2852,8 @@ mod tests {
             .push(crate::types::game_state::ExtraPhase {
                 anchor: Phase::EndCombat,
                 phase: Phase::BeginCombat,
+                attacker_restriction: None,
+                attacker_restriction_source: None,
             });
         state.phase = Phase::EndCombat;
         advance_phase(&mut state, &mut events);
@@ -1777,7 +2871,8 @@ mod tests {
         state.players[0].mana_pool.add(ManaUnit {
             color: ManaType::Green,
             source_id: ObjectId(1),
-            snow: false,
+            pip_id: crate::types::mana::ManaPipId(0),
+            supertype: None,
             source_could_produce_two_or_more_colors: false,
             restrictions: Vec::new(),
             grants: vec![],
@@ -1998,6 +3093,138 @@ mod tests {
         );
         assert_eq!(state.players[0].mana_pool.count_color(ManaType::Red), 0);
         assert_eq!(state.players[1].mana_pool.total(), 0);
+    }
+
+    #[test]
+    fn advance_phase_keeps_end_of_turn_mana_until_cleanup() {
+        // CR 500.5 + CR 703.4q (H2 invariant, Klauth, Unrivaled Ancient):
+        // "Until end of turn, you don't lose this mana as steps and phases
+        // end." A unit carrying `ManaExpiry::EndOfTurn` must survive every
+        // non-cleanup phase/step transition and only drain when the turn
+        // actually ends. A plain `None`-expiry unit drains on the very first
+        // transition. RUNTIME test driving `advance_phase` through the live
+        // empty-pool pipeline — guards the payload builder that previously
+        // emitted a `Drop` decision for retained expiry-bound units.
+        use crate::types::mana::{ManaExpiry, ManaType, ManaUnit};
+
+        let mut state = setup();
+        state.phase = Phase::PreCombatMain;
+
+        let mut klauth_mana = ManaUnit::new(ManaType::Red, ObjectId(10), false, Vec::new());
+        klauth_mana.expiry = Some(ManaExpiry::EndOfTurn);
+        state.players[0].mana_pool.add(klauth_mana);
+        state.players[0].mana_pool.add(ManaUnit::new(
+            ManaType::Blue,
+            ObjectId(11),
+            false,
+            Vec::new(),
+        ));
+
+        // First transition (PreCombatMain → next step, not cleanup): the
+        // plain Blue mana drains; the EndOfTurn Red mana is retained.
+        advance_phase(&mut state, &mut Vec::new());
+        assert_ne!(state.phase, Phase::Cleanup);
+        assert_eq!(state.players[0].mana_pool.count_color(ManaType::Red), 1);
+        assert_eq!(state.players[0].mana_pool.count_color(ManaType::Blue), 0);
+
+        // Drive forward until cleanup; the EndOfTurn mana survives each
+        // intermediate step and only drains once the turn ends.
+        while state.phase != Phase::Cleanup {
+            assert_eq!(
+                state.players[0].mana_pool.count_color(ManaType::Red),
+                1,
+                "EndOfTurn mana must persist through {:?}",
+                state.phase
+            );
+            advance_phase(&mut state, &mut Vec::new());
+        }
+        assert_eq!(state.phase, Phase::Cleanup);
+        assert_eq!(state.players[0].mana_pool.count_color(ManaType::Red), 0);
+    }
+
+    /// PR-6: the infinite-mana keep gate is the partner of
+    /// `mana_payment::refill_infinite_mana`. CR 500.5 normally empties a player's
+    /// pool as a step/phase ends; while that player's `unbounded_resources` names
+    /// any `Mana(_)` axis the engine dispositions their non-expiry units `Keep`
+    /// instead of `Drop`, so the pool survives the transition. A player NOT flagged
+    /// drains normally. RUNTIME test driving the live `advance_phase` empty-pool
+    /// pipeline (the production end-of-step seam this PR rewired).
+    ///
+    /// REVERT-PROBE: break the keep gate's `matches!(a, ResourceAxis::Mana(_))`
+    /// (so `keep_for_infinite_mana` is false) → P0's Blue mana drains → the
+    /// retention assertion fails.
+    #[test]
+    fn advance_phase_keeps_mana_for_unbounded_mana_player() {
+        use crate::game::mana_payment::INFINITE_MANA_AXES;
+        use crate::types::mana::{ManaType, ManaUnit};
+
+        let mut state = setup();
+        state.phase = Phase::PreCombatMain;
+
+        // P0 has the infinite-mana toggle active (records the six Mana axes).
+        state.mark_unbounded_loop(state.players[0].id, &INFINITE_MANA_AXES);
+        state.players[0].mana_pool.add(ManaUnit::new(
+            ManaType::Blue,
+            ObjectId(11),
+            false,
+            Vec::new(),
+        ));
+        // P1 is NOT flagged — their mana drains normally (the control).
+        state.players[1].mana_pool.add(ManaUnit::new(
+            ManaType::Red,
+            ObjectId(12),
+            false,
+            Vec::new(),
+        ));
+
+        advance_phase(&mut state, &mut Vec::new());
+
+        assert_eq!(
+            state.players[0].mana_pool.count_color(ManaType::Blue),
+            1,
+            "a Mana-unbounded player's pool must survive the CR 500.5 end-of-step empty"
+        );
+        assert_eq!(
+            state.players[1].mana_pool.total(),
+            0,
+            "an unflagged player's mana must drain normally at end of step"
+        );
+    }
+
+    #[test]
+    fn advance_phase_keeps_end_of_combat_mana_until_combat_ends() {
+        // CR 500.5 + CR 703.4q + CR 702.189a: Firebending mana says "Until
+        // end of combat, you don't lose this mana as steps and phases end."
+        // It must survive combat step transitions through the live empty-pool
+        // pipeline, then drain when the game leaves combat.
+        use crate::types::mana::{ManaExpiry, ManaType, ManaUnit};
+
+        let mut state = setup();
+        state.phase = Phase::BeginCombat;
+
+        let mut firebending_mana = ManaUnit::new(ManaType::Red, ObjectId(10), false, Vec::new());
+        firebending_mana.expiry = Some(ManaExpiry::EndOfCombat);
+        state.players[0].mana_pool.add(firebending_mana);
+        state.players[0].mana_pool.add(ManaUnit::new(
+            ManaType::Blue,
+            ObjectId(11),
+            false,
+            Vec::new(),
+        ));
+
+        while state.phase != Phase::PostCombatMain {
+            assert_eq!(
+                state.players[0].mana_pool.count_color(ManaType::Red),
+                1,
+                "EndOfCombat mana must persist through {:?}",
+                state.phase
+            );
+            advance_phase(&mut state, &mut Vec::new());
+            assert_eq!(state.players[0].mana_pool.count_color(ManaType::Blue), 0);
+        }
+
+        assert_eq!(state.phase, Phase::PostCombatMain);
+        assert_eq!(state.players[0].mana_pool.count_color(ManaType::Red), 0);
     }
 
     #[test]
@@ -2601,6 +3828,8 @@ mod tests {
         state.extra_phases.push(ExtraPhase {
             anchor: Phase::EndCombat,
             phase: Phase::BeginCombat,
+            attacker_restriction: None,
+            attacker_restriction_source: None,
         });
 
         let mut events = Vec::new();
@@ -2627,6 +3856,8 @@ mod tests {
         state.extra_phases.push(ExtraPhase {
             anchor: Phase::EndCombat,
             phase: Phase::BeginCombat,
+            attacker_restriction: None,
+            attacker_restriction_source: None,
         });
 
         let mut events = Vec::new();
@@ -2652,6 +3883,8 @@ mod tests {
         state.extra_phases.push(ExtraPhase {
             anchor: Phase::EndCombat,
             phase: Phase::BeginCombat,
+            attacker_restriction: None,
+            attacker_restriction_source: None,
         });
 
         // Walk the phase machine forward and record each phase entered.
@@ -2705,10 +3938,14 @@ mod tests {
         state.extra_phases.push(ExtraPhase {
             anchor: Phase::EndCombat,
             phase: Phase::PostCombatMain,
+            attacker_restriction: None,
+            attacker_restriction_source: None,
         });
         state.extra_phases.push(ExtraPhase {
             anchor: Phase::EndCombat,
             phase: Phase::BeginCombat,
+            attacker_restriction: None,
+            attacker_restriction_source: None,
         });
 
         let mut events = Vec::new();
@@ -2756,6 +3993,8 @@ mod tests {
             state.extra_phases.push(ExtraPhase {
                 anchor: Phase::EndCombat,
                 phase: Phase::BeginCombat,
+                attacker_restriction: None,
+                attacker_restriction_source: None,
             });
         }
 
@@ -2847,6 +4086,34 @@ mod tests {
         assert!(state.counter_added_this_turn.is_empty());
     }
 
+    /// CR 601.2a + CR 113.6b: Turn cleanup must clear BOTH the per-source
+    /// `ExileCastPermission` once-per-turn slots AND the rolling "cards exiled
+    /// with this source this turn" pool (Maralen, Fae Ascendant). Driven
+    /// through `start_next_turn` rather than a manual `.clear()`, so a
+    /// regression dropping either reset line in `start_next_turn` fails here
+    /// instead of staying green.
+    #[test]
+    fn start_next_turn_resets_exile_cast_permission_tracking() {
+        let mut state = setup();
+        let source = ObjectId(42);
+        state.exile_cast_permissions_used.insert(source);
+        state
+            .cards_exiled_with_source_this_turn
+            .insert(source, vec![ObjectId(7)]);
+
+        let mut events = Vec::new();
+        start_next_turn(&mut state, &mut events);
+
+        assert!(
+            state.exile_cast_permissions_used.is_empty(),
+            "OncePerTurn exile-cast slots must reset at turn start"
+        );
+        assert!(
+            state.cards_exiled_with_source_this_turn.is_empty(),
+            "per-turn exiled-with-source pool must reset at turn start"
+        );
+    }
+
     #[test]
     fn start_next_turn_emits_turn_started_event() {
         let mut state = setup();
@@ -2857,6 +4124,149 @@ mod tests {
         assert!(events
             .iter()
             .any(|e| matches!(e, GameEvent::TurnStarted { turn_number: 2, .. })));
+    }
+
+    /// V4: CR 102.1 + CR 500.1. `EndOfCurrentTurn` (the legacy behavior) clears
+    /// at the very next turn start regardless of whose turn begins. Driven
+    /// through the real `start_next_turn` clear seam; the reach-guard asserts the
+    /// flag is live immediately before the boundary so the negative is not
+    /// vacuous.
+    #[test]
+    fn end_of_current_turn_boundary_cleared_at_next_turn_start() {
+        let mut state = setup();
+        state.active_player = PlayerId(0);
+        state.auto_pass.insert(
+            PlayerId(0),
+            AutoPassMode::UntilTurnBoundary {
+                until: TurnBoundary::EndOfCurrentTurn,
+            },
+        );
+        // Reach-guard: the session is live before the boundary.
+        assert!(state.auto_pass.contains_key(&PlayerId(0)));
+
+        let mut events = Vec::new();
+        start_next_turn(&mut state, &mut events); // P1's turn begins.
+
+        assert!(
+            !state.auto_pass.contains_key(&PlayerId(0)),
+            "EndOfCurrentTurn must clear at the next turn start"
+        );
+    }
+
+    /// V5: CR 102.1. `MyNextTurnStart` persists through an intervening opponent
+    /// turn (3-player). The sibling `EndOfCurrentTurn` on the identical fixture
+    /// is gone after the same opponent turn start — proving the boundary axis
+    /// actually gates the retain rather than both behaving alike.
+    #[test]
+    fn my_next_turn_start_survives_opponent_turn() {
+        let mut state = GameState::new(crate::types::format::FormatConfig::free_for_all(), 3, 42);
+        state.turn_number = 1;
+        state.active_player = PlayerId(0);
+        state.auto_pass.insert(
+            PlayerId(0),
+            AutoPassMode::UntilTurnBoundary {
+                until: TurnBoundary::MyNextTurnStart,
+            },
+        );
+
+        let mut events = Vec::new();
+        start_next_turn(&mut state, &mut events); // P1's turn begins.
+        assert_eq!(state.active_player, PlayerId(1));
+
+        assert_eq!(
+            state.auto_pass.get(&PlayerId(0)),
+            Some(&AutoPassMode::UntilTurnBoundary {
+                until: TurnBoundary::MyNextTurnStart
+            }),
+            "MyNextTurnStart must survive an opponent's turn start"
+        );
+
+        // Sibling: EndOfCurrentTurn on the identical fixture is gone.
+        let mut sibling = GameState::new(crate::types::format::FormatConfig::free_for_all(), 3, 42);
+        sibling.turn_number = 1;
+        sibling.active_player = PlayerId(0);
+        sibling.auto_pass.insert(
+            PlayerId(0),
+            AutoPassMode::UntilTurnBoundary {
+                until: TurnBoundary::EndOfCurrentTurn,
+            },
+        );
+        start_next_turn(&mut sibling, &mut Vec::new());
+        assert!(
+            !sibling.auto_pass.contains_key(&PlayerId(0)),
+            "EndOfCurrentTurn must NOT survive the opponent's turn start"
+        );
+    }
+
+    /// V6: CR 102.1. `MyNextTurnStart` clears only when the session owner's own
+    /// next turn begins. Survives P1's and P2's turn starts (reach-guards),
+    /// clears exactly when P0 becomes active again.
+    #[test]
+    fn my_next_turn_start_clears_on_owner_turn() {
+        let mut state = GameState::new(crate::types::format::FormatConfig::free_for_all(), 3, 42);
+        state.turn_number = 1;
+        state.active_player = PlayerId(0);
+        state.auto_pass.insert(
+            PlayerId(0),
+            AutoPassMode::UntilTurnBoundary {
+                until: TurnBoundary::MyNextTurnStart,
+            },
+        );
+
+        let mut events = Vec::new();
+        start_next_turn(&mut state, &mut events); // → P1
+        assert_eq!(state.active_player, PlayerId(1));
+        assert!(
+            state.auto_pass.contains_key(&PlayerId(0)),
+            "survives P1's turn start"
+        );
+
+        start_next_turn(&mut state, &mut events); // → P2
+        assert_eq!(state.active_player, PlayerId(2));
+        assert!(
+            state.auto_pass.contains_key(&PlayerId(0)),
+            "survives P2's turn start"
+        );
+
+        start_next_turn(&mut state, &mut events); // → P0 (owner's next turn)
+        assert_eq!(state.active_player, PlayerId(0));
+        assert!(
+            !state.auto_pass.contains_key(&PlayerId(0)),
+            "MyNextTurnStart must clear when the owner's next turn begins"
+        );
+    }
+
+    /// Mixed-map coexistence: the retain evaluates each entry independently — a
+    /// turn-agnostic `UntilStackEmpty` for another player is untouched while an
+    /// `EndOfCurrentTurn` session clears at the same boundary.
+    #[test]
+    fn start_next_turn_retains_until_stack_empty_across_boundary() {
+        let mut state = GameState::new(crate::types::format::FormatConfig::free_for_all(), 3, 42);
+        state.turn_number = 1;
+        state.active_player = PlayerId(0);
+        state.auto_pass.insert(
+            PlayerId(0),
+            AutoPassMode::UntilTurnBoundary {
+                until: TurnBoundary::EndOfCurrentTurn,
+            },
+        );
+        state.auto_pass.insert(
+            PlayerId(1),
+            AutoPassMode::UntilStackEmpty {
+                initial_stack_len: 2,
+            },
+        );
+
+        start_next_turn(&mut state, &mut Vec::new());
+
+        assert!(!state.auto_pass.contains_key(&PlayerId(0)));
+        assert_eq!(
+            state.auto_pass.get(&PlayerId(1)),
+            Some(&AutoPassMode::UntilStackEmpty {
+                initial_stack_len: 2
+            }),
+            "UntilStackEmpty is turn-agnostic and must survive the boundary"
+        );
     }
 
     #[test]
@@ -2882,12 +4292,762 @@ mod tests {
             .any(|e| matches!(e, GameEvent::PermanentUntapped { object_id } if *object_id == id)));
     }
 
+    #[test]
+    fn execute_untap_applies_edge_of_malacol_untap_replacement() {
+        use crate::types::card_type::CoreType;
+        use crate::types::counter::CounterType;
+
+        let mut state = setup();
+        state.active_player = PlayerId(0);
+        // CR 502.3 + CR 502.4: the turn-based untap happens during the untap
+        // step; `ReplacementCondition::DuringUntapStep` gates on this phase.
+        state.phase = Phase::Untap;
+
+        // A tapped creature the active player controls.
+        let creature = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Grizzly Bears".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&creature).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.base_card_types = obj.card_types.clone();
+            obj.tapped = true;
+        }
+
+        // Edge of Malacol's untap-step replacement.
+        let source = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Edge of Malacol".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let def = crate::parser::oracle_replacement::parse_replacement_line(
+                "If a creature you control would untap during your untap step, put two +1/+1 counters on it instead.",
+                "Edge of Malacol",
+            )
+            .expect("untap-step replacement should parse");
+            let obj = state.objects.get_mut(&source).unwrap();
+            obj.card_types.core_types.push(CoreType::Enchantment);
+            obj.base_card_types = obj.card_types.clone();
+            obj.replacement_definitions.push(def.clone());
+            Arc::make_mut(&mut obj.base_replacement_definitions).push(def);
+        }
+
+        let mut events = Vec::new();
+        execute_untap(&mut state, &mut events);
+
+        // The untap is replaced: the creature stays tapped, emits no untap event,
+        // and gains two +1/+1 counters instead — exercising the DuringUntapStep
+        // gate and the untap-step raise end to end (a broken phase check or raise
+        // would untap the creature and skip the counters).
+        assert!(
+            state.objects[&creature].tapped,
+            "untap must be replaced; the creature stays tapped"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                GameEvent::PermanentUntapped { object_id } if *object_id == creature
+            )),
+            "no untap event is emitted when the untap is replaced"
+        );
+        assert_eq!(
+            state.objects[&creature]
+                .counters
+                .get(&CounterType::Plus1Plus1)
+                .copied()
+                .unwrap_or(0),
+            2,
+            "two +1/+1 counters are added instead of untapping"
+        );
+    }
+
+    /// CR 502.3 + CR 701.26b: Blossombind — "Enchanted creature can't become
+    /// untapped …" is an unconditional `ProposedEvent::Untap` PREVENTION
+    /// (CR 701.26b, the broad prohibition — NOT a `CantUntap` static, which is the
+    /// untap-step-only class). This drives the production untap step (`execute_untap`)
+    /// and asserts the host stays tapped; the EFFECT-driven untap path is covered
+    /// separately in `tap_untap.rs`. The replacement is parsed from the real
+    /// Oracle text via the cross-layer split and installed on the attached Aura.
+    /// Reverting the untap-prevention replacement (or its split routing) makes the
+    /// untap-step `replace_event` return `Execute`, the creature untaps, and this
+    /// assertion fails — so the test discriminates the change.
+    #[test]
+    fn execute_untap_honors_blossombind_cant_become_untapped() {
+        use crate::game::effects::attach::attach_to;
+        use crate::types::card_type::CoreType;
+        use crate::types::replacements::ReplacementEvent;
+
+        let mut state = setup();
+        state.active_player = PlayerId(0);
+
+        let host = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Bound Bear".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&host).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.base_card_types = obj.card_types.clone();
+            obj.tapped = true;
+        }
+
+        let aura = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Blossombind".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            // Parse the real compound line; pull the Untap-prevention replacement
+            // out of the cross-layer split and install it on the Aura. (The
+            // AddCounter-prevention conjunct is irrelevant to untap; the full split
+            // is exercised by the parser-layer test.)
+            let parsed = crate::parser::parse_oracle_text(
+                "Enchant creature\nEnchanted creature can't become untapped and can't have counters put on it.",
+                "Blossombind",
+                &[],
+                &["Enchantment".to_string()],
+                &["Aura".to_string()],
+            );
+            assert!(
+                parsed
+                    .replacements
+                    .iter()
+                    .any(|def| def.event == ReplacementEvent::Untap),
+                "Blossombind's untap prohibition must parse to an Untap-prevention replacement"
+            );
+            let obj = state.objects.get_mut(&aura).unwrap();
+            obj.card_types.core_types.push(CoreType::Enchantment);
+            obj.card_types.subtypes.push("Aura".to_string());
+            obj.base_card_types = obj.card_types.clone();
+            obj.replacement_definitions = parsed.replacements.into();
+        }
+        attach_to(&mut state, aura, host);
+
+        let mut events = Vec::new();
+        execute_untap(&mut state, &mut events);
+
+        assert!(
+            state.objects[&host].tapped,
+            "Blossombind's enchanted creature must stay tapped at the untap step"
+        );
+        assert!(
+            !events.iter().any(|event| {
+                matches!(event, GameEvent::PermanentUntapped { object_id } if *object_id == host)
+            }),
+            "skipped untap must not emit PermanentUntapped"
+        );
+    }
+
+    #[test]
+    fn execute_untap_honors_attached_subject_cant_untap_from_parser() {
+        use crate::game::effects::attach::attach_to;
+        use crate::types::card_type::CoreType;
+
+        let mut state = setup();
+        state.active_player = PlayerId(0);
+
+        let host = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Locked Bear".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&host).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.base_card_types = obj.card_types.clone();
+            obj.tapped = true;
+        }
+
+        let aura = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Flood the Engine".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let defs = crate::parser::oracle_static::parse_static_line_multi(
+                "Enchanted permanent loses all abilities and doesn't untap during its controller's untap step.",
+            );
+            let obj = state.objects.get_mut(&aura).unwrap();
+            obj.card_types.core_types.push(CoreType::Enchantment);
+            obj.card_types.subtypes.push("Aura".to_string());
+            obj.base_card_types = obj.card_types.clone();
+            for def in defs.iter().cloned() {
+                obj.static_definitions.push(def);
+            }
+            Arc::make_mut(&mut obj.base_static_definitions).extend(defs);
+        }
+        attach_to(&mut state, aura, host);
+
+        let mut events = Vec::new();
+        // CR 604.1: a functioning CantUntap static IS present, so the hoisted
+        // existence gate is true and the per-permanent `check_static_ability`
+        // scan MUST still run — proving the gate does not suppress real scans on
+        // the gate=true path.
+        crate::game::perf_counters::reset();
+        execute_untap(&mut state, &mut events);
+        let scans = crate::game::perf_counters::snapshot().static_full_scans;
+
+        assert!(
+            state.objects[&host].tapped,
+            "attached CantUntap static must keep the enchanted permanent tapped"
+        );
+        assert!(
+            !events.iter().any(|event| {
+                matches!(event, GameEvent::PermanentUntapped { object_id } if *object_id == host)
+            }),
+            "skipped untap must not emit PermanentUntapped"
+        );
+        assert!(
+            scans > 0,
+            "gate=true path must still run the real per-permanent CantUntap scan"
+        );
+    }
+
     fn install_may_choose_not_to_untap_static(state: &mut GameState, source_id: ObjectId) {
         use crate::types::ability::StaticDefinition;
         let def = StaticDefinition::new(StaticMode::MayChooseNotToUntap);
         let obj = state.objects.get_mut(&source_id).unwrap();
         obj.static_definitions.push(def.clone());
         Arc::make_mut(&mut obj.base_static_definitions).push(def);
+    }
+
+    /// CR 502.3: Install a Smoke-class "can't untap more than one creature"
+    /// max-untap cap on `source_id`.
+    fn install_max_untap_one_creature_static(state: &mut GameState, source_id: ObjectId) {
+        use crate::types::ability::{StaticDefinition, TargetFilter, TypedFilter};
+        let def = StaticDefinition::new(StaticMode::MaxUntapPerType {
+            filter: TargetFilter::Typed(TypedFilter::creature()),
+            max: 1,
+        });
+        let obj = state.objects.get_mut(&source_id).unwrap();
+        obj.static_definitions.push(def.clone());
+        Arc::make_mut(&mut obj.base_static_definitions).push(def);
+    }
+
+    fn create_tapped_creature(state: &mut GameState, card_id: u64, name: &str) -> ObjectId {
+        use crate::types::card_type::CoreType;
+        let id = create_object(
+            state,
+            CardId(card_id),
+            PlayerId(0),
+            name.to_string(),
+            Zone::Battlefield,
+        );
+        let obj = state.objects.get_mut(&id).unwrap();
+        obj.card_types.core_types.push(CoreType::Creature);
+        obj.tapped = true;
+        id
+    }
+
+    /// CR 502.3 + CR 604.1: GAP-1 guard. The every-turn untap of K tapped
+    /// active-player permanents on a restriction-free board must NOT perform any
+    /// whole-battlefield `check_static_ability` scan — the hoisted CantUntap
+    /// existence gate is false, so the per-permanent scan is skipped. Reverting
+    /// the gate restores O(K) scans, failing the `== 0` assertion. Drives the
+    /// production `execute_untap`, not the prompt helper.
+    #[test]
+    fn execute_untap_no_static_scan_on_vanilla_board() {
+        let mut state = setup();
+        state.active_player = PlayerId(0);
+        let ids: Vec<ObjectId> = (0..8)
+            .map(|i| create_tapped_creature(&mut state, 100 + i, &format!("Bear {i}")))
+            .collect();
+
+        // Flush makes the `StaticModePresence` index PRECISE (CantUntap absent). In
+        // production the index is always flushed before the untap step; the pre-flush
+        // `all_present` default would conservatively fall through to the O(N) scan.
+        crate::game::layers::evaluate_layers(&mut state);
+        crate::game::perf_counters::reset();
+        let mut events = Vec::new();
+        execute_untap(&mut state, &mut events);
+        let scans = crate::game::perf_counters::snapshot().static_full_scans;
+
+        for id in &ids {
+            assert!(!state.objects[id].tapped, "vanilla permanent must untap");
+        }
+        assert_eq!(
+            scans, 0,
+            "no static-ability whole-board scan on a vanilla untap"
+        );
+    }
+
+    /// CR 502.3 + CR 604.1: with a `MaxUntapPerType` cap present but no
+    /// functioning CantUntap static, `max_untap_subset_prompt` reaches
+    /// `untap_excluded_ids`, whose per-permanent CantUntap scan is gated off by
+    /// the hoisted existence flag — so building the over-cap group costs zero
+    /// whole-board scans even though it does NOT bail early.
+    #[test]
+    fn max_untap_subset_prompt_no_cant_untap_scan_with_cap() {
+        let mut state = setup();
+        state.active_player = PlayerId(0);
+        let smoke = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Smoke".to_string(),
+            Zone::Battlefield,
+        );
+        install_max_untap_one_creature_static(&mut state, smoke);
+        create_tapped_creature(&mut state, 2, "Bear A");
+        create_tapped_creature(&mut state, 3, "Bear B");
+
+        // Flush makes the `StaticModePresence` index PRECISE (CantUntap absent, only the
+        // MaxUntapPerType cap present). Production reaches this path with a flushed index;
+        // the pre-flush `all_present` default would conservatively fall through.
+        crate::game::layers::evaluate_layers(&mut state);
+        crate::game::perf_counters::reset();
+        let prompt = max_untap_subset_prompt(&state, PlayerId(0), &HashSet::new());
+        let scans = crate::game::perf_counters::snapshot().static_full_scans;
+
+        assert!(
+            prompt.is_some(),
+            "two tapped creatures exceed the cap of one"
+        );
+        assert_eq!(
+            scans, 0,
+            "no CantUntap whole-board scan when no such static exists"
+        );
+    }
+
+    /// CR 502.3: with no `MaxUntapPerType` cap in play, `max_untap_subset_prompt`
+    /// bails before the `untap_excluded_ids` CantUntap scan — proving the
+    /// early-return short-circuit. Reverting the bail makes the scan run over the
+    /// tapped board, raising `static_full_scans` above zero.
+    #[test]
+    fn max_untap_subset_prompt_bails_without_cap_no_scan() {
+        let mut state = setup();
+        state.active_player = PlayerId(0);
+        for i in 0..8 {
+            create_tapped_creature(&mut state, 200 + i, &format!("Bear {i}"));
+        }
+
+        crate::game::perf_counters::reset();
+        let prompt = max_untap_subset_prompt(&state, PlayerId(0), &HashSet::new());
+        let scans = crate::game::perf_counters::snapshot().static_full_scans;
+
+        assert!(prompt.is_none(), "no cap means nothing to prompt");
+        assert_eq!(scans, 0, "bail short-circuits before any whole-board scan");
+    }
+
+    /// CR 502.3: With a Smoke-class cap of one creature and two tapped
+    /// creatures, the untap step does NOT silently clamp — it raises the
+    /// `ChooseUntapSubset` prompt so the active player determines which one
+    /// untaps. This is the architectural fix: the cap is a required bounded
+    /// selection, not deterministic excess-skipping.
+    #[test]
+    fn max_untap_cap_raises_subset_prompt_over_cap() {
+        let mut state = setup();
+        state.active_player = PlayerId(0);
+
+        let smoke = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Smoke".to_string(),
+            Zone::Battlefield,
+        );
+        install_max_untap_one_creature_static(&mut state, smoke);
+
+        let creature_a = create_tapped_creature(&mut state, 2, "Bear A");
+        let creature_b = create_tapped_creature(&mut state, 3, "Bear B");
+
+        let prompt = begin_untap_or_subset_prompt(&mut state, &mut Vec::new(), HashSet::new());
+        match prompt {
+            Some(WaitingFor::ChooseUntapSubset { player, group, max }) => {
+                assert_eq!(player, PlayerId(0));
+                assert_eq!(max, 1);
+                let mut g = group;
+                g.sort_by_key(|id| id.0);
+                let mut expected = vec![creature_a, creature_b];
+                expected.sort_by_key(|id| id.0);
+                assert_eq!(g, expected, "both over-cap creatures are offered");
+            }
+            other => panic!("expected ChooseUntapSubset prompt, got {other:?}"),
+        }
+        // Nothing untapped yet — the player must choose first (no auto-clamp).
+        assert!(state.objects[&creature_a].tapped);
+        assert!(state.objects[&creature_b].tapped);
+    }
+
+    /// CR 502.3: The active player's explicit subset selection is honored — the
+    /// chosen creature untaps, the unchosen one stays tapped, with no reliance
+    /// on iteration order. Exercises the full bridge: declines + subset choice.
+    #[test]
+    fn max_untap_subset_selection_untaps_chosen_only() {
+        let mut state = setup();
+        state.active_player = PlayerId(0);
+
+        let smoke = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Smoke".to_string(),
+            Zone::Battlefield,
+        );
+        install_max_untap_one_creature_static(&mut state, smoke);
+
+        let creature_a = create_tapped_creature(&mut state, 2, "Bear A");
+        let creature_b = create_tapped_creature(&mut state, 3, "Bear B");
+
+        // Player chooses to untap creature_b (the non-first member).
+        let mut chosen = HashSet::new();
+        chosen.insert(creature_b);
+        // Simulate the engine handler's complement fold: everything in the group
+        // not chosen stays tapped.
+        let mut skipped = HashSet::new();
+        for id in [creature_a, creature_b] {
+            if !chosen.contains(&id) {
+                skipped.insert(id);
+            }
+        }
+        let resumed = begin_untap_or_subset_prompt(&mut state, &mut Vec::new(), skipped);
+        assert!(
+            resumed.is_none(),
+            "after the subset is resolved, untap executes and no further prompt is raised"
+        );
+
+        assert!(
+            !state.objects[&creature_b].tapped,
+            "the chosen creature untaps"
+        );
+        assert!(
+            state.objects[&creature_a].tapped,
+            "the unchosen creature stays tapped — explicit selection, not order"
+        );
+    }
+
+    /// CR 502.3 SAFETY NET: A direct caller that reaches
+    /// `execute_untap_with_choices` without resolving the subset prompt still
+    /// has the cap enforced (deterministic clamp), so the engine never
+    /// over-untaps past the CR 502.3 limit.
+    #[test]
+    fn max_untap_cap_clamp_safety_net_holds() {
+        let mut state = setup();
+        state.active_player = PlayerId(0);
+
+        let smoke = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Smoke".to_string(),
+            Zone::Battlefield,
+        );
+        install_max_untap_one_creature_static(&mut state, smoke);
+
+        let creature_a = create_tapped_creature(&mut state, 2, "Bear A");
+        let creature_b = create_tapped_creature(&mut state, 3, "Bear B");
+
+        execute_untap(&mut state, &mut Vec::new());
+
+        let untapped = [creature_a, creature_b]
+            .iter()
+            .filter(|id| !state.objects[id].tapped)
+            .count();
+        assert_eq!(
+            untapped, 1,
+            "the clamp keeps the cap enforced even on the direct untap path"
+        );
+    }
+
+    /// CR 502.3: The player determines which permanents untap. A decline of the
+    /// first creature must leave the SECOND creature untapped (the cap honors
+    /// the player's choice rather than a fixed order).
+    #[test]
+    fn max_untap_cap_honors_player_decline_choice() {
+        let mut state = setup();
+        state.active_player = PlayerId(0);
+
+        let smoke = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Smoke".to_string(),
+            Zone::Battlefield,
+        );
+        install_max_untap_one_creature_static(&mut state, smoke);
+
+        let creature_a = create_tapped_creature(&mut state, 2, "Bear A");
+        let creature_b = create_tapped_creature(&mut state, 3, "Bear B");
+
+        // Player declines creature_a, so creature_b is the one that untaps.
+        let mut choices = HashSet::new();
+        choices.insert(creature_a);
+        execute_untap_with_choices(&mut state, &mut Vec::new(), &choices);
+
+        assert!(
+            state.objects[&creature_a].tapped,
+            "declined creature stays tapped"
+        );
+        assert!(
+            !state.objects[&creature_b].tapped,
+            "the non-declined creature untaps under the cap"
+        );
+    }
+
+    /// CR 502.3: The cap is type-scoped — a tapped artifact untaps freely while
+    /// the creature cap applies only to creatures. Proves the filter is honored.
+    #[test]
+    fn max_untap_cap_does_not_restrict_other_types() {
+        let mut state = setup();
+        state.active_player = PlayerId(0);
+
+        let smoke = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Smoke".to_string(),
+            Zone::Battlefield,
+        );
+        install_max_untap_one_creature_static(&mut state, smoke);
+
+        let creature_a = create_tapped_creature(&mut state, 2, "Bear A");
+        let creature_b = create_tapped_creature(&mut state, 3, "Bear B");
+
+        let artifact = {
+            use crate::types::card_type::CoreType;
+            let id = create_object(
+                &mut state,
+                CardId(4),
+                PlayerId(0),
+                "Mox".to_string(),
+                Zone::Battlefield,
+            );
+            let obj = state.objects.get_mut(&id).unwrap();
+            obj.card_types.core_types.push(CoreType::Artifact);
+            obj.tapped = true;
+            id
+        };
+
+        execute_untap(&mut state, &mut Vec::new());
+
+        assert!(
+            !state.objects[&artifact].tapped,
+            "artifact untaps freely under a creature-only cap"
+        );
+        let untapped_creatures = [creature_a, creature_b]
+            .iter()
+            .filter(|id| !state.objects[id].tapped)
+            .count();
+        assert_eq!(untapped_creatures, 1, "creature cap still applies");
+    }
+
+    /// CR 502.3: When a group is over the cap, `max_untap_subset_prompt` offers
+    /// every eligible member so the active player determines which untap. The
+    /// per-permanent optional-decline prompt (`untap_choice_candidates`) is a
+    /// SEPARATE concern and must NOT include the cap group (no
+    /// `MayChooseNotToUntap` static is present here).
+    #[test]
+    fn max_untap_subset_prompt_offers_over_cap_group() {
+        let mut state = setup();
+        state.active_player = PlayerId(0);
+
+        let smoke = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Smoke".to_string(),
+            Zone::Battlefield,
+        );
+        install_max_untap_one_creature_static(&mut state, smoke);
+
+        let creature_a = create_tapped_creature(&mut state, 2, "Bear A");
+        let creature_b = create_tapped_creature(&mut state, 3, "Bear B");
+
+        // The decline prompt is empty — these creatures have no
+        // MayChooseNotToUntap static; the cap is a distinct selection.
+        assert!(
+            untap_choice_candidates(&state, PlayerId(0)).is_empty(),
+            "cap group must not leak into the optional-decline prompt"
+        );
+
+        let (mut group, max) =
+            max_untap_subset_prompt(&state, PlayerId(0), &HashSet::new()).expect("over-cap prompt");
+        assert_eq!(max, 1);
+        group.sort_by_key(|id| id.0);
+        let mut expected = vec![creature_a, creature_b];
+        expected.sort_by_key(|id| id.0);
+        assert_eq!(group, expected);
+    }
+
+    /// CR 502.3: A group at or under the cap produces no max-untap prompt.
+    #[test]
+    fn max_untap_subset_prompt_empty_when_under_cap() {
+        let mut state = setup();
+        state.active_player = PlayerId(0);
+
+        let smoke = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Smoke".to_string(),
+            Zone::Battlefield,
+        );
+        install_max_untap_one_creature_static(&mut state, smoke);
+
+        create_tapped_creature(&mut state, 2, "Bear A");
+
+        assert!(max_untap_subset_prompt(&state, PlayerId(0), &HashSet::new()).is_none());
+        assert!(untap_choice_candidates(&state, PlayerId(0)).is_empty());
+    }
+
+    /// CR 502.3: Declines reduce the eligible group before the cap check. If the
+    /// player has already declined enough that the remaining eligible group is
+    /// at or under the cap, no subset prompt is raised.
+    #[test]
+    fn max_untap_subset_prompt_respects_declines() {
+        let mut state = setup();
+        state.active_player = PlayerId(0);
+
+        let smoke = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Smoke".to_string(),
+            Zone::Battlefield,
+        );
+        install_max_untap_one_creature_static(&mut state, smoke);
+
+        let creature_a = create_tapped_creature(&mut state, 2, "Bear A");
+        let _creature_b = create_tapped_creature(&mut state, 3, "Bear B");
+
+        // Declining one of the two leaves a single eligible creature — at the
+        // cap, so no required selection remains.
+        let mut declined = HashSet::new();
+        declined.insert(creature_a);
+        assert!(max_untap_subset_prompt(&state, PlayerId(0), &declined).is_none());
+    }
+
+    /// CR 502.3: a max-untap cap ("can't untap more than one creature") bounds
+    /// the untap count from ABOVE only — choosing ZERO is legal. When the active
+    /// player resolves the `ChooseUntapSubset` prompt with an empty selection,
+    /// every member of the over-cap group folds into the skipped set, the whole
+    /// group stays tapped, and the untap step advances cleanly with no residual
+    /// prompt. This is the engine-side guarantee behind the frontend allowing an
+    /// empty `SelectCards { cards: [] }` confirmation.
+    #[test]
+    fn max_untap_empty_subset_leaves_whole_group_tapped() {
+        let mut state = setup();
+        state.active_player = PlayerId(0);
+
+        let smoke = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Smoke".to_string(),
+            Zone::Battlefield,
+        );
+        install_max_untap_one_creature_static(&mut state, smoke);
+
+        let creature_a = create_tapped_creature(&mut state, 2, "Bear A");
+        let creature_b = create_tapped_creature(&mut state, 3, "Bear B");
+
+        // Empty selection: the engine's SelectCards handler folds the entire
+        // prompted group into the skipped set (chosen.len() == 0 <= max). Mirror
+        // that fold here — nothing was chosen, so both group members stay tapped.
+        let mut skipped = HashSet::new();
+        skipped.insert(creature_a);
+        skipped.insert(creature_b);
+        let resumed = begin_untap_or_subset_prompt(&mut state, &mut Vec::new(), skipped);
+        assert!(
+            resumed.is_none(),
+            "an empty untap subset resolves the step — no further prompt is raised"
+        );
+
+        assert!(
+            state.objects[&creature_a].tapped,
+            "choosing zero leaves the first group member tapped"
+        );
+        assert!(
+            state.objects[&creature_b].tapped,
+            "choosing zero leaves the second group member tapped"
+        );
+    }
+
+    /// CR 502.3 + CR 611.1: a filter-scoped transient `CantUntap` (a spell/effect
+    /// that installs "creatures don't untap …" by typed/filter target rather than
+    /// a single `SpecificObject`) removes every affected permanent from the
+    /// max-untap cap group AND the cap math. Here a creature-wide transient
+    /// CantUntap makes BOTH tapped creatures ineligible, so the eligible group
+    /// drops to zero — under the cap — and no `ChooseUntapSubset` prompt is
+    /// raised. Proves the cap prompt no longer offers a permanent that cannot
+    /// legally untap. Builds for the class (any filter-scoped transient
+    /// CantUntap), not a single card.
+    #[test]
+    fn max_untap_prompt_excludes_filter_scoped_transient_cant_untap() {
+        use crate::types::ability::{ContinuousModification, Duration, TargetFilter, TypedFilter};
+
+        let mut state = setup();
+        state.active_player = PlayerId(0);
+
+        let smoke = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Smoke".to_string(),
+            Zone::Battlefield,
+        );
+        install_max_untap_one_creature_static(&mut state, smoke);
+
+        let creature_a = create_tapped_creature(&mut state, 2, "Bear A");
+        let creature_b = create_tapped_creature(&mut state, 3, "Bear B");
+
+        // Without the transient effect, the over-cap group offers both creatures.
+        let (group, _max) = max_untap_subset_prompt(&state, PlayerId(0), &HashSet::new())
+            .expect("two over a cap of one must prompt before the transient effect");
+        assert_eq!(group.len(), 2);
+
+        // Install a filter-scoped transient CantUntap on ALL creatures (a typed
+        // filter target, not SpecificObject). Source is the smoke permanent.
+        let source = create_object(
+            &mut state,
+            CardId(4),
+            PlayerId(0),
+            "Frost Lattice".to_string(),
+            Zone::Battlefield,
+        );
+        state.add_transient_continuous_effect(
+            source,
+            PlayerId(0),
+            Duration::UntilEndOfTurn,
+            TargetFilter::Typed(TypedFilter::creature()),
+            vec![ContinuousModification::AddStaticMode {
+                mode: StaticMode::CantUntap,
+            }],
+            None,
+        );
+
+        // Both creatures are now ineligible to untap, so the eligible group is
+        // empty — at/under the cap — and no subset prompt is raised.
+        assert!(
+            max_untap_subset_prompt(&state, PlayerId(0), &HashSet::new()).is_none(),
+            "filter-scoped transient CantUntap removes affected permanents from the cap group"
+        );
+        assert!(
+            untap_excluded_ids(&state, PlayerId(0))
+                .is_superset(&[creature_a, creature_b].into_iter().collect()),
+            "both creatures are excluded by the filter-scoped transient CantUntap"
+        );
+
+        // And the real untap step keeps both tapped (cap prompt and untap agree).
+        execute_untap(&mut state, &mut Vec::new());
+        assert!(state.objects[&creature_a].tapped);
+        assert!(state.objects[&creature_b].tapped);
     }
 
     #[test]
@@ -3160,6 +5320,149 @@ mod tests {
         assert!(state.players[0].has_drawn_this_turn);
     }
 
+    /// CR 805.4b: "Each player on a team draws a card during that team's
+    /// draw step." A single `execute_draw` call must seed the queue with
+    /// both active-team members and drain it to completion in the common
+    /// (no-pause) case.
+    #[test]
+    fn execute_draw_two_headed_giant_both_teammates_draw() {
+        let mut state = GameState::new(crate::types::FormatConfig::two_headed_giant(), 4, 0);
+        state.active_player = PlayerId(0);
+        let card0 = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Card0".to_string(),
+            Zone::Library,
+        );
+        let card1 = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(1),
+            "Card1".to_string(),
+            Zone::Library,
+        );
+
+        let mut events = Vec::new();
+        let result = execute_draw(&mut state, &mut events);
+
+        assert!(result.is_none(), "no replacement pause expected here");
+        assert!(state.players[0].hand.contains(&card0));
+        assert!(state.players[1].hand.contains(&card1));
+        assert!(state.players[0].has_drawn_this_turn);
+        assert!(state.players[1].has_drawn_this_turn);
+        assert!(
+            state.pending_team_draw_step.is_empty(),
+            "the draw-step queue must be fully drained, not left with stale entries"
+        );
+    }
+
+    #[test]
+    fn execute_draw_archenemy_hero_team_draws_all_living_heroes() {
+        let mut state = GameState::new(crate::types::FormatConfig::archenemy(), 4, 0);
+        state.active_player = PlayerId(1);
+        let archenemy_card = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Scheme Boss Draw".to_string(),
+            Zone::Library,
+        );
+        let hero_cards: Vec<ObjectId> = (1u8..=3)
+            .map(|seat| {
+                create_object(
+                    &mut state,
+                    CardId(10 + u64::from(seat)),
+                    PlayerId(seat),
+                    format!("Hero {seat} Draw"),
+                    Zone::Library,
+                )
+            })
+            .collect();
+
+        let mut events = Vec::new();
+        let result = execute_draw(&mut state, &mut events);
+
+        assert!(result.is_none(), "no replacement pause expected here");
+        assert!(state.players[0].library.contains(&archenemy_card));
+        for (offset, card) in hero_cards.iter().enumerate() {
+            assert!(state.players[offset + 1].hand.contains(card));
+        }
+    }
+
+    #[test]
+    fn execute_draw_archenemy_turn_draws_only_archenemy() {
+        let mut state = GameState::new(crate::types::FormatConfig::archenemy(), 4, 0);
+        state.active_player = PlayerId(0);
+        let archenemy_card = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Archenemy Draw".to_string(),
+            Zone::Library,
+        );
+        let hero_card = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(1),
+            "Hero Draw".to_string(),
+            Zone::Library,
+        );
+
+        let mut events = Vec::new();
+        let result = execute_draw(&mut state, &mut events);
+
+        assert!(result.is_none(), "no replacement pause expected here");
+        assert!(state.players[0].hand.contains(&archenemy_card));
+        assert!(state.players[1].library.contains(&hero_card));
+    }
+
+    /// CR 805.4b + CR 616.1: regression for the resumption gap flagged in
+    /// review — if the active player's draw-step draw paused on a
+    /// competing-replacement choice and was then resumed (popping the active
+    /// player off the queue's front), the teammate left in the queue must
+    /// still be drawn for by a later `drain_pending_team_draw_step` call
+    /// (the exact call `handle_replacement_choice`'s resume epilogue makes),
+    /// not silently dropped.
+    #[test]
+    fn drain_pending_team_draw_step_resumes_remaining_queued_teammate() {
+        let mut state = GameState::new(crate::types::FormatConfig::two_headed_giant(), 4, 0);
+        state.active_player = PlayerId(0);
+        let card0 = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Card0".to_string(),
+            Zone::Library,
+        );
+        let card1 = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(1),
+            "Card1".to_string(),
+            Zone::Library,
+        );
+
+        // Simulate "P0's draw already completed and was popped off the
+        // front; P1 is still owed their draw" — the exact state the queue
+        // is in immediately after a resumed P0 draw, before P1 has drawn.
+        state.pending_team_draw_step = vec![PlayerId(1)];
+
+        let mut events = Vec::new();
+        let result = drain_pending_team_draw_step(&mut state, &mut events);
+
+        assert!(result.is_none());
+        assert!(
+            state.players[0].hand.is_empty() && state.players[0].library.contains(&card0),
+            "P0 already drew in this scenario — this call must not draw for them again"
+        );
+        assert!(
+            state.players[1].hand.contains(&card1),
+            "P1's queued draw must still happen on resume"
+        );
+        assert!(state.pending_team_draw_step.is_empty());
+    }
+
     #[test]
     fn should_skip_draw_on_turn_1() {
         let mut state = setup();
@@ -3397,6 +5700,228 @@ mod tests {
         assert_eq!(state.objects[&id].damage_marked, 0);
     }
 
+    #[test]
+    fn execute_cleanup_preserves_damage_under_damage_not_removed_static() {
+        use crate::types::card_type::CoreType;
+
+        let mut state = setup();
+
+        // Ancient-Adamantoise-style permanent: its own damage isn't removed at
+        // cleanup. CR 514.2 — the static suppresses the turn-based removal.
+        let protected = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Ancient Adamantoise".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let defs = crate::parser::oracle_static::parse_static_line_multi(
+                "Damage isn't removed from this creature during cleanup steps.",
+            );
+            assert!(
+                defs.iter()
+                    .any(|d| d.mode == StaticMode::DamageNotRemovedDuringCleanup),
+                "static must parse to DamageNotRemovedDuringCleanup, got {:?}",
+                defs.iter().map(|d| &d.mode).collect::<Vec<_>>()
+            );
+            let obj = state.objects.get_mut(&protected).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.base_card_types = obj.card_types.clone();
+            obj.damage_marked = 4;
+            for def in defs.iter().cloned() {
+                obj.static_definitions.push(def);
+            }
+            Arc::make_mut(&mut obj.base_static_definitions).extend(defs);
+        }
+
+        // A normal creature: its damage IS removed at cleanup (control).
+        let normal = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Grizzly Bears".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&normal).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.base_card_types = obj.card_types.clone();
+            obj.damage_marked = 3;
+        }
+
+        let mut events = Vec::new();
+        execute_cleanup(&mut state, &mut events);
+
+        assert_eq!(
+            state.objects[&protected].damage_marked, 4,
+            "damage must persist under DamageNotRemovedDuringCleanup"
+        );
+        assert_eq!(
+            state.objects[&normal].damage_marked, 0,
+            "a normal creature's damage is still removed at cleanup"
+        );
+    }
+
+    #[test]
+    fn finish_cleanup_discard_preserves_damage_under_damage_not_removed_static() {
+        use crate::types::card_type::CoreType;
+
+        let mut state = setup();
+        state.active_player = PlayerId(0);
+
+        // 9 cards in hand so cleanup must DEFER to a discard-to-hand-size choice,
+        // routing the damage clearing through `finish_cleanup_discard`.
+        let mut hand_ids = Vec::new();
+        for i in 0..9 {
+            let id = create_object(
+                &mut state,
+                CardId(100 + i),
+                PlayerId(0),
+                format!("Card {}", i),
+                Zone::Hand,
+            );
+            hand_ids.push(id);
+        }
+
+        // Ancient-Adamantoise-style protected permanent with marked damage.
+        let protected = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Ancient Adamantoise".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let defs = crate::parser::oracle_static::parse_static_line_multi(
+                "Damage isn't removed from this creature during cleanup steps.",
+            );
+            let obj = state.objects.get_mut(&protected).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.base_card_types = obj.card_types.clone();
+            obj.damage_marked = 4;
+            for def in defs.iter().cloned() {
+                obj.static_definitions.push(def);
+            }
+            Arc::make_mut(&mut obj.base_static_definitions).extend(defs);
+        }
+
+        // Normal creature with marked damage (control).
+        let normal = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Grizzly Bears".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&normal).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.base_card_types = obj.card_types.clone();
+            obj.damage_marked = 3;
+        }
+
+        // Cleanup defers: over hand size, the damage clearing is postponed to the
+        // discard finish, so both creatures still carry their damage here.
+        let mut events = Vec::new();
+        let waiting = execute_cleanup(&mut state, &mut events);
+        assert!(
+            matches!(waiting, Some(WaitingFor::DiscardToHandSize { .. })),
+            "expected a discard-to-hand-size choice, got {:?}",
+            waiting
+        );
+        assert_eq!(
+            state.objects[&protected].damage_marked, 4,
+            "damage clearing is deferred until the discard finishes"
+        );
+        assert_eq!(
+            state.objects[&normal].damage_marked, 3,
+            "damage clearing is deferred until the discard finishes"
+        );
+
+        // Finish the discard: the deferred cleanup damage clearing runs through
+        // the shared helper, so the protected creature KEEPS its damage while the
+        // normal creature's is removed.
+        finish_cleanup_discard(
+            &mut state,
+            PlayerId(0),
+            &[hand_ids[7], hand_ids[8]],
+            &mut events,
+        );
+
+        assert_eq!(
+            state.objects[&protected].damage_marked, 4,
+            "CR 514.2: protected damage must persist even through the discard path"
+        );
+        assert_eq!(
+            state.objects[&normal].damage_marked, 0,
+            "a normal creature's damage is removed when the discard finishes"
+        );
+    }
+
+    #[test]
+    fn execute_cleanup_preserves_phased_out_creature_damage_under_static() {
+        use crate::game::game_object::{PhaseOutCause, PhaseStatus};
+        use crate::types::card_type::CoreType;
+
+        let mut state = setup();
+        state.active_player = PlayerId(0);
+
+        // Patient Zero: "Damage isn't removed from creatures your opponents
+        // control during cleanup steps." — the static source (controlled by P0).
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Patient Zero".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let defs = crate::parser::oracle_static::parse_static_line_multi(
+                "Damage isn't removed from creatures your opponents control during cleanup steps.",
+            );
+            assert!(defs
+                .iter()
+                .any(|d| d.mode == StaticMode::DamageNotRemovedDuringCleanup));
+            let obj = state.objects.get_mut(&source).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.base_card_types = obj.card_types.clone();
+            for def in defs.iter().cloned() {
+                obj.static_definitions.push(def);
+            }
+            Arc::make_mut(&mut obj.base_static_definitions).extend(defs);
+        }
+
+        // A phased-out opponent creature with marked damage. CR 514.2 + CR
+        // 702.26b: damage removal at cleanup is a turn-based action over the
+        // whole battlefield (including phased-out permanents), so the static must
+        // preserve this creature's damage even while it is phased out.
+        let phased = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(1),
+            "Grizzly Bears".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&phased).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.base_card_types = obj.card_types.clone();
+            obj.damage_marked = 3;
+            obj.phase_status = PhaseStatus::PhasedOut {
+                cause: PhaseOutCause::Directly,
+            };
+        }
+
+        let mut events = Vec::new();
+        execute_cleanup(&mut state, &mut events);
+
+        assert_eq!(
+            state.objects[&phased].damage_marked, 3,
+            "a phased-out opponent creature's damage must persist under the static"
+        );
+    }
+
     /// CR 117.1c + CR 503.2: After Untap (no priority), the engine must hand
     /// the active player priority during Upkeep — even when no triggers fired.
     /// Previously `auto_advance` skipped past empty Upkeep/Draw windows, which
@@ -3430,6 +5955,320 @@ mod tests {
                 player: PlayerId(0)
             }
         ));
+    }
+
+    #[test]
+    fn auto_advance_returns_upkeep_sba_waiting_state() {
+        let mut state = setup();
+        state.phase = Phase::Untap;
+        state.turn_number = 2;
+        state.active_player = PlayerId(0);
+
+        for card_id in [1, 2] {
+            let legend = create_object(
+                &mut state,
+                CardId(card_id),
+                PlayerId(0),
+                "Mirror Legend".to_string(),
+                Zone::Battlefield,
+            );
+            state
+                .objects
+                .get_mut(&legend)
+                .unwrap()
+                .card_types
+                .supertypes
+                .push(Supertype::Legendary);
+        }
+
+        let mut events = Vec::new();
+        let waiting = auto_advance(&mut state, &mut events);
+
+        assert_eq!(state.phase, Phase::Upkeep);
+        assert!(matches!(
+            waiting,
+            WaitingFor::ChooseLegend {
+                player: PlayerId(0),
+                ..
+            }
+        ));
+    }
+
+    /// Regression for #1375: Twilight Prophet's upkeep trigger requires the city's blessing.
+    /// The city blessing is granted by SBAs (CR 702.131b), so SBAs must run before
+    /// beginning-of-upkeep triggers are collected. This test verifies that when a player
+    /// controls 10 permanents with an Ascend permanent, the city blessing is granted
+    /// before upkeep triggers are evaluated.
+    #[test]
+    fn city_blessing_granted_before_upkeep_triggers() {
+        let mut state = setup();
+        state.phase = Phase::Untap;
+        state.turn_number = 2;
+        state.active_player = PlayerId(0);
+
+        // Player controls 10 permanents including one with Ascend
+        let ascend_permanent = create_object(
+            &mut state,
+            CardId(0),
+            PlayerId(0),
+            "Ascend Permanent".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&ascend_permanent)
+            .unwrap()
+            .keywords
+            .push(crate::types::keywords::Keyword::Ascend);
+
+        for i in 1..10 {
+            create_object(
+                &mut state,
+                CardId(i),
+                PlayerId(0),
+                format!("Permanent {}", i),
+                Zone::Battlefield,
+            );
+        }
+
+        // Add Twilight Prophet with an upkeep trigger that checks for city blessing
+        let prophet = create_object(
+            &mut state,
+            CardId(100),
+            PlayerId(0),
+            "Twilight Prophet".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&prophet)
+            .unwrap()
+            .trigger_definitions
+            .push(
+                crate::types::ability::TriggerDefinition::new(
+                    crate::types::triggers::TriggerMode::Phase,
+                )
+                .condition(crate::types::ability::TriggerCondition::HasCityBlessing)
+                .description("Test trigger".to_string()),
+            );
+
+        // Untap step: no priority, just advance to Upkeep
+        let mut events = Vec::new();
+        auto_advance(&mut state, &mut events);
+
+        // Should be in Upkeep now
+        assert_eq!(state.phase, Phase::Upkeep);
+
+        // City blessing should be granted by SBAs before upkeep triggers
+        assert!(state.city_blessing.contains(&PlayerId(0)));
+    }
+
+    /// Regression for #1305: Thalisse's end step trigger counts tokens created this turn.
+    /// This test verifies that tokens created during the turn are correctly counted
+    /// when the end step trigger fires.
+    #[test]
+    fn thalisse_token_counting_at_end_step() {
+        let mut state = setup();
+        state.phase = Phase::Untap;
+        state.turn_number = 2;
+        state.active_player = PlayerId(0);
+
+        // Add Thalisse with an end step trigger that counts tokens created this turn
+        let thalisse = create_object(
+            &mut state,
+            CardId(100),
+            PlayerId(0),
+            "Thalisse, Reverent Medium".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&thalisse)
+            .unwrap()
+            .trigger_definitions
+            .push(
+                crate::types::ability::TriggerDefinition::new(
+                    crate::types::triggers::TriggerMode::Phase,
+                )
+                .phase(Phase::End)
+                .condition(
+                    crate::types::ability::TriggerCondition::QuantityComparison {
+                        lhs: crate::types::ability::QuantityExpr::Ref {
+                            qty: crate::types::ability::QuantityRef::TokensCreatedThisTurn {
+                                player: crate::types::ability::PlayerScope::Controller,
+                                filter: crate::types::ability::TargetFilter::Any,
+                            },
+                        },
+                        comparator: crate::types::ability::Comparator::GE,
+                        rhs: crate::types::ability::QuantityExpr::Fixed { value: 1 },
+                    },
+                )
+                .description("Test trigger".to_string()),
+            );
+
+        // Create 3 tokens during the turn
+        for i in 0..3 {
+            let token = create_object(
+                &mut state,
+                CardId(i),
+                PlayerId(0),
+                format!("Token {}", i),
+                Zone::Battlefield,
+            );
+            state.objects.get_mut(&token).unwrap().is_token = true;
+            crate::game::restrictions::record_token_created(&mut state, token);
+        }
+
+        // Advance to end step
+        state.phase = Phase::PostCombatMain;
+        advance_phase(&mut state, &mut Vec::new()); // PostCombatMain → End
+        let mut events = Vec::new();
+        auto_advance(&mut state, &mut events);
+
+        // Should be in End phase now
+        assert_eq!(state.phase, Phase::End);
+
+        // Verify tokens created this turn is 3
+        assert_eq!(state.created_tokens_this_turn.len(), 3);
+    }
+
+    /// Regression for #1307: Moseo's trigger checks life gained this turn.
+    /// This test verifies that life gained during the turn is correctly tracked
+    /// and the trigger condition evaluates correctly.
+    #[test]
+    fn moseo_life_gained_trigger_condition() {
+        let mut state = setup();
+        state.phase = Phase::Untap;
+        state.turn_number = 2;
+        state.active_player = PlayerId(0);
+
+        // Add Moseo with a trigger that checks life gained this turn
+        let moseo = create_object(
+            &mut state,
+            CardId(100),
+            PlayerId(0),
+            "Moseo, Vein's New Dean".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&moseo)
+            .unwrap()
+            .trigger_definitions
+            .push(
+                crate::types::ability::TriggerDefinition::new(
+                    crate::types::triggers::TriggerMode::LifeGained,
+                )
+                .condition(
+                    crate::types::ability::TriggerCondition::QuantityComparison {
+                        lhs: crate::types::ability::QuantityExpr::Ref {
+                            qty: crate::types::ability::QuantityRef::LifeGainedThisTurn {
+                                player: crate::types::ability::PlayerScope::Controller,
+                            },
+                        },
+                        comparator: crate::types::ability::Comparator::GE,
+                        rhs: crate::types::ability::QuantityExpr::Fixed { value: 3 },
+                    },
+                )
+                .description("Test trigger".to_string()),
+            );
+
+        // Simulate gaining 5 life this turn
+        state.players[0].life_gained_this_turn = 5;
+
+        // Check that the condition evaluates correctly
+        let condition = crate::types::ability::TriggerCondition::QuantityComparison {
+            lhs: crate::types::ability::QuantityExpr::Ref {
+                qty: crate::types::ability::QuantityRef::LifeGainedThisTurn {
+                    player: crate::types::ability::PlayerScope::Controller,
+                },
+            },
+            comparator: crate::types::ability::Comparator::GE,
+            rhs: crate::types::ability::QuantityExpr::Fixed { value: 3 },
+        };
+        assert!(
+            crate::game::triggers::check_trigger_condition(
+                &state,
+                &condition,
+                PlayerId(0),
+                Some(moseo),
+                None
+            ),
+            "Condition should be true when 5 life gained (>= 3)"
+        );
+    }
+
+    /// Regression for #1356: Tinybones end step trigger checks opponent discards.
+    /// This test verifies that cards discarded by opponents are correctly tracked
+    /// and the trigger condition evaluates correctly.
+    #[test]
+    fn tinybones_opponent_discard_trigger_condition() {
+        let mut state = setup();
+        state.phase = Phase::Untap;
+        state.turn_number = 2;
+        state.active_player = PlayerId(0);
+
+        // Add Tinybones with an end step trigger that checks opponent discards
+        let tinybones = create_object(
+            &mut state,
+            CardId(100),
+            PlayerId(0),
+            "Tinybones, Trinket Thief".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&tinybones)
+            .unwrap()
+            .trigger_definitions
+            .push(
+                crate::types::ability::TriggerDefinition::new(
+                    crate::types::triggers::TriggerMode::Phase,
+                )
+                .phase(Phase::End)
+                .condition(
+                    crate::types::ability::TriggerCondition::QuantityComparison {
+                        lhs: crate::types::ability::QuantityExpr::Ref {
+                            qty: crate::types::ability::QuantityRef::CardsDiscardedThisTurn {
+                                player: crate::types::ability::PlayerScope::Opponent {
+                                    aggregate: crate::types::ability::AggregateFunction::Sum,
+                                },
+                            },
+                        },
+                        comparator: crate::types::ability::Comparator::GE,
+                        rhs: crate::types::ability::QuantityExpr::Fixed { value: 1 },
+                    },
+                )
+                .description("Test trigger".to_string()),
+            );
+
+        // Simulate opponent discarding 2 cards this turn
+        state
+            .cards_discarded_this_turn_by_player
+            .insert(PlayerId(1), 2);
+
+        // Check that the condition evaluates correctly
+        let condition = crate::types::ability::TriggerCondition::QuantityComparison {
+            lhs: crate::types::ability::QuantityExpr::Ref {
+                qty: crate::types::ability::QuantityRef::CardsDiscardedThisTurn {
+                    player: crate::types::ability::PlayerScope::Opponent {
+                        aggregate: crate::types::ability::AggregateFunction::Sum,
+                    },
+                },
+            },
+            comparator: crate::types::ability::Comparator::GE,
+            rhs: crate::types::ability::QuantityExpr::Fixed { value: 1 },
+        };
+        assert!(
+            crate::game::triggers::check_trigger_condition(
+                &state,
+                &condition,
+                PlayerId(0),
+                Some(tinybones),
+                None
+            ),
+            "Condition should be true when opponent discarded 2 cards (>= 1)"
+        );
     }
 
     #[test]
@@ -3554,6 +6393,63 @@ mod tests {
         assert!(!state.players[0].library.contains(&id));
     }
 
+    /// CR 500.1–500.4 / CR 501.1 / CR 505.1 / CR 506.1 / CR 512.1: exhaustive
+    /// phase → last-step-of-containing-phase mapping.
+    #[test]
+    fn last_step_of_phase_maps_each_phase_to_its_phases_final_step() {
+        assert_eq!(last_step_of_phase(Phase::Untap), Phase::Draw);
+        assert_eq!(last_step_of_phase(Phase::Upkeep), Phase::Draw);
+        assert_eq!(last_step_of_phase(Phase::Draw), Phase::Draw);
+        assert_eq!(
+            last_step_of_phase(Phase::PreCombatMain),
+            Phase::PreCombatMain
+        );
+        assert_eq!(last_step_of_phase(Phase::BeginCombat), Phase::EndCombat);
+        assert_eq!(
+            last_step_of_phase(Phase::DeclareAttackers),
+            Phase::EndCombat
+        );
+        assert_eq!(last_step_of_phase(Phase::DeclareBlockers), Phase::EndCombat);
+        assert_eq!(last_step_of_phase(Phase::CombatDamage), Phase::EndCombat);
+        assert_eq!(last_step_of_phase(Phase::EndCombat), Phase::EndCombat);
+        assert_eq!(
+            last_step_of_phase(Phase::PostCombatMain),
+            Phase::PostCombatMain
+        );
+        assert_eq!(last_step_of_phase(Phase::End), Phase::Cleanup);
+        assert_eq!(last_step_of_phase(Phase::Cleanup), Phase::Cleanup);
+    }
+
+    /// CR 103.8a: the turn-1 draw skip applies only to the starting player's
+    /// FIRST (natural) draw step. An inserted beginning phase's draw step
+    /// (`extra_phase_resume` non-empty) must still perform the turn-based draw,
+    /// even on turn 1 in a 2-player game (Temple of Atropos as the starting plane).
+    #[test]
+    fn inserted_beginning_phase_draw_not_skipped_on_first_turn() {
+        let mut state = setup(); // 2-player, turn_number = 1
+        state.phase = Phase::Draw;
+        state.active_player = PlayerId(0);
+        // Simulate being inside an inserted beginning phase.
+        state.extra_phase_resume = vec![Phase::PostCombatMain];
+
+        let id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Card".to_string(),
+            Zone::Library,
+        );
+
+        let mut events = Vec::new();
+        auto_advance(&mut state, &mut events);
+
+        assert!(
+            state.players[0].hand.contains(&id),
+            "CR 103.8a: an inserted beginning phase's draw must not be skipped",
+        );
+        assert!(!state.players[0].library.contains(&id));
+    }
+
     #[test]
     fn skip_draw_step_static_prevents_draw() {
         use crate::types::statics::StaticMode;
@@ -3597,6 +6493,66 @@ mod tests {
             "draw step should be skipped when SkipStep(Draw) static is active"
         );
         assert!(!state.players[0].hand.contains(&card_id));
+    }
+
+    #[test]
+    fn all_player_static_step_skip_affects_noncontroller_active_player() {
+        use crate::types::ability::TargetFilter;
+        use crate::types::statics::StaticMode;
+
+        let mut state = setup();
+        state.active_player = PlayerId(1);
+
+        let hub_id = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Eon Hub".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&hub_id)
+            .unwrap()
+            .static_definitions
+            .push(
+                crate::types::ability::StaticDefinition::new(StaticMode::SkipStep {
+                    step: Phase::Upkeep,
+                })
+                .affected(TargetFilter::Player),
+            );
+
+        assert!(should_skip_step_static(&state, Phase::Upkeep));
+    }
+
+    #[test]
+    fn controller_static_step_skip_does_not_affect_opponent() {
+        use crate::types::ability::TargetFilter;
+        use crate::types::statics::StaticMode;
+
+        let mut state = setup();
+        state.active_player = PlayerId(1);
+
+        let enchant_id = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Necropotence".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&enchant_id)
+            .unwrap()
+            .static_definitions
+            .push(
+                crate::types::ability::StaticDefinition::new(StaticMode::SkipStep {
+                    step: Phase::Draw,
+                })
+                .affected(TargetFilter::Controller),
+            );
+
+        assert!(!should_skip_step_static(&state, Phase::Draw));
     }
 
     #[test]
@@ -3745,6 +6701,77 @@ mod tests {
             "state.waiting_for should be GameOver, got {:?}",
             state.waiting_for
         );
+    }
+
+    #[test]
+    fn auto_advance_combat_damage_flushes_layers_before_reading_power() {
+        use crate::game::combat::{AttackTarget, AttackerInfo, CombatState};
+        use crate::types::card_type::CoreType;
+        use crate::types::counter::CounterType;
+
+        let mut state = GameState::new_two_player(42);
+        state.turn_number = 2;
+        state.active_player = PlayerId(0);
+        state.phase = Phase::CombatDamage;
+
+        let attacker = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Counter Beast".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&attacker).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.power = Some(1);
+            obj.toughness = Some(3);
+            obj.base_power = Some(1);
+            obj.base_toughness = Some(3);
+            obj.base_characteristics_initialized = true;
+            obj.counters.insert(CounterType::Plus1Plus1, 8);
+            obj.entered_battlefield_turn = Some(1);
+        }
+
+        let planeswalker = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(1),
+            "Professor Onyx".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&planeswalker).unwrap();
+            obj.card_types.core_types.push(CoreType::Planeswalker);
+            // CR 306.5b: loyalty field and counter map mirror each other.
+            obj.loyalty = Some(10);
+            obj.counters.insert(CounterType::Loyalty, 10);
+        }
+
+        state.layers_dirty.mark_full();
+        assert_eq!(
+            state.objects.get(&attacker).unwrap().power,
+            Some(1),
+            "precondition: attacker power is stale before the CombatDamage phase arm runs"
+        );
+
+        state.combat = Some(CombatState {
+            attackers: vec![AttackerInfo::new(
+                attacker,
+                AttackTarget::Planeswalker(planeswalker),
+                PlayerId(1),
+            )],
+            ..Default::default()
+        });
+
+        let mut events = Vec::new();
+        let _ = auto_advance(&mut state, &mut events);
+
+        // CR 510.1a + CR 120.3c + CR 613.4c: combat damage uses evaluated power,
+        // including +1/+1 counters from layer 7c. Without the CombatDamage pre-flush
+        // in auto_advance, this remains at 9 because stale base power dealt only 1.
+        assert_eq!(state.objects[&planeswalker].loyalty, Some(1));
+        assert_eq!(state.players[1].life, 20);
     }
 
     /// CR 800.4: When the active player is eliminated mid-turn in multiplayer,
@@ -4327,6 +7354,57 @@ mod tests {
     }
 
     #[test]
+    fn two_headed_giant_natural_turn_advances_to_opposing_team() {
+        let mut state = GameState::new(
+            crate::types::format::FormatConfig::two_headed_giant(),
+            4,
+            42,
+        );
+        state.active_player = PlayerId(0);
+        state.turn_number = 1;
+
+        let mut events = Vec::new();
+        start_next_turn(&mut state, &mut events);
+
+        assert_eq!(state.active_player, PlayerId(2));
+    }
+
+    #[test]
+    fn two_headed_giant_rotated_order_advances_to_next_team_representative() {
+        let mut state = GameState::new(
+            crate::types::format::FormatConfig::two_headed_giant(),
+            4,
+            42,
+        );
+        crate::game::engine::start_game_with_starting_player(&mut state, PlayerId(1));
+
+        let mut events = Vec::new();
+        start_next_turn(&mut state, &mut events);
+
+        assert_eq!(
+            state.seat_order,
+            vec![PlayerId(1), PlayerId(2), PlayerId(3), PlayerId(0)]
+        );
+        assert_eq!(state.active_player, PlayerId(2));
+
+        start_next_turn(&mut state, &mut events);
+
+        assert_eq!(state.active_player, PlayerId(0));
+    }
+
+    #[test]
+    fn free_for_all_natural_turn_still_advances_seat_by_seat() {
+        let mut state = GameState::new(crate::types::format::FormatConfig::free_for_all(), 4, 42);
+        state.active_player = PlayerId(0);
+        state.turn_number = 1;
+
+        let mut events = Vec::new();
+        start_next_turn(&mut state, &mut events);
+
+        assert_eq!(state.active_player, PlayerId(1));
+    }
+
+    #[test]
     fn controlled_turn_uses_controller_then_grants_extra_turn_afterward() {
         let mut state = setup();
         state.active_player = PlayerId(0);
@@ -4337,6 +7415,7 @@ mod tests {
                 target_player: PlayerId(1),
                 controller: PlayerId(0),
                 grant_extra_turn_after: true,
+                window: crate::types::ability::ControlWindow::NextTurn,
             });
 
         let mut events = Vec::new();
@@ -4356,6 +7435,162 @@ mod tests {
     }
 
     #[test]
+    fn projected_turn_order_tracks_normal_and_reversed_multiplayer_order() {
+        let mut state = GameState::new(crate::types::format::FormatConfig::free_for_all(), 4, 42);
+        state.active_player = PlayerId(0);
+
+        assert_eq!(
+            projected_turn_order(&state, 4),
+            vec![PlayerId(0), PlayerId(1), PlayerId(2), PlayerId(3)]
+        );
+
+        state.turn_direction = crate::types::phase::TurnDirection::Reversed;
+
+        assert_eq!(
+            projected_turn_order(&state, 4),
+            vec![PlayerId(0), PlayerId(3), PlayerId(2), PlayerId(1)]
+        );
+    }
+
+    #[test]
+    fn projected_turn_order_skips_turn_counter_without_mutating_original() {
+        let mut state = GameState::new(crate::types::format::FormatConfig::free_for_all(), 4, 42);
+        state.active_player = PlayerId(0);
+        state.turns_to_skip[1] = 1;
+
+        let projected = projected_turn_order(&state, 3);
+
+        assert_eq!(
+            projected,
+            vec![PlayerId(0), PlayerId(2), PlayerId(3)],
+            "P1's skipped turn must not emit a display slot"
+        );
+        assert_eq!(
+            state.turns_to_skip[1], 1,
+            "projection must not consume the source state's skip counter"
+        );
+    }
+
+    #[test]
+    fn projected_turn_order_begin_turn_replacement_skips_extra_turn_cursor() {
+        use crate::types::ability::ReplacementCondition;
+        use crate::types::identifiers::ObjectId;
+
+        let mut state = GameState::new(crate::types::format::FormatConfig::free_for_all(), 4, 42);
+        state.active_player = PlayerId(0);
+        state.extra_turns.push(PlayerId(2));
+        install_begin_turn_skip_permanent(
+            &mut state,
+            ObjectId(100),
+            PlayerId(1),
+            Some(ReplacementCondition::OnlyExtraTurn),
+        );
+
+        let projected = projected_turn_order(&state, 2);
+
+        assert_eq!(
+            projected,
+            vec![PlayerId(0), PlayerId(3)],
+            "P2's prevented extra turn leaves the cursor on P2, so the next natural slot is P3"
+        );
+        assert_eq!(
+            state.extra_turns,
+            vec![PlayerId(2)],
+            "projection must not pop the source state's queued extra turn"
+        );
+        assert!(
+            state.pending_replacement.is_none(),
+            "read-only projection must not park a replacement choice"
+        );
+    }
+
+    #[test]
+    fn projected_turn_order_controlled_turn_completion_enqueues_extra_turn() {
+        let mut state = GameState::new(crate::types::format::FormatConfig::free_for_all(), 4, 42);
+        state.active_player = PlayerId(1);
+        state.turn_decision_controller = Some(PlayerId(2));
+        state
+            .scheduled_turn_controls
+            .push(crate::types::game_state::ScheduledTurnControl {
+                target_player: PlayerId(1),
+                controller: PlayerId(2),
+                grant_extra_turn_after: true,
+                window: ControlWindow::NextTurn,
+            });
+
+        let projected = projected_turn_order(&state, 2);
+
+        assert_eq!(
+            projected,
+            vec![PlayerId(1), PlayerId(1)],
+            "the controller's promised extra turn for P1 appears before natural order resumes"
+        );
+        assert!(state.extra_turns.is_empty());
+        assert_eq!(state.scheduled_turn_controls.len(), 1);
+        assert_eq!(state.turn_decision_controller, Some(PlayerId(2)));
+    }
+
+    #[test]
+    fn projected_turn_order_activates_scheduled_control_then_releases_it() {
+        let mut state = GameState::new(crate::types::format::FormatConfig::free_for_all(), 4, 42);
+        state.active_player = PlayerId(0);
+        state
+            .scheduled_turn_controls
+            .push(crate::types::game_state::ScheduledTurnControl {
+                target_player: PlayerId(1),
+                controller: PlayerId(2),
+                grant_extra_turn_after: true,
+                window: ControlWindow::NextTurn,
+            });
+
+        let projected = projected_turn_order(&state, 3);
+
+        assert_eq!(
+            projected,
+            vec![PlayerId(0), PlayerId(1), PlayerId(1)],
+            "scheduled control must bind to P1's natural turn, then grant P1 the follow-up extra turn"
+        );
+        assert!(state.extra_turns.is_empty());
+        assert_eq!(state.scheduled_turn_controls.len(), 1);
+        assert_eq!(state.turn_decision_controller, None);
+    }
+
+    #[test]
+    fn shared_team_control_retires_non_anchor_completed_turn() {
+        let mut state = GameState::new(
+            crate::types::format::FormatConfig::two_headed_giant(),
+            4,
+            42,
+        );
+        state.seat_order = vec![PlayerId(1), PlayerId(2), PlayerId(3), PlayerId(0)];
+        state.active_player = PlayerId(1);
+        state.priority_player = PlayerId(2);
+        state.turn_decision_controller = Some(PlayerId(2));
+        state.turn_number = 1;
+        state
+            .scheduled_turn_controls
+            .push(crate::types::game_state::ScheduledTurnControl {
+                target_player: PlayerId(0),
+                controller: PlayerId(2),
+                grant_extra_turn_after: false,
+                window: crate::types::ability::ControlWindow::NextTurn,
+            });
+
+        let mut events = Vec::new();
+        start_next_turn(&mut state, &mut events);
+
+        assert_eq!(state.active_player, PlayerId(2));
+        assert_eq!(state.turn_decision_controller, None);
+        assert!(state.scheduled_turn_controls.is_empty());
+
+        start_next_turn(&mut state, &mut events);
+
+        assert_eq!(state.active_player, PlayerId(0));
+        assert_eq!(state.turn_decision_controller, None);
+        assert_eq!(state.priority_player, PlayerId(0));
+    }
+
+    #[test]
     fn newest_scheduled_control_for_target_takes_precedence() {
         let mut state = setup();
         state.active_player = PlayerId(0);
@@ -4366,6 +7601,7 @@ mod tests {
                 target_player: PlayerId(1),
                 controller: PlayerId(0),
                 grant_extra_turn_after: false,
+                window: crate::types::ability::ControlWindow::NextTurn,
             });
         state
             .scheduled_turn_controls
@@ -4373,6 +7609,7 @@ mod tests {
                 target_player: PlayerId(1),
                 controller: PlayerId(1),
                 grant_extra_turn_after: false,
+                window: crate::types::ability::ControlWindow::NextTurn,
             });
 
         let mut events = Vec::new();
@@ -4386,6 +7623,198 @@ mod tests {
         assert_eq!(state.active_player, PlayerId(0));
         assert_eq!(state.turn_decision_controller, None);
         assert!(state.scheduled_turn_controls.is_empty());
+    }
+
+    // --- CR 723.2 phase-scoped (NextCombatPhase) player control ---
+
+    fn schedule_combat_phase_control(
+        state: &mut GameState,
+        target: PlayerId,
+        controller: PlayerId,
+    ) {
+        state
+            .scheduled_turn_controls
+            .push(crate::types::game_state::ScheduledTurnControl {
+                target_player: target,
+                controller,
+                grant_extra_turn_after: false,
+                window: ControlWindow::NextCombatPhase,
+            });
+    }
+
+    // CR 723.2 + CR 506.1 + CR 511.3 (test 7.1 — the discriminating core): control
+    // under a NextCombatPhase entry is active EXACTLY within the target's combat
+    // phase. Owner decides upkeep/draw/precombat-main and postcombat-main/end;
+    // controller pilots the five combat steps. Revert-to-red: removing the
+    // `finish_enter_phase` ACTIVATE branch → combat steps stay owner-controlled;
+    // removing the RELEASE branch → PostCombatMain stays controller-controlled.
+    #[test]
+    fn next_combat_phase_control_active_only_during_combat() {
+        let mut state = setup();
+        let owner = PlayerId(1);
+        let controller = PlayerId(0);
+        state.active_player = owner;
+        state.phase = Phase::Untap;
+        schedule_combat_phase_control(&mut state, owner, controller);
+        let mut events = Vec::new();
+
+        for phase in [Phase::Upkeep, Phase::Draw, Phase::PreCombatMain] {
+            enter_phase(&mut state, phase, &mut events);
+            assert_eq!(
+                turn_control::turn_decision_maker(&state),
+                owner,
+                "{phase:?}: owner decides before combat"
+            );
+        }
+        for phase in [
+            Phase::BeginCombat,
+            Phase::DeclareAttackers,
+            Phase::DeclareBlockers,
+            Phase::CombatDamage,
+            Phase::EndCombat,
+        ] {
+            enter_phase(&mut state, phase, &mut events);
+            assert_eq!(
+                turn_control::turn_decision_maker(&state),
+                controller,
+                "{phase:?}: controller pilots combat"
+            );
+        }
+        for phase in [Phase::PostCombatMain, Phase::End] {
+            enter_phase(&mut state, phase, &mut events);
+            assert_eq!(
+                turn_control::turn_decision_maker(&state),
+                owner,
+                "{phase:?}: released — owner decides after combat"
+            );
+        }
+        assert!(
+            state.scheduled_turn_controls.is_empty(),
+            "entry consumed by the phase-boundary release"
+        );
+    }
+
+    // CR 506.7d (by analogy) + CR 500.8 (test 7.2 — first-only latch): with two
+    // combat phases in one turn, control binds to the FIRST only. Revert-to-red:
+    // removing the `next == Phase::BeginCombat` arm of the release condition leaves
+    // the controller piloting combat phase 2.
+    #[test]
+    fn first_combat_phase_only_latch() {
+        let mut state = setup();
+        let owner = PlayerId(1);
+        let controller = PlayerId(0);
+        state.active_player = owner;
+        state.phase = Phase::PreCombatMain;
+        schedule_combat_phase_control(&mut state, owner, controller);
+        let mut events = Vec::new();
+
+        enter_phase(&mut state, Phase::BeginCombat, &mut events);
+        assert_eq!(
+            turn_control::turn_decision_maker(&state),
+            controller,
+            "combat phase 1: controller pilots"
+        );
+        enter_phase(&mut state, Phase::EndCombat, &mut events);
+        assert_eq!(turn_control::turn_decision_maker(&state), controller);
+
+        // CR 500.8: a second (extra) combat phase begins.
+        enter_phase(&mut state, Phase::BeginCombat, &mut events);
+        assert_eq!(
+            turn_control::turn_decision_maker(&state),
+            owner,
+            "combat phase 2: control released, not rebound (first-only)"
+        );
+        assert!(
+            state.scheduled_turn_controls.is_empty(),
+            "entry released at the second BeginCombat"
+        );
+    }
+
+    // CR 723.1b + Scryfall ruling 2025-10-02 (test 7.3 — carry): a skipped combat
+    // phase does NOT lapse the control; it carries to the combat phase the target
+    // actually takes. A wholly-skipped combat never enters
+    // `finish_enter_phase(BeginCombat)`, so activation never fires and the entry
+    // persists across the turn boundary. Revert-to-red: removing the ACTIVATE
+    // branch → the final BeginCombat leaves control with the owner (no activation),
+    // so the carry-activation assertion fails.
+    #[test]
+    fn next_combat_phase_control_carries_across_skipped_combat() {
+        let mut state = setup();
+        let owner = PlayerId(1);
+        let controller = PlayerId(0);
+        state.active_player = owner;
+        state.phase = Phase::Untap;
+        schedule_combat_phase_control(&mut state, owner, controller);
+        let mut events = Vec::new();
+
+        // Owner's turn with combat SKIPPED — never enter BeginCombat.
+        for phase in [
+            Phase::Upkeep,
+            Phase::Draw,
+            Phase::PreCombatMain,
+            Phase::PostCombatMain,
+            Phase::End,
+            Phase::Cleanup,
+        ] {
+            enter_phase(&mut state, phase, &mut events);
+        }
+        assert_eq!(
+            state.turn_decision_controller, None,
+            "no activation on a combat-less turn"
+        );
+
+        // Turn boundary: the NextCombatPhase entry must SURVIVE (carry).
+        start_next_turn(&mut state, &mut events); // -> P0's turn
+        assert_eq!(
+            state.scheduled_turn_controls.len(),
+            1,
+            "carry: entry survives the combat-less turn boundary"
+        );
+        assert_eq!(state.turn_decision_controller, None);
+        start_next_turn(&mut state, &mut events); // -> owner (P1) again
+        assert_eq!(state.active_player, owner);
+
+        // Owner now actually takes a combat phase → control activates.
+        enter_phase(&mut state, Phase::BeginCombat, &mut events);
+        assert_eq!(
+            turn_control::turn_decision_maker(&state),
+            controller,
+            "carried control activates at the combat phase actually taken"
+        );
+    }
+
+    // CR 723.5 + CR 506.2 (test 7.5 — 3+ players): only the controlled active
+    // player's seat reroutes to the controller; every other seat decides for
+    // itself. Revert-to-red: removing the ACTIVATE branch → O's seat routes to
+    // itself (no controller bound), failing the first assertion.
+    #[test]
+    fn next_combat_phase_control_multiplayer_seat_scoping() {
+        let mut state = GameState::new(crate::types::format::FormatConfig::free_for_all(), 4, 42);
+        let controller = PlayerId(0);
+        let owner = PlayerId(1);
+        let bystander = PlayerId(2);
+        state.active_player = owner;
+        state.phase = Phase::PreCombatMain;
+        schedule_combat_phase_control(&mut state, owner, controller);
+        let mut events = Vec::new();
+
+        enter_phase(&mut state, Phase::BeginCombat, &mut events);
+        assert_eq!(turn_control::turn_decision_maker(&state), controller);
+        assert_eq!(
+            turn_control::authorized_submitter_for_player(&state, owner),
+            controller,
+            "controlled active player's seat routes to the controller"
+        );
+        assert_eq!(
+            turn_control::authorized_submitter_for_player(&state, bystander),
+            bystander,
+            "a third player still decides for themselves"
+        );
+        assert_eq!(
+            turn_control::authorized_submitter_for_player(&state, controller),
+            controller,
+            "the controller's own seat is unchanged"
+        );
     }
 
     // --- BeginTurn / BeginPhase replacement pipeline (CR 614.1b, CR 614.10) ---

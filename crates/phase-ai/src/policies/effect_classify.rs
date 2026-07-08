@@ -1,10 +1,13 @@
 use engine::game::filter::{matches_target_filter, FilterContext};
 use engine::game::game_object::GameObject;
 use engine::types::ability::{
-    ContinuousModification, Effect, PtValue, QuantityExpr, TargetFilter, TypeFilter,
+    ContinuousModification, Effect, EffectScope, PtValue, QuantityExpr, TapStateChange,
+    TargetFilter, TriggerDefinition, TypeFilter,
 };
 use engine::types::counter::CounterType;
+use engine::types::game_state::{CastingVariant, GameState, WaitingFor};
 use engine::types::identifiers::ObjectId;
+use engine::types::keywords::Keyword;
 use engine::types::player::PlayerId;
 use engine::types::statics::StaticMode;
 use engine::types::triggers::TriggerMode;
@@ -66,9 +69,9 @@ pub(crate) fn effect_polarity(effect: &Effect) -> EffectPolarity {
         // same semantics — the effect puts counters of `counter_type` onto a target.
         // MultiplyCounter (e.g., Doubling Season) amplifies existing counters: its
         // polarity is context-dependent (doubling -1/-1 on a creature is harmful).
-        Effect::AddCounter { counter_type, .. }
-        | Effect::PutCounter { counter_type, .. }
-        | Effect::PutCounterAll { counter_type, .. } => counter_sign_polarity(counter_type),
+        Effect::PutCounter { counter_type, .. } | Effect::PutCounterAll { counter_type, .. } => {
+            counter_sign_polarity(counter_type)
+        }
         // CR 122.1 + CR 121: Removing counters inverts the placement polarity —
         // removing a +1/+1 counter harms the bearer, removing a -1/-1 counter
         // helps it (Hexcaster's Mark, Solemnity-style interactions, Vampire
@@ -109,10 +112,18 @@ pub(crate) fn effect_polarity(effect: &Effect) -> EffectPolarity {
         Effect::DoublePTAll { .. } => EffectPolarity::Beneficial,
         Effect::SkipNextTurn { .. } | Effect::SkipNextStep { .. } => EffectPolarity::Contextual,
         Effect::Regenerate { .. }
+        | Effect::RemoveAllDamage { .. }
         | Effect::PreventDamage { .. }
         | Effect::Animate { .. }
         | Effect::DoublePT { .. } => EffectPolarity::Beneficial,
-        Effect::Untap { .. } => EffectPolarity::Beneficial,
+        // CR 701.26b: untapping a single permanent is beneficial. The mass
+        // (`All`) scope is left Contextual via the catch-all, matching the
+        // legacy `UntapAll`.
+        Effect::SetTapState {
+            scope: EffectScope::Single,
+            state: TapStateChange::Untap,
+            ..
+        } => EffectPolarity::Beneficial,
         // Beneficial: resource generation and card advantage
         Effect::GainLife { .. }
         | Effect::Draw { .. }
@@ -126,6 +137,14 @@ pub(crate) fn effect_polarity(effect: &Effect) -> EffectPolarity {
         | Effect::Connive { .. }
         | Effect::BecomeMonarch
         | Effect::ExtraTurn { .. } => EffectPolarity::Beneficial,
+        // CR 701.26a: tapping a single permanent is harmful (denies its use).
+        // The mass (`All`) scope is left Contextual via the catch-all, matching
+        // the legacy `TapAll`.
+        Effect::SetTapState {
+            scope: EffectScope::Single,
+            state: TapStateChange::Tap,
+            ..
+        } => EffectPolarity::Harmful,
         // Harmful: removal, disruption, and forced actions
         Effect::Destroy { .. }
         | Effect::DealDamage { .. }
@@ -133,7 +152,6 @@ pub(crate) fn effect_polarity(effect: &Effect) -> EffectPolarity {
         | Effect::DiscardCard { .. }
         | Effect::Mill { .. }
         | Effect::LoseLife { .. }
-        | Effect::Tap { .. }
         | Effect::Bounce { .. }
         | Effect::Counter { .. }
         | Effect::PhaseOut { .. }
@@ -143,7 +161,7 @@ pub(crate) fn effect_polarity(effect: &Effect) -> EffectPolarity {
         | Effect::DestroyAll { .. }
         | Effect::DamageAll { .. }
         | Effect::BounceAll { .. }
-        | Effect::LoseTheGame => EffectPolarity::Harmful,
+        | Effect::LoseTheGame { .. } => EffectPolarity::Harmful,
         // ChangeZone: depends on destination
         Effect::ChangeZone { destination, .. } => match destination {
             Zone::Exile | Zone::Graveyard => EffectPolarity::Harmful,
@@ -176,8 +194,189 @@ pub(crate) fn effect_polarity(effect: &Effect) -> EffectPolarity {
         | Effect::GiftDelivery { .. }
         | Effect::Suspect { .. }
         | Effect::GivePlayerCounter { .. }
-        | Effect::ExchangeControl { .. } => EffectPolarity::Contextual,
-        _ => EffectPolarity::Contextual,
+        | Effect::ExchangeControl { .. }
+        | Effect::ExchangeLifeTotals { .. } => EffectPolarity::Contextual,
+        // Remaining variants have no fixed polarity for target-selection purposes
+        // (their benefit/harm depends on usage context). Enumerated exhaustively
+        // rather than caught by `_` so a newly added `Effect` variant fails to
+        // compile here until its polarity is deliberately classified — the
+        // forcing function that prevents silent `Contextual` misclassification.
+        // `SetTapState { .. }` here catches only the non-Single scopes; the
+        // beneficial (Single+Untap) and harmful (Single+Tap) cases are handled
+        // by the guarded arms above.
+        Effect::Adapt { .. }
+        | Effect::AdditionalPhase { .. }
+        | Effect::AddPendingETBCounters { .. }
+        | Effect::AddPendingEntersModifications { .. }
+        | Effect::AddRestriction { .. }
+        | Effect::AddTargetReplacement { .. }
+        | Effect::Amass { .. }
+        | Effect::ApplyPerpetual { .. }
+        | Effect::ApplyPostReplacementDamage { .. }
+        | Effect::ApplySticker { .. }
+        | Effect::AssembleContraptionOnSprocket { .. }
+        | Effect::AssembleContraptions { .. }
+        | Effect::AssembleContraptionsFromRollDifference
+        | Effect::Attach { .. }
+        | Effect::BecomeCopy { .. }
+        | Effect::BecomePrepared { .. }
+        | Effect::BecomeSaddled { .. }
+        | Effect::BecomeUnprepared { .. }
+        | Effect::Behold { .. }
+        | Effect::BlightEffect { .. }
+        | Effect::Bolster { .. }
+        | Effect::Cascade
+        | Effect::CastCopyOfCard { .. }
+        | Effect::CastFromZone { .. }
+        | Effect::ChangeSpeed { .. }
+        | Effect::ChangeTargets { .. }
+        | Effect::ChangeZoneAll { .. }
+        | Effect::ChaosEnsues
+        | Effect::Choose { .. }
+        | Effect::ChooseAndSacrificeRest { .. }
+        | Effect::ChooseAugmentAndCombineWithHost { .. }
+        | Effect::ChooseCard { .. }
+        | Effect::ChooseCounterAdjustment { .. }
+        | Effect::ChooseCounterKind { .. }
+        | Effect::ChooseDamageSource { .. }
+        | Effect::ChooseDrawnThisTurnPayOrTopdeck { .. }
+        | Effect::ChooseFromZone { .. }
+        | Effect::ChooseObjectsIntoTrackedSet { .. }
+        | Effect::ChooseOneOf { .. }
+        | Effect::Clash
+        | Effect::Cleanup { .. }
+        | Effect::Cloak { .. }
+        | Effect::CollectEvidence { .. }
+        | Effect::CombineHost { .. }
+        | Effect::Conjure { .. }
+        | Effect::ControlNextTurn { .. }
+        | Effect::CopySpell { .. }
+        | Effect::CopyTokenBlockingAttacker { .. }
+        | Effect::CopyTokenOf { .. }
+        | Effect::CounterAll { .. }
+        | Effect::CrankContraptions { .. }
+        | Effect::CreateDamageReplacement { .. }
+        | Effect::CreateDelayedTrigger { .. }
+        | Effect::CreateDrawReplacement { .. }
+        | Effect::CreateEmblem { .. }
+        | Effect::CreatePlaneswalkReplacement { .. }
+        | Effect::CreateTokenCopyFromPool { .. }
+        | Effect::DamageEachPlayer { .. }
+        | Effect::Detain { .. }
+        | Effect::Dig { .. }
+        | Effect::Discard { .. }
+        | Effect::Discover { .. }
+        | Effect::Double { .. }
+        | Effect::DraftFromSpellbook { .. }
+        | Effect::EachDealsDamageEqualToPower { .. }
+        | Effect::EachPlayerCopyChosen { .. }
+        | Effect::EachSourceDealsDamage { .. }
+        | Effect::Encore
+        | Effect::EndCombatPhase
+        | Effect::EndTheTurn
+        | Effect::Endure { .. }
+        | Effect::EpicCopy { .. }
+        | Effect::ExchangeLifeWithStat { .. }
+        | Effect::ExileFromTopUntil { .. }
+        | Effect::ExileHaunting { .. }
+        | Effect::ExileResolvingSpellInsteadOfGraveyard
+        | Effect::ExileTop { .. }
+        | Effect::Exploit { .. }
+        | Effect::ExploreAll { .. }
+        | Effect::FlipCoin { .. }
+        | Effect::FlipCoins { .. }
+        | Effect::FlipCoinUntilLose { .. }
+        | Effect::Forage
+        | Effect::ForceAttack { .. }
+        | Effect::ForEachCategoryExile { .. }
+        | Effect::FreeCastFromZones { .. }
+        | Effect::GainActivatedAbilitiesOfTarget { .. }
+        | Effect::GainControlAll { .. }
+        | Effect::GainEnergy { .. }
+        | Effect::GiveControl { .. }
+        | Effect::GoadAll { .. }
+        | Effect::GrantCastingPermission { .. }
+        | Effect::GrantExtraLoyaltyActivations { .. }
+        | Effect::GrantNextSpellAbility { .. }
+        | Effect::Harness
+        | Effect::Heist { .. }
+        | Effect::HeistExile
+        | Effect::HideawayConceal { .. }
+        | Effect::Incubate { .. }
+        | Effect::Intensify { .. }
+        | Effect::Learn
+        | Effect::LoseAllPlayerCounters { .. }
+        | Effect::MadnessCast { .. }
+        | Effect::Manifest { .. }
+        | Effect::ManifestDread
+        | Effect::Meld { .. }
+        | Effect::MiracleCast { .. }
+        | Effect::Monstrosity { .. }
+        | Effect::Myriad
+        | Effect::NoOp
+        | Effect::OpenAttractions { .. }
+        | Effect::OpponentGuess { .. }
+        | Effect::PairWith { .. }
+        | Effect::PayCost { .. }
+        | Effect::PhaseIn { .. }
+        | Effect::Planeswalk
+        | Effect::Populate
+        | Effect::ProcessRadCounters
+        | Effect::ProliferateTarget { .. }
+        | Effect::PumpAll { .. }
+        | Effect::PutAtLibraryPosition { .. }
+        | Effect::PutChosenCounter { .. }
+        | Effect::PutOnTopOrBottom { .. }
+        | Effect::PutSticker { .. }
+        | Effect::ReassembleContraption { .. }
+        | Effect::ReassembleContraptionOnSprocket { .. }
+        | Effect::ReduceNextSpellCost { .. }
+        | Effect::RedistributeLifeTotals
+        | Effect::RegisterBending { .. }
+        | Effect::RememberCard { .. }
+        | Effect::RemoveFromCombat { .. }
+        | Effect::BecomeBlocked { .. }
+        | Effect::Renown { .. }
+        | Effect::ReturnAsAura { .. }
+        | Effect::Reveal { .. }
+        | Effect::RevealFromHand { .. }
+        | Effect::RevealHand { .. }
+        | Effect::RevealTop { .. }
+        | Effect::RevealUntil { .. }
+        | Effect::ReverseTurnOrder
+        | Effect::RingTemptsYou
+        | Effect::Ripple { .. }
+        | Effect::RollDie { .. }
+        | Effect::RollToVisitAttractions
+        | Effect::RuntimeHandled { .. }
+        | Effect::SearchOutsideGame { .. }
+        | Effect::Seek { .. }
+        | Effect::SeparateIntoPiles { .. }
+        | Effect::SetClassLevel { .. }
+        | Effect::SetDayNight { .. }
+        | Effect::SetLifeTotal { .. }
+        | Effect::SetRoomDoorLock { .. }
+        | Effect::SetTapState { .. }
+        | Effect::Shuffle { .. }
+        | Effect::SolveCase
+        | Effect::Specialize
+        | Effect::StartYourEngines { .. }
+        | Effect::SwapChosenLabels { .. }
+        | Effect::SwitchPT { .. }
+        | Effect::TakeTheInitiative
+        | Effect::TargetOnly { .. }
+        | Effect::TimeTravel
+        | Effect::Transform { .. }
+        | Effect::Tribute { .. }
+        | Effect::TurnFaceDown { .. }
+        | Effect::TurnFaceUp { .. }
+        | Effect::UnattachAll { .. }
+        | Effect::Unimplemented { .. }
+        | Effect::Unsuspect { .. }
+        | Effect::VentureInto { .. }
+        | Effect::VentureIntoDungeon
+        | Effect::Vote { .. }
+        | Effect::WinTheGame { .. } => EffectPolarity::Contextual,
     }
 }
 
@@ -186,7 +385,6 @@ pub(crate) fn extract_target_filter(effect: &Effect) -> Option<&TargetFilter> {
     match effect {
         // Beneficial effects
         Effect::Pump { target, .. }
-        | Effect::AddCounter { target, .. }
         | Effect::PutCounter { target, .. }
         | Effect::PutCounterAll { target, .. }
         | Effect::MultiplyCounter { target, .. }
@@ -194,12 +392,11 @@ pub(crate) fn extract_target_filter(effect: &Effect) -> Option<&TargetFilter> {
         | Effect::DoublePT { target, .. }
         | Effect::DoublePTAll { target, .. }
         | Effect::Regenerate { target, .. }
-        | Effect::Untap { target }
+        | Effect::RemoveAllDamage { target, .. }
         | Effect::PreventDamage { target, .. }
         // Harmful effects
         | Effect::Destroy { target, .. }
         | Effect::DealDamage { target, .. }
-        | Effect::Tap { target }
         | Effect::RemoveCounter { target, .. }
         // Removal / disruption
         | Effect::Bounce { target, .. }
@@ -210,7 +407,6 @@ pub(crate) fn extract_target_filter(effect: &Effect) -> Option<&TargetFilter> {
         | Effect::Goad { target }
         | Effect::ChangeZone { target, .. }
         | Effect::Connive { target, .. }
-        | Effect::Suspect { target, .. }
         | Effect::ForceBlock { target, .. }
         | Effect::Exploit { target, .. }
         | Effect::Attach { target, .. }
@@ -219,6 +415,29 @@ pub(crate) fn extract_target_filter(effect: &Effect) -> Option<&TargetFilter> {
         | Effect::ExtraTurn { target, .. }
         | Effect::SkipNextStep { target, .. }
         | Effect::MoveCounters { target, .. } => Some(target),
+        // CR 701.26a/b: only single-permanent tap/untap exposes a selectable
+        // target. The mass (`All`) scope's filter is a population filter and is
+        // not surfaced as a target (matching the legacy `TapAll`/`UntapAll`,
+        // which fell through to `None`).
+        Effect::SetTapState {
+            scope: EffectScope::Single,
+            target,
+            ..
+        } => Some(target),
+        // CR 701.60a: only single-permanent suspect/unsuspect exposes a
+        // selectable target. The mass (`All`) scope (e.g. Absolving Lammasu)
+        // is a non-targeting population effect — its filter is not surfaced as
+        // a target (mirrors `SetTapState`'s `Single`/`All` split).
+        Effect::Suspect {
+            scope: EffectScope::Single,
+            target,
+            ..
+        }
+        | Effect::Unsuspect {
+            scope: EffectScope::Single,
+            target,
+            ..
+        } => Some(target),
         // GenericEffect and LoseLife have Option<TargetFilter>
         Effect::GenericEffect { target, .. } | Effect::LoseLife { target, .. } => {
             target.as_ref()
@@ -229,6 +448,100 @@ pub(crate) fn extract_target_filter(effect: &Effect) -> Option<&TargetFilter> {
         // NOTE: SearchLibrary uses `filter`, not `target`.
         _ => None,
     }
+}
+
+/// Whether `effects`, all applied to the creature `object_id`, will kill it.
+///
+/// Models the three toughness-reducing removal modalities the AI must reason
+/// about when deciding whether a removal spell is worth casting:
+/// - direct damage (`Effect::DealDamage`),
+/// - negative `Pump` (covers `-X/-X` and `-0/-X`),
+/// - `-1/-1` (and other negative P/T) counters (`Effect::PutCounter`).
+///
+/// All such effects in the spell are assumed to hit this creature, which is the
+/// single-target removal case the callers care about.
+///
+/// Returns:
+/// - `Some(true)`  — provably lethal,
+/// - `Some(false)` — provably non-lethal (every relevant amount is fixed and
+///   the creature survives),
+/// - `None`        — not determinable: either no damage/shrink effect is present
+///   (e.g. `Destroy`, `Bounce`, `Exile`), or a relevant amount is variable (an
+///   `X` spell whose value the caster chooses). Callers fail open on `None`.
+pub(crate) fn lethal_to_creature(
+    state: &GameState,
+    object_id: ObjectId,
+    effects: &[&Effect],
+) -> Option<bool> {
+    let object = state.objects.get(&object_id)?;
+    let base_toughness = object.toughness?;
+
+    let mut toughness_reduction = 0i32; // from negative pumps and -1/-1 counters
+    let mut total_damage = 0i32;
+    let mut saw_relevant = false;
+
+    for effect in effects {
+        match effect {
+            Effect::DealDamage {
+                amount: QuantityExpr::Fixed { value },
+                ..
+            } => {
+                total_damage += *value;
+                saw_relevant = true;
+            }
+            // Variable (X) damage — the caster picks the amount, so lethality
+            // can't be decided here.
+            Effect::DealDamage { .. } => return None,
+            Effect::Pump { toughness, .. } => match toughness {
+                PtValue::Fixed(v) if *v < 0 => {
+                    toughness_reduction += -*v;
+                    saw_relevant = true;
+                }
+                PtValue::Fixed(_) => {}
+                // -X/-X: variable shrink, undecidable here.
+                PtValue::Variable(_) | PtValue::Quantity(_) => return None,
+            },
+            Effect::PutCounter {
+                counter_type,
+                count,
+                ..
+            } => {
+                if let Some((_, t_delta)) = counter_type.power_toughness_delta() {
+                    if t_delta < 0 {
+                        match count {
+                            QuantityExpr::Fixed { value } => {
+                                toughness_reduction += -t_delta * *value;
+                                saw_relevant = true;
+                            }
+                            _ => return None,
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if !saw_relevant {
+        return None;
+    }
+
+    let new_toughness = base_toughness - toughness_reduction;
+    // CR 704.5f: a creature with toughness 0 or less is put into its owner's
+    // graveyard. This is not destruction, so indestructible does not prevent it.
+    if new_toughness <= 0 {
+        return Some(true);
+    }
+    // CR 704.5g + CR 702.12b: lethal marked damage destroys the creature — but
+    // an indestructible permanent ignores that state-based action, so damage
+    // alone can never kill it.
+    if total_damage > 0 && !object.has_keyword(&Keyword::Indestructible) {
+        let marked = object.damage_marked as i32;
+        if marked + total_damage >= new_toughness {
+            return Some(true);
+        }
+    }
+    Some(false)
 }
 
 /// Returns true if the effect exclusively targets creatures (not "any target").
@@ -261,6 +574,15 @@ pub(crate) fn targets_creatures(effect: &Effect) -> bool {
 /// Defaults to false (assume harmful) when uncertain — safe fallback since most
 /// targeted spells in MTG are removal/damage.
 pub(crate) fn is_spell_beneficial(ctx: &PolicyContext<'_>) -> bool {
+    // CR 702.140a: Mutate targets a non-Human creature with the same owner as
+    // the spell — treat it as beneficial so targeting prefers our creatures over
+    // opponents' creatures when evaluating candidate targets.
+    if let WaitingFor::TargetSelection { pending_cast, .. } = &ctx.decision.waiting_for {
+        if pending_cast.casting_variant == CastingVariant::Mutate {
+            return true;
+        }
+    }
+
     let player_impact = aggregate_player_impact(ctx);
     if player_impact > 0.25 {
         return true;
@@ -317,7 +639,12 @@ pub(crate) fn targeted_player_impact(ctx: &PolicyContext<'_>, player: PlayerId) 
         let Some(filter) = extract_target_filter(effect) else {
             continue;
         };
-        if engine::game::filter::player_matches_target_filter(filter, player, source_controller) {
+        if engine::game::filter::player_matches_target_filter_in_state(
+            ctx.state,
+            filter,
+            player,
+            source_controller,
+        ) {
             found_targeted_effect = true;
             impact += player_impact(effect);
         }
@@ -500,6 +827,23 @@ pub(crate) fn static_mode_polarity(mode: &StaticMode) -> EffectPolarity {
     }
 }
 
+/// CR 603.1: A `GrantTrigger` confers a triggered ability on its target. The
+/// benefit/harm to the bearer is the polarity of the effect that granted trigger
+/// *executes* — Undying Malice grants "when this dies, return it to the
+/// battlefield" (`ChangeZone`→Battlefield, Beneficial); a downside grant of "at
+/// the beginning of your upkeep, you lose 1 life" (`LoseLife`, Harmful) must NOT
+/// read Beneficial. Delegating to `effect_polarity` covers the whole class of
+/// grant-a-trigger buffs and downside curses (AI heuristic). The polarity is
+/// bound statically from the parsed `TriggerDefinition.execute.effect`; no live
+/// game-state lookup.
+fn granted_trigger_polarity(trigger: &TriggerDefinition) -> EffectPolarity {
+    trigger
+        .execute
+        .as_deref()
+        .map(|exec| effect_polarity(&exec.effect))
+        .unwrap_or(EffectPolarity::Contextual)
+}
+
 /// Classify a continuous modification as beneficial/harmful to its target.
 pub(crate) fn modification_polarity(m: &ContinuousModification) -> EffectPolarity {
     match m {
@@ -516,11 +860,13 @@ pub(crate) fn modification_polarity(m: &ContinuousModification) -> EffectPolarit
         ContinuousModification::AddDynamicPower { .. }
         | ContinuousModification::AddDynamicToughness { .. } => EffectPolarity::Beneficial,
         ContinuousModification::AddKeyword { .. }
+        | ContinuousModification::AddKeywordWithDerivedCost { .. }
         | ContinuousModification::GrantAbility { .. }
         | ContinuousModification::AddAllCreatureTypes
         | ContinuousModification::AddColor { .. }
         | ContinuousModification::AddType { .. }
         | ContinuousModification::AddSubtype { .. } => EffectPolarity::Beneficial,
+        ContinuousModification::GrantTrigger { trigger } => granted_trigger_polarity(trigger),
         ContinuousModification::RemoveKeyword { .. }
         | ContinuousModification::RemoveAllAbilities
         | ContinuousModification::RemoveType { .. }
@@ -554,5 +900,339 @@ fn filter_excludes_parent_target(filter: &TargetFilter) -> bool {
         TargetFilter::Not { filter: inner } => matches!(inner.as_ref(), TargetFilter::ParentTarget),
         TargetFilter::And { filters } => filters.iter().any(filter_excludes_parent_target),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod lethality_tests {
+    use super::*;
+    use engine::game::scenario::{GameScenario, P1};
+    use engine::types::keywords::Keyword;
+
+    fn deal_damage(value: i32) -> Effect {
+        Effect::DealDamage {
+            amount: QuantityExpr::Fixed { value },
+            target: TargetFilter::Any,
+            damage_source: None,
+            excess: None,
+        }
+    }
+
+    fn shrink(power: i32, toughness: i32) -> Effect {
+        Effect::Pump {
+            power: PtValue::Fixed(power),
+            toughness: PtValue::Fixed(toughness),
+            target: TargetFilter::Any,
+        }
+    }
+
+    fn minus_counters(count: i32) -> Effect {
+        Effect::PutCounter {
+            counter_type: CounterType::Minus1Minus1,
+            count: QuantityExpr::Fixed { value: count },
+            target: TargetFilter::Any,
+        }
+    }
+
+    #[test]
+    fn damage_lethal_only_at_or_above_remaining_toughness() {
+        let mut scenario = GameScenario::new();
+        let bear = scenario.add_creature(P1, "Bear", 2, 2).id();
+        let runner = scenario.build();
+        let state = runner.state();
+        assert_eq!(
+            lethal_to_creature(state, bear, &[&deal_damage(2)]),
+            Some(true)
+        );
+        assert_eq!(
+            lethal_to_creature(state, bear, &[&deal_damage(1)]),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn abrade_on_zero_four_reads_non_lethal() {
+        // Regression: 3 damage on a 0/4 must not look lethal (the reported bug).
+        let mut scenario = GameScenario::new();
+        let wall = scenario.add_creature(P1, "Wall", 0, 4).id();
+        let runner = scenario.build();
+        assert_eq!(
+            lethal_to_creature(runner.state(), wall, &[&deal_damage(3)]),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn damage_accounts_for_marked_damage() {
+        // CR 704.5g: total marked damage (prior + this) vs toughness.
+        let mut scenario = GameScenario::new();
+        let wall = scenario.add_creature(P1, "Wall", 0, 4).id();
+        let mut runner = scenario.build();
+        runner
+            .state_mut()
+            .objects
+            .get_mut(&wall)
+            .unwrap()
+            .damage_marked = 2;
+        let state = runner.state();
+        assert_eq!(
+            lethal_to_creature(state, wall, &[&deal_damage(2)]),
+            Some(true)
+        );
+        assert_eq!(
+            lethal_to_creature(state, wall, &[&deal_damage(1)]),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn negative_pump_kills_via_zero_toughness() {
+        // CR 704.5f: -0/-4 brings a 0/4 to 0 toughness -> dies; -0/-3 survives.
+        let mut scenario = GameScenario::new();
+        let wall = scenario.add_creature(P1, "Wall", 0, 4).id();
+        let runner = scenario.build();
+        let state = runner.state();
+        assert_eq!(
+            lethal_to_creature(state, wall, &[&shrink(0, -4)]),
+            Some(true)
+        );
+        assert_eq!(
+            lethal_to_creature(state, wall, &[&shrink(0, -3)]),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn minus_one_counters_kill_by_toughness() {
+        let mut scenario = GameScenario::new();
+        let bear = scenario.add_creature(P1, "Bear", 2, 2).id();
+        let runner = scenario.build();
+        let state = runner.state();
+        assert_eq!(
+            lethal_to_creature(state, bear, &[&minus_counters(2)]),
+            Some(true)
+        );
+        assert_eq!(
+            lethal_to_creature(state, bear, &[&minus_counters(1)]),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn indestructible_survives_damage_but_dies_to_zero_toughness() {
+        let mut scenario = GameScenario::new();
+        let wall = scenario
+            .add_creature(P1, "Wall", 0, 4)
+            .with_keyword(Keyword::Indestructible)
+            .id();
+        let runner = scenario.build();
+        let state = runner.state();
+        // CR 702.12b: damage never destroys an indestructible creature.
+        assert_eq!(
+            lethal_to_creature(state, wall, &[&deal_damage(10)]),
+            Some(false)
+        );
+        // CR 704.5f: toughness 0 bypasses indestructible.
+        assert_eq!(
+            lethal_to_creature(state, wall, &[&shrink(0, -4)]),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn variable_and_non_shrink_effects_are_undecidable() {
+        let mut scenario = GameScenario::new();
+        let bear = scenario.add_creature(P1, "Bear", 2, 2).id();
+        let runner = scenario.build();
+        let state = runner.state();
+        // Variable (X) shrink: the caster picks the amount -> undecidable.
+        let variable_shrink = Effect::Pump {
+            power: PtValue::Fixed(0),
+            toughness: PtValue::Variable("X".to_string()),
+            target: TargetFilter::Any,
+        };
+        assert_eq!(lethal_to_creature(state, bear, &[&variable_shrink]), None);
+        // Destroy has no toughness-reducing component -> undecidable here (the
+        // gate handles it; lethality math doesn't apply).
+        let destroy = Effect::Destroy {
+            target: TargetFilter::Any,
+            cant_regenerate: false,
+        };
+        assert_eq!(lethal_to_creature(state, bear, &[&destroy]), None);
+    }
+}
+
+#[cfg(test)]
+mod suspect_scope_tests {
+    use super::*;
+
+    // CR 701.60a: mass un-designation ("all suspected creatures are no longer
+    // suspected", Absolving Lammasu) is a non-targeting population effect. The
+    // AI's target-filter extraction must mirror the engine's `target_filter()`,
+    // which surfaces a selectable target only for `EffectScope::Single`.
+    #[test]
+    fn extract_target_filter_only_for_single_scope_suspect() {
+        // Same non-None filter on both; only `scope` differs, so a pass proves
+        // the scope gate (not the filter) drives target-filter extraction.
+        let single_suspect = Effect::Suspect {
+            target: TargetFilter::Any,
+            scope: EffectScope::Single,
+        };
+        let all_suspect = Effect::Suspect {
+            target: TargetFilter::Any,
+            scope: EffectScope::All,
+        };
+        assert!(
+            extract_target_filter(&single_suspect).is_some(),
+            "single-scope Suspect must expose a selectable target"
+        );
+        assert!(
+            extract_target_filter(&all_suspect).is_none(),
+            "mass Suspect{{All}} is a population effect, not target-filtered"
+        );
+    }
+
+    #[test]
+    fn extract_target_filter_only_for_single_scope_unsuspect() {
+        let single_unsuspect = Effect::Unsuspect {
+            target: TargetFilter::Any,
+            scope: EffectScope::Single,
+        };
+        let all_unsuspect = Effect::Unsuspect {
+            target: TargetFilter::Any,
+            scope: EffectScope::All,
+        };
+        assert!(
+            extract_target_filter(&single_unsuspect).is_some(),
+            "single-scope Unsuspect must expose a selectable target"
+        );
+        assert!(
+            extract_target_filter(&all_unsuspect).is_none(),
+            "mass Unsuspect{{All}} (Absolving Lammasu) is a population effect, not target-filtered"
+        );
+    }
+}
+
+#[cfg(test)]
+mod grant_trigger_polarity_tests {
+    use super::*;
+    use engine::types::ability::{AbilityDefinition, AbilityKind, StaticDefinition, TypedFilter};
+    use engine::types::zones::EtbTapState;
+
+    /// Build a `GenericEffect` that grants its target a triggered ability whose
+    /// executed effect is `exec` — the Undying-Malice-shaped AST
+    /// (`GenericEffect{ Continuous{ GrantTrigger{ dies → exec } } }`).
+    fn grant_trigger_generic(exec: Effect) -> Effect {
+        let mut trigger = TriggerDefinition::new(TriggerMode::ChangesZone);
+        trigger.execute = Some(Box::new(AbilityDefinition::new(AbilityKind::Spell, exec)));
+        Effect::GenericEffect {
+            static_abilities: vec![StaticDefinition::continuous()
+                .affected(TargetFilter::ParentTarget)
+                .modifications(vec![ContinuousModification::GrantTrigger {
+                    trigger: Box::new(trigger),
+                }])],
+            target: Some(TargetFilter::Typed(TypedFilter::new(TypeFilter::Creature))),
+            duration: None,
+        }
+    }
+
+    /// "When this dies, return it to the battlefield" — the Undying Malice grant.
+    fn return_to_battlefield() -> Effect {
+        Effect::ChangeZone {
+            origin: Some(Zone::Graveyard),
+            destination: Zone::Battlefield,
+            target: TargetFilter::SelfRef,
+            owner_library: false,
+            enter_transformed: false,
+            enters_under: None,
+            enter_tapped: EtbTapState::Unspecified,
+            enters_attacking: false,
+            up_to: false,
+            enter_with_counters: vec![],
+            conditional_enter_with_counters: vec![],
+            face_down_profile: None,
+            enters_modified_if: None,
+        }
+    }
+
+    #[test]
+    fn grant_return_trigger_reads_beneficial() {
+        // Undying Malice grants "when this dies, return it to the battlefield"
+        // (ChangeZone→Battlefield, Beneficial). Pre-fix `GrantTrigger` hit the
+        // `_ => Contextual` fallback, so the whole GenericEffect read Contextual.
+        let ge = grant_trigger_generic(return_to_battlefield());
+        assert_eq!(effect_polarity(&ge), EffectPolarity::Beneficial);
+    }
+
+    #[test]
+    fn harmful_grant_trigger_not_beneficial() {
+        // A downside grant ("at the beginning of your upkeep, you lose 1 life")
+        // must read Harmful, NOT a blanket Beneficial — this is the load-bearing
+        // discriminator that proves the arm reads the executed-effect polarity
+        // rather than labeling every grant beneficial.
+        let ge = grant_trigger_generic(Effect::LoseLife {
+            amount: QuantityExpr::Fixed { value: 1 },
+            target: None,
+        });
+        assert_eq!(effect_polarity(&ge), EffectPolarity::Harmful);
+    }
+
+    #[test]
+    fn granted_trigger_without_execute_is_contextual() {
+        // A grant whose trigger has no executed effect carries no polarity
+        // signal — stays Contextual (the same as the pre-existing fallback).
+        let mut trigger = TriggerDefinition::new(TriggerMode::ChangesZone);
+        trigger.execute = None;
+        assert_eq!(
+            modification_polarity(&ContinuousModification::GrantTrigger {
+                trigger: Box::new(trigger),
+            }),
+            EffectPolarity::Contextual
+        );
+    }
+
+    #[test]
+    fn parsed_undying_malice_grant_reads_beneficial() {
+        // Production-parser reach guard: the real Undying Malice Oracle text parses
+        // to `GenericEffect{ Continuous{ GrantTrigger{ dies → ChangeZone→Battlefield
+        // } } }`, so its polarity must read Beneficial through the same classifier
+        // the AI target-scorer uses. Guards the fix against future parser AST drift.
+        use engine::parser::oracle::parse_oracle_text;
+
+        let parsed = parse_oracle_text(
+            "Until end of turn, target creature gains \"When this creature dies, return it to the battlefield tapped under its owner's control with a +1/+1 counter on it.\"",
+            "Undying Malice",
+            &[],
+            &["Instant".to_string()],
+            &[],
+        );
+        let spell = parsed
+            .abilities
+            .iter()
+            .find(|a| a.kind == AbilityKind::Spell)
+            .expect("Undying Malice parses to a spell ability");
+        assert_eq!(
+            effect_polarity(&spell.effect),
+            EffectPolarity::Beneficial,
+            "Undying Malice's granted return-to-battlefield trigger must read Beneficial"
+        );
+    }
+
+    #[test]
+    fn grant_ability_still_beneficial() {
+        // Sibling reach-guard: `GrantAbility` (a granted static/activated ability,
+        // no executed-trigger effect to inspect) stays in the Beneficial cluster,
+        // unchanged by the new GrantTrigger arm.
+        assert_eq!(
+            modification_polarity(&ContinuousModification::GrantAbility {
+                definition: Box::new(AbilityDefinition::new(
+                    AbilityKind::Activated,
+                    Effect::TargetOnly {
+                        target: TargetFilter::Any,
+                    },
+                )),
+            }),
+            EffectPolarity::Beneficial
+        );
     }
 }

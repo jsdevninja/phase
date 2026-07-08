@@ -2,8 +2,8 @@
 use super::*;
 
 use engine::types::ability::{
-    AbilityDefinition, AbilityKind, ControllerRef, Effect, FilterProp, ReplacementCondition,
-    ReplacementDefinition, TargetFilter, TypedFilter,
+    AbilityDefinition, AbilityKind, ControllerRef, Effect, EffectScope, FilterProp,
+    ReplacementCondition, ReplacementDefinition, TapStateChange, TargetFilter, TypedFilter,
 };
 use engine::types::card_type::CoreType;
 use engine::types::identifiers::CardId;
@@ -15,8 +15,10 @@ fn fast_land_replacement(description: &str) -> ReplacementDefinition {
     ReplacementDefinition::new(ReplacementEvent::Moved)
         .execute(AbilityDefinition::new(
             AbilityKind::Spell,
-            Effect::Tap {
+            Effect::SetTapState {
                 target: TargetFilter::SelfRef,
+                scope: EffectScope::Single,
+                state: TapStateChange::Tap,
             },
         ))
         .valid_card(TargetFilter::SelfRef)
@@ -31,26 +33,17 @@ fn fast_land_replacement(description: &str) -> ReplacementDefinition {
 }
 
 fn replacement_choice_index(runner: &GameRunner, description: &str) -> usize {
-    let WaitingFor::ReplacementChoice {
-        candidate_descriptions,
-        ..
-    } = &runner.state().waiting_for
-    else {
+    let WaitingFor::ReplacementChoice { candidates, .. } = &runner.state().waiting_for else {
         panic!(
             "expected ReplacementChoice, got {:?}",
             runner.state().waiting_for
         );
     };
 
-    candidate_descriptions
+    candidates
         .iter()
-        .position(|candidate| candidate.contains(description))
-        .unwrap_or_else(|| {
-            panic!(
-                "replacement choice {description:?} not found in {:?}",
-                candidate_descriptions
-            )
-        })
+        .position(|candidate| candidate.description.contains(description))
+        .unwrap_or_else(|| panic!("replacement choice {description:?} not found in {candidates:?}"))
 }
 
 // ── Fast land integration tests ──
@@ -475,8 +468,10 @@ fn turbulent_land_replacement(description: &str) -> ReplacementDefinition {
     ReplacementDefinition::new(ReplacementEvent::Moved)
         .execute(AbilityDefinition::new(
             AbilityKind::Spell,
-            Effect::Tap {
+            Effect::SetTapState {
                 target: TargetFilter::SelfRef,
+                scope: EffectScope::Single,
+                state: TapStateChange::Tap,
             },
         ))
         .valid_card(TargetFilter::SelfRef)

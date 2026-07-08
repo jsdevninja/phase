@@ -3,10 +3,13 @@ use std::collections::HashSet;
 use crate::game::quantity::resolve_quantity_with_targets;
 use crate::game::replacement::{self, ReplacementResult};
 use crate::types::ability::{
-    Effect, EffectError, EffectKind, GainLifePlayer, ResolvedAbility, TargetFilter, TargetRef,
+    Effect, EffectError, EffectKind, ResolvedAbility, TargetFilter, TargetRef,
 };
 use crate::types::events::GameEvent;
-use crate::types::game_state::GameState;
+use crate::types::game_state::{
+    GameState, PendingEffectResolutionEvent, PendingEffectResolved, PendingLifeTotalAssignment,
+    WaitingFor,
+};
 use crate::types::player::PlayerId;
 use crate::types::proposed_event::ProposedEvent;
 
@@ -21,31 +24,16 @@ pub fn resolve_gain(
     ability: &ResolvedAbility,
     events: &mut Vec<GameEvent>,
 ) -> Result<(), EffectError> {
-    let (amount, player_kind) = match &ability.effect {
+    let (amount, player_filter) = match &ability.effect {
         Effect::GainLife { amount, player } => (amount, player),
         _ => return Err(EffectError::MissingParam("GainLife amount".to_string())),
     };
 
-    // Resolve the target object (if any) for TargetedController.
-    let target_obj = ability.targets.iter().find_map(|t| {
-        if let TargetRef::Object(id) = t {
-            state.objects.get(id)
-        } else {
-            None
-        }
-    });
-
-    let player_id: PlayerId = match player_kind {
-        GainLifePlayer::TargetedController => target_obj
-            .map(|o| o.controller)
-            .unwrap_or(ability.controller),
-        GainLifePlayer::Controller => ability.controller,
-        // CR 115.2 + CR 601.2c: "Target player gains N life" — the
-        // chosen player is bound on `ability.targets` via the spell-
-        // announcement target slot. `target_player()` extracts the
-        // first `TargetRef::Player` and falls back to controller.
-        GainLifePlayer::TargetPlayer => ability.target_player(),
-    };
+    // CR 119.3: Who gains the life. `resolve_life_loss_target` is the single
+    // authority for player resolution from a TargetFilter — context-refs
+    // (Controller, ParentTargetController) resolve via state slots; explicit
+    // Player targets come from `ability.targets`.
+    let player_id: PlayerId = resolve_life_loss_target(state, ability, Some(player_filter));
 
     // CR 119.7: "If an effect says that a player can't gain life ... a replacement
     // effect that would replace a life gain event affecting that player won't do
@@ -91,7 +79,7 @@ pub fn resolve_gain(
                 player.life += gain_amount as i32;
                 // CR 119.9: Track life gained this turn for triggered ability matching.
                 player.life_gained_this_turn += gain_amount;
-                state.layers_dirty = true;
+                crate::game::layers::mark_layers_full(state);
 
                 events.push(GameEvent::LifeChanged {
                     player_id,
@@ -168,7 +156,7 @@ pub fn apply_life_gain(
             Ok(0)
         }
         ReplacementResult::NeedsChoice(player) => {
-            // CR 614.7: Multiple competing replacements — player must choose.
+            // CR 616.1: Multiple competing replacements — player must choose.
             state.waiting_for =
                 crate::game::replacement::replacement_choice_waiting_for(player, state);
             Err(ReplacementDeferred)
@@ -220,7 +208,7 @@ pub fn apply_life_gain_after_replacement(
         player.life += gain_amount as i32;
         player.life_gained_this_turn += gain_amount;
     }
-    state.layers_dirty = true;
+    crate::game::layers::mark_layers_full(state);
     events.push(GameEvent::LifeChanged {
         player_id: pid,
         amount: gain_amount as i32,
@@ -262,7 +250,7 @@ pub fn apply_damage_life_loss(
             Ok(0)
         }
         ReplacementResult::NeedsChoice(player) => {
-            // CR 614.7: Multiple competing replacements — player must choose.
+            // CR 616.1: Multiple competing replacements — player must choose.
             state.waiting_for =
                 crate::game::replacement::replacement_choice_waiting_for(player, state);
             Err(ReplacementDeferred)
@@ -296,12 +284,152 @@ pub fn apply_life_loss_after_replacement(
         player.life -= loss_amount as i32;
         player.life_lost_this_turn += loss_amount;
     }
-    state.layers_dirty = true;
+    crate::game::layers::mark_layers_full(state);
     events.push(GameEvent::LifeChanged {
         player_id: pid,
         amount: -(loss_amount as i32),
     });
     loss_amount
+}
+
+/// Outcome of applying a life-total permutation via `apply_life_totals_assignment`.
+///
+/// Typed (not a bare bool) so the control-flow signal is self-documenting at
+/// call sites: `Applied` means the caller should emit its `EffectResolved`;
+/// `Deferred` means a competing replacement (CR 616.1) installed a choice
+/// `WaitingFor` and the caller must return without emitting — the resume path
+/// completes resolution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LifeAssignmentOutcome {
+    Applied,
+    Deferred,
+}
+
+/// CR 701.12c / CR 119.7 + CR 119.8: Apply a simultaneous life-total permutation.
+///
+/// `assignment[i] = (receiver, resulting_life)` — each named player's life total
+/// becomes `resulting_life` by *gaining or losing the difference* from a snapshot
+/// taken before any mutation (so the permutation is simultaneous and each delta
+/// is measured against the pre-resolution total, per CR 701.12c). The changes
+/// route through `apply_life_gain` / `apply_damage_life_loss` — not a raw
+/// `player.life = ...` set — so replacement effects may modify them and triggered
+/// abilities (Blood Artist-likes) trigger on the resulting gain/loss.
+///
+/// Shared by `ExchangeLifeTotals` (2-slot swap) and `RedistributeLifeTotals`
+/// (N-slot controller-chosen permutation). Callers that require all-or-nothing
+/// legality (CR 701.12a exchange) must pre-check before calling; the
+/// redistribution resolver instead filters illegal receivers out of each
+/// enumerated option, so every assignment reaching this helper is already legal.
+pub fn apply_life_totals_assignment(
+    state: &mut GameState,
+    assignment: &[(PlayerId, i32)],
+    completion_player: PlayerId,
+    completion: Option<PendingEffectResolved>,
+    events: &mut Vec<GameEvent>,
+) -> Result<LifeAssignmentOutcome, EffectError> {
+    // CR 701.12c: snapshot every receiver's current life BEFORE any mutation so
+    // each delta is measured against the pre-permutation total.
+    let deltas: Vec<(PlayerId, i32)> = assignment
+        .iter()
+        .map(|&(pid, new_life)| {
+            let old = state
+                .players
+                .iter()
+                .find(|p| p.id == pid)
+                .map(|p| p.life)
+                .ok_or(EffectError::PlayerNotFound)?;
+            Ok((pid, new_life - old))
+        })
+        .collect::<Result<Vec<_>, EffectError>>()?;
+
+    for (index, (pid, diff)) in deltas.iter().copied().enumerate() {
+        let deferred = match diff.signum() {
+            1 => apply_life_gain(state, pid, diff as u32, events).err(),
+            -1 => apply_damage_life_loss(state, pid, (-diff) as u32, events).err(),
+            _ => None,
+        };
+        if deferred.is_some() {
+            // CR 616.1: a competing replacement required a player choice; the
+            // helper installed the WaitingFor and the resume path completes the
+            // remaining assignments.
+            state.pending_life_total_assignment = Some(PendingLifeTotalAssignment {
+                completion_player,
+                remaining: deltas[index + 1..].to_vec(),
+                completion: completion.clone(),
+            });
+            return Ok(LifeAssignmentOutcome::Deferred);
+        }
+    }
+    Ok(LifeAssignmentOutcome::Applied)
+}
+
+pub(crate) fn drain_pending_life_total_assignment(
+    state: &mut GameState,
+    events: &mut Vec<GameEvent>,
+) {
+    while let Some(mut pending) = state.pending_life_total_assignment.take() {
+        state.waiting_for = WaitingFor::Priority {
+            player: pending.completion_player,
+        };
+
+        let Some((pid, diff)) = pending.remaining.first().copied() else {
+            complete_pending_life_total_assignment(state, pending, events);
+            if !matches!(state.waiting_for, WaitingFor::Priority { .. }) {
+                return;
+            }
+            continue;
+        };
+
+        pending.remaining.remove(0);
+        state.pending_life_total_assignment = Some(pending);
+
+        let deferred = match diff.signum() {
+            1 => apply_life_gain(state, pid, diff as u32, events).err(),
+            -1 => apply_damage_life_loss(state, pid, (-diff) as u32, events).err(),
+            _ => None,
+        };
+        if deferred.is_some() || !matches!(state.waiting_for, WaitingFor::Priority { .. }) {
+            return;
+        }
+    }
+}
+
+fn complete_pending_life_total_assignment(
+    state: &mut GameState,
+    pending: PendingLifeTotalAssignment,
+    events: &mut Vec<GameEvent>,
+) {
+    state.waiting_for = WaitingFor::Priority {
+        player: pending.completion_player,
+    };
+
+    if let Some(PendingEffectResolved {
+        kind,
+        source_id,
+        resolution_event,
+        post_actions,
+        player_action,
+    }) = pending.completion
+    {
+        debug_assert!(
+            post_actions.is_empty(),
+            "life-total assignment completion does not support counter post-actions"
+        );
+        match resolution_event {
+            PendingEffectResolutionEvent::Emit => {
+                events.push(GameEvent::EffectResolved { kind, source_id });
+            }
+            PendingEffectResolutionEvent::Suppress => {}
+        }
+        if let Some(action) = player_action {
+            events.push(GameEvent::PlayerPerformedAction {
+                player_id: action.player_id,
+                action: action.action,
+            });
+        }
+    }
+
+    super::drain_pending_continuation(state, events);
 }
 
 /// CR 119.3: If an effect causes a player to lose life, adjust their life total.
@@ -351,7 +479,7 @@ pub fn resolve_lose(
                     .ok_or(EffectError::PlayerNotFound)?;
                 player.life -= loss_amount as i32;
                 player.life_lost_this_turn += loss_amount;
-                state.layers_dirty = true;
+                crate::game::layers::mark_layers_full(state);
 
                 events.push(GameEvent::LifeChanged {
                     player_id,
@@ -421,46 +549,78 @@ pub fn resolve_set_life_total(
     ability: &ResolvedAbility,
     events: &mut Vec<GameEvent>,
 ) -> Result<(), EffectError> {
-    let amount = match &ability.effect {
-        Effect::SetLifeTotal { amount, .. } => {
-            crate::game::quantity::resolve_quantity_with_targets(state, amount, ability)
-        }
+    let (amount_expr, target) = match &ability.effect {
+        Effect::SetLifeTotal { amount, target } => (amount, target),
         _ => return Err(EffectError::MissingParam("SetLifeTotal amount".to_string())),
     };
-
-    let target_player_id = ability
-        .targets
-        .iter()
-        .find_map(|t| {
-            if let TargetRef::Player(pid) = t {
-                Some(*pid)
-            } else {
-                None
-            }
-        })
-        .unwrap_or(ability.controller);
-
-    let current_life = state
-        .players
-        .iter()
-        .find(|p| p.id == target_player_id)
-        .ok_or(EffectError::PlayerNotFound)?
-        .life;
-    let diff = amount - current_life;
-
-    // CR 119.5: Decompose into the matching gain/loss event. A diff of 0 is a
-    // no-op. apply_life_gain / apply_damage_life_loss each handle their own
-    // CR 119.7 / CR 119.8 short-circuits and replacement pipeline routing.
-    let deferred = match diff.signum() {
-        1 => apply_life_gain(state, target_player_id, diff as u32, events).err(),
-        -1 => apply_damage_life_loss(state, target_player_id, (-diff) as u32, events).err(),
-        _ => None,
+    // CR 119.5 + CR 608.2f: Resolve which players' life totals are set. The
+    // common single-player forms ("your" → Controller, "target player's" →
+    // the chosen target) preserve the original single-player behavior. The
+    // non-targeted all-players form ("each player's life total becomes N" —
+    // Worldfire, issue #2882) expands to every player in APNAP order.
+    let target_player_ids: Vec<PlayerId> = if matches!(target, TargetFilter::AllPlayers) {
+        crate::game::players::apnap_order(state)
+    } else {
+        vec![ability
+            .targets
+            .iter()
+            .find_map(|t| {
+                if let TargetRef::Player(pid) = t {
+                    Some(*pid)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(ability.controller)]
     };
-    if deferred.is_some() {
-        // CR 614.7: A competing replacement required a player choice; the
-        // helper already installed the WaitingFor state. Return without
-        // emitting EffectResolved — the resume path will complete resolution.
-        return Ok(());
+
+    // CR 119.5: Set each player's life total one at a time, decomposing into the
+    // matching gain/loss event. apply_life_gain / apply_damage_life_loss each
+    // handle their own CR 119.7 / CR 119.8 short-circuits and replacement
+    // pipeline routing.
+    for target_player_id in target_player_ids {
+        // CR 119.5 + CR 109.5: Resolve the new life total per player so a
+        // third-person "the number of [X] THEY control" count (Biorhythm,
+        // Shaman of Forgotten Ways) binds to each recipient. `scoped_player` is
+        // rebound to the player whose life total is being set; the count's
+        // `ScopedPlayer` controller reads it, while `original_controller` (and
+        // hence any `You`-scoped count) and the ability's targets / chosen_x
+        // stay fixed to the caster. Single-player and caster-scoped forms
+        // ("becomes 10", "your life total", Repay in Kind's cross-player
+        // extremum) are unaffected — they carry no `ScopedPlayer` ref to vary.
+        let mut scoped_ability = ability.clone();
+        scoped_ability.set_scoped_player_recursive(target_player_id);
+        let amount = crate::game::quantity::resolve_quantity_with_targets(
+            state,
+            amount_expr,
+            &scoped_ability,
+        );
+
+        // CR 810.9a: "If a cost or effect needs to know the value of an
+        // individual player's life total, that cost or effect uses the
+        // team's life total instead" — degenerates to `Player::life` outside
+        // team-based formats. CR 810.9c: the diff is still applied to only
+        // `target_player_id`'s own life, so the team total moves by exactly
+        // the gained/lost amount.
+        if !state.players.iter().any(|p| p.id == target_player_id) {
+            return Err(EffectError::PlayerNotFound);
+        }
+        let current_life = crate::game::players::team_life_total(state, target_player_id);
+        let diff = amount - current_life;
+
+        let deferred = match diff.signum() {
+            1 => apply_life_gain(state, target_player_id, diff as u32, events).err(),
+            -1 => apply_damage_life_loss(state, target_player_id, (-diff) as u32, events).err(),
+            _ => None,
+        };
+        if deferred.is_some() {
+            // CR 616.1: A competing replacement required a player choice; the
+            // helper already installed the WaitingFor state. Return without
+            // emitting EffectResolved — the resume path completes resolution.
+            // (A multi-player set that hits a replacement mid-list defers from
+            // that player onward, mirroring the original single-player path.)
+            return Ok(());
+        }
     }
 
     events.push(GameEvent::EffectResolved {
@@ -477,9 +637,12 @@ mod tests {
     use crate::game::game_object::AttachTarget;
     use crate::game::zones::create_object;
     use crate::types::ability::{
-        ControllerRef, QuantityExpr, StaticDefinition, TargetFilter, TargetRef, TypedFilter,
+        AggregateFunction, ControllerRef, QuantityExpr, QuantityRef, SharedQuality,
+        StaticDefinition, TargetFilter, TargetRef, TypeFilter, TypedFilter,
     };
+    use crate::types::card_type::CoreType;
     use crate::types::identifiers::{CardId, ObjectId};
+    use crate::types::keywords::Keyword;
     use crate::types::player::PlayerId;
     use crate::types::statics::StaticMode;
     use crate::types::zones::Zone;
@@ -513,7 +676,7 @@ mod tests {
         let ability = ResolvedAbility::new(
             Effect::GainLife {
                 amount: QuantityExpr::Fixed { value: 5 },
-                player: GainLifePlayer::Controller,
+                player: TargetFilter::Controller,
             },
             vec![],
             ObjectId(100),
@@ -524,6 +687,107 @@ mod tests {
         resolve_gain(&mut state, &ability, &mut events).unwrap();
 
         assert_eq!(state.players[0].life, 25);
+    }
+
+    #[test]
+    fn set_life_total_all_players_sets_every_player_no_target() {
+        // CR 119.5 + issue #2882: Worldfire's "Each player's life total becomes 1"
+        // must set EVERY player to 1 with no targeting prompt — not just the
+        // controller and not a single chosen player.
+        let mut state = GameState::new_two_player(42);
+        state.players[0].life = 20;
+        state.players[1].life = 15;
+        let ability = ResolvedAbility::new(
+            Effect::SetLifeTotal {
+                target: TargetFilter::AllPlayers,
+                amount: QuantityExpr::Fixed { value: 1 },
+            },
+            vec![], // no Player targets — AllPlayers is a non-targeted scope
+            ObjectId(100),
+            PlayerId(0),
+        );
+        let mut events = Vec::new();
+
+        resolve_set_life_total(&mut state, &ability, &mut events).unwrap();
+
+        assert_eq!(
+            state.players[0].life, 1,
+            "controller's life should become 1"
+        );
+        assert_eq!(state.players[1].life, 1, "opponent's life should become 1");
+    }
+
+    #[test]
+    fn skemfar_shadowsage_gain_life_mode_uses_shared_creature_type_count() {
+        let mut state = GameState::new_two_player(42);
+        state.all_creature_types = vec![
+            "Elf".to_string(),
+            "Warrior".to_string(),
+            "Druid".to_string(),
+            "Human".to_string(),
+        ];
+        let source = create_object(
+            &mut state,
+            CardId(901),
+            PlayerId(0),
+            "Skemfar Shadowsage".to_string(),
+            Zone::Battlefield,
+        );
+        for (name, subtypes) in [
+            ("Elf Warrior", vec!["Elf", "Warrior"]),
+            ("Elf Druid", vec!["Elf", "Druid"]),
+            ("Human Warrior", vec!["Human", "Warrior"]),
+        ] {
+            let id = create_object(
+                &mut state,
+                CardId(902),
+                PlayerId(0),
+                name.to_string(),
+                Zone::Battlefield,
+            );
+            let obj = state.objects.get_mut(&id).unwrap();
+            obj.card_types.core_types = vec![CoreType::Creature];
+            obj.card_types.subtypes = subtypes
+                .into_iter()
+                .map(|subtype| subtype.to_string())
+                .collect();
+        }
+        let changeling = create_object(
+            &mut state,
+            CardId(903),
+            PlayerId(0),
+            "Masked Vandal".to_string(),
+            Zone::Battlefield,
+        );
+        let obj = state.objects.get_mut(&changeling).unwrap();
+        obj.card_types.core_types = vec![CoreType::Creature];
+        obj.card_types.subtypes = vec!["Shapeshifter".to_string()];
+        obj.keywords.push(Keyword::Changeling);
+
+        let ability = ResolvedAbility::new(
+            Effect::GainLife {
+                amount: QuantityExpr::Ref {
+                    qty: QuantityRef::ObjectCountBySharedQuality {
+                        filter: TargetFilter::Typed(TypedFilter {
+                            type_filters: vec![TypeFilter::Creature],
+                            controller: Some(ControllerRef::You),
+                            properties: Vec::new(),
+                        }),
+                        quality: SharedQuality::CreatureType,
+                        aggregate: AggregateFunction::Max,
+                    },
+                },
+                player: TargetFilter::Controller,
+            },
+            vec![],
+            source,
+            PlayerId(0),
+        );
+        let mut events = Vec::new();
+
+        resolve_gain(&mut state, &ability, &mut events).unwrap();
+
+        assert_eq!(state.players[0].life, 23);
     }
 
     #[test]
@@ -543,6 +807,42 @@ mod tests {
         resolve_lose(&mut state, &ability, &mut events).unwrap();
 
         assert_eq!(state.players[1].life, 17);
+    }
+
+    /// CR 115.1 + CR 119.3: Astarion, the Decadent (Feed mode) — "Target
+    /// opponent loses life equal to the amount of life they lost this turn."
+    /// The third-person "they" anaphor is the effect's player target, so the
+    /// amount resolves through `PlayerScope::Target` (the target's *own*
+    /// `life_lost_this_turn`), NOT the controller's. The controller's count is
+    /// seeded high as a trap: a `Controller`-scoped resolution would drain the
+    /// target by 99 instead of 3.
+    #[test]
+    fn lose_life_amount_target_relative_life_lost_this_turn() {
+        use crate::types::ability::PlayerScope;
+        let mut state = GameState::new_two_player(42);
+        state.players[0].life_lost_this_turn = 99; // controller — must be ignored
+        state.players[1].life_lost_this_turn = 3; // target opponent
+        let ability = ResolvedAbility::new(
+            Effect::LoseLife {
+                amount: QuantityExpr::Ref {
+                    qty: QuantityRef::LifeLostThisTurn {
+                        player: PlayerScope::Target,
+                    },
+                },
+                target: None,
+            },
+            vec![TargetRef::Player(PlayerId(1))],
+            ObjectId(100),
+            PlayerId(0),
+        );
+        let mut events = Vec::new();
+
+        resolve_lose(&mut state, &ability, &mut events).unwrap();
+
+        // Target opponent (20 starting) loses 3 — their own life lost this turn.
+        assert_eq!(state.players[1].life, 17);
+        // Controller is untouched (it is the source, not a target/recipient).
+        assert_eq!(state.players[0].life, 20);
     }
 
     #[test]
@@ -623,7 +923,7 @@ mod tests {
         let ability = ResolvedAbility::new(
             Effect::GainLife {
                 amount: QuantityExpr::Fixed { value: 4 },
-                player: GainLifePlayer::Controller,
+                player: TargetFilter::Controller,
             },
             vec![],
             ObjectId(100),
@@ -673,7 +973,7 @@ mod tests {
         let ability = ResolvedAbility::new(
             Effect::GainLife {
                 amount: QuantityExpr::Fixed { value: 5 },
-                player: GainLifePlayer::Controller,
+                player: TargetFilter::Controller,
             },
             vec![],
             ObjectId(100),
@@ -733,6 +1033,81 @@ mod tests {
 
         assert_eq!(lost, 0);
         assert_eq!(state.players[0].life, 20);
+    }
+
+    /// CR 701.12c + CR 616.1: If a life-total assignment pauses on a replacement
+    /// choice, the resume path must apply the remaining snapshot deltas.
+    #[test]
+    fn life_total_assignment_resumes_tail_after_replacement_choice() {
+        use crate::game::engine::apply_as_current;
+        use crate::types::ability::{ReplacementDefinition, ReplacementMode};
+        use crate::types::actions::GameAction;
+        use crate::types::game_state::WaitingFor;
+        use crate::types::replacements::ReplacementEvent;
+
+        let mut state = GameState::new_two_player(42);
+        state.players[0].life = 20;
+        state.players[1].life = 5;
+
+        let shield = create_object(
+            &mut state,
+            CardId(950),
+            PlayerId(0),
+            "Life Shield".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&shield)
+            .unwrap()
+            .replacement_definitions
+            .push(
+                ReplacementDefinition::new(ReplacementEvent::LifeReduced)
+                    .mode(ReplacementMode::Optional { decline: None })
+                    .description("Life Shield".to_string()),
+            );
+
+        let mut events = Vec::new();
+        let outcome = apply_life_totals_assignment(
+            &mut state,
+            &[(PlayerId(0), 5), (PlayerId(1), 20)],
+            PlayerId(0),
+            Some(PendingEffectResolved::new(
+                EffectKind::ExchangeLifeTotals,
+                ObjectId(100),
+            )),
+            &mut events,
+        )
+        .unwrap();
+
+        assert_eq!(outcome, LifeAssignmentOutcome::Deferred);
+        assert!(matches!(
+            state.waiting_for,
+            WaitingFor::ReplacementChoice { .. }
+        ));
+        assert_eq!(state.players[0].life, 20);
+        assert_eq!(state.players[1].life, 5);
+
+        let WaitingFor::ReplacementChoice { player, .. } = state.waiting_for.clone() else {
+            panic!("expected replacement choice");
+        };
+        state.active_player = player;
+        state.priority_player = player;
+
+        let result = apply_as_current(&mut state, GameAction::ChooseReplacement { index: 0 })
+            .expect("accept life-loss replacement");
+
+        assert_eq!(state.players[0].life, 5);
+        assert_eq!(state.players[1].life, 20);
+        assert!(state.pending_life_total_assignment.is_none());
+        assert!(matches!(state.waiting_for, WaitingFor::Priority { .. }));
+        assert!(result.events.iter().any(|event| matches!(
+            event,
+            GameEvent::EffectResolved {
+                kind: EffectKind::ExchangeLifeTotals,
+                source_id: ObjectId(100),
+            }
+        )));
     }
 
     /// CR 119.8: `resolve_lose` suppresses life loss for CantLoseLife player.
@@ -919,7 +1294,7 @@ mod tests {
         let ability = ResolvedAbility::new(
             Effect::GainLife {
                 amount: QuantityExpr::Fixed { value: 5 },
-                player: GainLifePlayer::Controller,
+                player: TargetFilter::Controller,
             },
             vec![],
             ObjectId(200),
@@ -1003,6 +1378,115 @@ mod tests {
         );
     }
 
+    /// CR 119.3 + CR 109.5: Genesis of the Daleks chapter IV — "...and each of
+    /// your opponents loses life equal to ...". End-to-end resolution guard for
+    /// the parser fix that lifts the "each of your opponents" subject onto the
+    /// sub_ability's `player_scope` (leaving `LoseLife.target: None`) instead of
+    /// stamping a non-resolvable `Typed(controller=Opponent)` target.
+    ///
+    /// This drives the actual parsed encoding through `resolve_ability_chain`:
+    /// the controller (p0) must NOT lose life and the opponent (p1) MUST. The
+    /// AST-only parser test (`genesis_villainous_branch_splits_destroy_and_lose_life`)
+    /// asserts the shape; this test asserts the runtime routing, closing the
+    /// path-divergence gap where a green AST test masked the inverse drain.
+    #[test]
+    fn genesis_each_opponent_loses_life_drains_opponent() {
+        use crate::game::effects::resolve_ability_chain;
+        use crate::types::ability::PlayerFilter;
+
+        let mut state = GameState::new_two_player(42);
+        let p0_life_before = state.players[0].life;
+        let p1_life_before = state.players[1].life;
+
+        // Genesis branch-1 LoseLife encoding: undirected `target: None` with the
+        // each-opponent scope lifted onto the ability (the post-fix shape). The
+        // amount is fixed here — the bug under test is target routing, not amount
+        // resolution (the dynamic `ZoneChangeAggregateThisTurn` amount is covered
+        // by the AST parser test).
+        let mut ability = ResolvedAbility::new(
+            Effect::LoseLife {
+                amount: QuantityExpr::Fixed { value: 5 },
+                target: None,
+            },
+            vec![],
+            ObjectId(100),
+            PlayerId(0),
+        );
+        ability.player_scope = Some(PlayerFilter::Opponent);
+
+        let mut events = Vec::new();
+        resolve_ability_chain(&mut state, &ability, &mut events, 0).unwrap();
+
+        assert_eq!(
+            state.players[0].life, p0_life_before,
+            "Genesis's controller (p0) must NOT lose life — the each-opponent \
+             scope routes the loss to opponents, not the source controller"
+        );
+        assert_eq!(
+            state.players[1].life,
+            p1_life_before - 5,
+            "each opponent (p1) must lose 5 life"
+        );
+    }
+
+    /// CR 115.10a + CR 119.3 + CR 608.2c (Wound Reflection / Archfiend of Despair /
+    /// Warlock Class L3): "each opponent loses life equal to the life they lost
+    /// this turn" resolves with a `LifeLostThisTurn { ScopedPlayer }` amount under
+    /// `player_scope: Opponent`. Each iterated opponent must lose its OWN life lost
+    /// this turn — NOT the source controller's. The controller's count is seeded
+    /// high (99) as a trap: the prior `Controller`-scoped encoding drained every
+    /// opponent by 99. This is the canonical runtime regression guard for the
+    /// reported bug; the parser fix is covered in oracle_effect/mod.rs.
+    #[test]
+    fn each_opponent_loses_own_life_lost_uses_scoped_player() {
+        use crate::game::effects::resolve_ability_chain;
+        use crate::types::ability::{PlayerFilter, PlayerScope};
+
+        // 3-player game so two distinct opponents prove per-iteration scoping.
+        let mut state = GameState::new(crate::types::FormatConfig::standard(), 3, 42);
+        state.players[0].life_lost_this_turn = 99; // controller — trap, must be ignored
+        state.players[1].life_lost_this_turn = 3; // opponent A
+        state.players[2].life_lost_this_turn = 5; // opponent B
+        let p0_life_before = state.players[0].life;
+        let p1_life_before = state.players[1].life;
+        let p2_life_before = state.players[2].life;
+
+        let mut ability = ResolvedAbility::new(
+            Effect::LoseLife {
+                amount: QuantityExpr::Ref {
+                    qty: QuantityRef::LifeLostThisTurn {
+                        player: PlayerScope::ScopedPlayer,
+                    },
+                },
+                target: None,
+            },
+            vec![],
+            ObjectId(100),
+            PlayerId(0),
+        );
+        ability.player_scope = Some(PlayerFilter::Opponent);
+
+        let mut events = Vec::new();
+        resolve_ability_chain(&mut state, &ability, &mut events, 0).unwrap();
+
+        // Controller untouched — it is the source, not an affected opponent.
+        assert_eq!(
+            state.players[0].life, p0_life_before,
+            "controller must not lose life — the trap value (99) must be ignored"
+        );
+        // Each opponent loses ITS OWN life lost this turn (3 and 5), not 99.
+        assert_eq!(
+            state.players[1].life,
+            p1_life_before - 3,
+            "opponent A must lose its own life lost (3), not the controller's 99"
+        );
+        assert_eq!(
+            state.players[2].life,
+            p2_life_before - 5,
+            "opponent B must lose its own life lost (5), not the controller's 99"
+        );
+    }
+
     /// Issue #317 (Lich): "If you would gain life, draw that many cards
     /// instead." The replacement substitutes a *different* event type
     /// (`Effect::Draw`) for the original `LifeGain` event. CR 614.1a +
@@ -1013,9 +1497,7 @@ mod tests {
     /// fallback path).
     #[test]
     fn lich_gain_life_substituted_by_draw_cards_instead() {
-        use crate::types::ability::{
-            AbilityDefinition, AbilityKind, GainLifePlayer, ReplacementDefinition,
-        };
+        use crate::types::ability::{AbilityDefinition, AbilityKind, ReplacementDefinition};
         use crate::types::replacements::ReplacementEvent;
 
         let mut state = GameState::new_two_player(42);
@@ -1061,7 +1543,7 @@ mod tests {
         let ability = ResolvedAbility::new(
             Effect::GainLife {
                 amount: QuantityExpr::Fixed { value: 4 },
-                player: GainLifePlayer::Controller,
+                player: TargetFilter::Controller,
             },
             vec![],
             ObjectId(100),
@@ -1096,9 +1578,7 @@ mod tests {
     /// "substitution" (different event type).
     #[test]
     fn gain_life_scaling_shape_modifies_amount_does_not_substitute() {
-        use crate::types::ability::{
-            AbilityDefinition, AbilityKind, GainLifePlayer, ReplacementDefinition,
-        };
+        use crate::types::ability::{AbilityDefinition, AbilityKind, ReplacementDefinition};
         use crate::types::replacements::ReplacementEvent;
 
         let mut state = GameState::new_two_player(42);
@@ -1119,7 +1599,7 @@ mod tests {
                             qty: crate::types::ability::QuantityRef::EventContextAmount,
                         }),
                     },
-                    player: GainLifePlayer::Controller,
+                    player: TargetFilter::Controller,
                 },
             ));
         state
@@ -1132,7 +1612,7 @@ mod tests {
         let ability = ResolvedAbility::new(
             Effect::GainLife {
                 amount: QuantityExpr::Fixed { value: 3 },
-                player: GainLifePlayer::Controller,
+                player: TargetFilter::Controller,
             },
             vec![],
             ObjectId(100),
@@ -1158,5 +1638,25 @@ mod tests {
              continuation; found {:?}",
             state.post_replacement_continuation
         );
+    }
+
+    #[test]
+    fn gain_life_target_player_uses_declared_target() {
+        // CR 115.1 + CR 119.3: "target player gains N life" — the gaining
+        // player is the declared target in ability.targets, not the controller.
+        let mut state = GameState::new_two_player(42);
+        let ability = ResolvedAbility::new(
+            Effect::GainLife {
+                amount: QuantityExpr::Fixed { value: 4 },
+                player: TargetFilter::Player,
+            },
+            vec![TargetRef::Player(PlayerId(1))],
+            ObjectId(100),
+            PlayerId(0),
+        );
+        let mut events = Vec::new();
+        resolve_gain(&mut state, &ability, &mut events).unwrap();
+        assert_eq!(state.players[1].life, 24, "target player (p1) gains 4 life");
+        assert_eq!(state.players[0].life, 20, "controller (p0) is unaffected");
     }
 }

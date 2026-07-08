@@ -9,6 +9,7 @@ import type {
 } from "../../adapter/types.ts";
 import { useCanActForWaitingState } from "../../hooks/usePlayerId.ts";
 import { useGameStore } from "../../stores/gameStore.ts";
+import { assertNever } from "../../utils/assertNever.ts";
 import { ManaCostSymbols } from "../mana/ManaCostSymbols.tsx";
 import { CardTextboxPreview } from "./CardTextboxPreview.tsx";
 import { DialogShell } from "./DialogShell.tsx";
@@ -24,9 +25,7 @@ interface KeywordCopy {
   normalLabel: string;
   altLabel: string;
   altSuffix?: string;
-  /** True when the card's printed Oracle text is helpful context. Warp's
-   * rider lives on the keyword itself; the other three meaningfully change
-   * the spell's behavior. */
+  /** True when the card's printed Oracle text is helpful context for the chosen keyword. */
   showOracleText: boolean;
   subtitle: string;
 }
@@ -56,6 +55,27 @@ function keywordCopy(
         showOracleText: true,
         subtitle: t("alternativeCost.evokeSubtitle", { name: cardName }),
       };
+    // CR 702.119a-c: Emerge — sacrifice a creature while casting; the emerge
+    // cost is reduced by that creature's mana value (handled engine-side).
+    case "Emerge":
+      return {
+        eyebrow: t("alternativeCost.emergeEyebrow"),
+        normalLabel: t("alternativeCost.emergeNormalLabel"),
+        altLabel: t("alternativeCost.emergeAltLabel"),
+        showOracleText: true,
+        subtitle: t("alternativeCost.emergeSubtitle", { name: cardName }),
+      };
+    // CR 702.109a: Dash — like Warp, the rider (haste + end-step return to hand)
+    // lives on the keyword itself and doesn't change the spell's printed text.
+    case "Dash":
+      return {
+        eyebrow: t("alternativeCost.dashEyebrow"),
+        normalLabel: t("alternativeCost.dashNormalLabel"),
+        altLabel: t("alternativeCost.dashAltLabel"),
+        altSuffix: t("alternativeCost.dashAltSuffix"),
+        showOracleText: false,
+        subtitle: t("alternativeCost.dashSubtitle", { name: cardName }),
+      };
     case "Overload":
       return {
         eyebrow: t("alternativeCost.overloadEyebrow"),
@@ -72,7 +92,105 @@ function keywordCopy(
         showOracleText: true,
         subtitle: t("alternativeCost.bestowSubtitle", { name: cardName }),
       };
+    case "Awaken":
+      return {
+        eyebrow: t("alternativeCost.awakenEyebrow"),
+        normalLabel: t("alternativeCost.awakenNormalLabel"),
+        altLabel: t("alternativeCost.awakenAltLabel"),
+        showOracleText: true,
+        subtitle: t("alternativeCost.awakenSubtitle", { name: cardName }),
+      };
+    case "Cleave":
+      return {
+        eyebrow: t("alternativeCost.cleaveEyebrow"),
+        normalLabel: t("alternativeCost.cleaveNormalLabel"),
+        altLabel: t("alternativeCost.cleaveAltLabel"),
+        showOracleText: true,
+        subtitle: t("alternativeCost.cleaveSubtitle", { name: cardName }),
+      };
+    case "MoreThanMeetsTheEye":
+      return {
+        eyebrow: t("alternativeCost.mtmteEyebrow"),
+        normalLabel: t("alternativeCost.mtmteNormalLabel"),
+        altLabel: t("alternativeCost.mtmteAltLabel"),
+        showOracleText: true,
+        subtitle: t("alternativeCost.mtmteSubtitle", { name: cardName }),
+      };
+    // CR 702.140a: Mutate — pay the mutate cost to cast as a mutating creature
+    // spell targeting a non-Human creature you own.
+    case "Mutate":
+      return {
+        eyebrow: t("alternativeCost.mutateEyebrow"),
+        normalLabel: t("alternativeCost.mutateNormalLabel"),
+        altLabel: t("alternativeCost.mutateAltLabel"),
+        showOracleText: true,
+        subtitle: t("alternativeCost.mutateSubtitle", { name: cardName }),
+      };
+    // CR 702.152a: Blitz — pay the blitz cost; the creature gains haste and
+    // "when it dies, draw a card", but is sacrificed at the next end step.
+    case "Blitz":
+      return {
+        eyebrow: t("alternativeCost.blitzEyebrow"),
+        normalLabel: t("alternativeCost.blitzNormalLabel"),
+        altLabel: t("alternativeCost.blitzAltLabel"),
+        showOracleText: true,
+        subtitle: t("alternativeCost.blitzSubtitle", { name: cardName }),
+      };
+    // CR 702.176a: Impending — pay the impending cost; the permanent enters with
+    // time counters and isn't a creature until the last one is removed.
+    case "Impending":
+      return {
+        eyebrow: t("alternativeCost.impendingEyebrow"),
+        normalLabel: t("alternativeCost.impendingNormalLabel"),
+        altLabel: t("alternativeCost.impendingAltLabel"),
+        showOracleText: true,
+        subtitle: t("alternativeCost.impendingSubtitle", { name: cardName }),
+      };
+    // CR 702.160a: Prototype — pay the prototype cost; the spell/permanent uses
+    // its secondary power, toughness, and mana cost while it is a creature.
+    case "Prototype":
+      return {
+        eyebrow: t("alternativeCost.prototypeEyebrow"),
+        normalLabel: t("alternativeCost.prototypeNormalLabel"),
+        altLabel: t("alternativeCost.prototypeAltLabel"),
+        showOracleText: true,
+        subtitle: t("alternativeCost.prototypeSubtitle", { name: cardName }),
+      };
+    // CR 702.137a: Spectacle — pay the spectacle cost (legal only if an opponent
+    // lost life this turn). A pure cost substitution; the spell resolves normally
+    // with no rider, so the printed Oracle text needs no extra context.
+    case "Spectacle":
+      return {
+        eyebrow: t("alternativeCost.spectacleEyebrow"),
+        normalLabel: t("alternativeCost.spectacleNormalLabel"),
+        altLabel: t("alternativeCost.spectacleAltLabel"),
+        showOracleText: false,
+        subtitle: t("alternativeCost.spectacleSubtitle", { name: cardName }),
+      };
+    // CR 702.76a: Prowl — pay the prowl cost if the caster's matching creature
+    // dealt combat damage to a player this turn. Pure cost substitution.
+    case "Prowl":
+      return {
+        eyebrow: t("alternativeCost.prowlEyebrow"),
+        normalLabel: t("alternativeCost.prowlNormalLabel"),
+        altLabel: t("alternativeCost.prowlAltLabel"),
+        showOracleText: false,
+        subtitle: t("alternativeCost.prowlSubtitle", { name: cardName }),
+      };
+    // CR 702.37c / CR 702.168a + CR 708.4: Morph/Megamorph/Disguise — cast face
+    // down as a blank 2/2 creature spell for a fixed {3}. The card's real Oracle
+    // text (including its turn-face-up cost) helps the caster decide, so show it.
+    case "FaceDown":
+      return {
+        eyebrow: t("alternativeCost.faceDownEyebrow"),
+        normalLabel: t("alternativeCost.faceDownNormalLabel"),
+        altLabel: t("alternativeCost.faceDownAltLabel"),
+        altSuffix: t("alternativeCost.faceDownAltSuffix"),
+        showOracleText: true,
+        subtitle: t("alternativeCost.faceDownSubtitle", { name: cardName }),
+      };
   }
+  return assertNever(keyword);
 }
 
 /**
@@ -105,8 +223,8 @@ function describeAdditionalCost(
 /**
  * CR 118.9: Unified prompt for keyword-granted alternative casting costs
  * (Warp custom, Evoke per CR 702.74a, Overload per CR 702.96a, Bestow per
- * CR 702.103a). All four share the same player-decision shape; the engine's
- * `keyword` axis selects display copy only.
+ * CR 702.103a, Cleave per CR 702.148a). All share the same player-decision
+ * shape; the engine's `keyword` axis selects display copy only.
  */
 export function AlternativeCostModal() {
   const canActForWaitingState = useCanActForWaitingState();

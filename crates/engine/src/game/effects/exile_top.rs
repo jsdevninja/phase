@@ -1,5 +1,5 @@
 use crate::game::quantity::resolve_quantity_with_targets;
-use crate::game::zones;
+use crate::game::zone_pipeline::{self, ZoneMoveRequest};
 use crate::types::ability::{Effect, EffectError, EffectKind, ResolvedAbility};
 use crate::types::events::GameEvent;
 use crate::types::game_state::GameState;
@@ -18,7 +18,11 @@ pub fn resolve(
         } => (
             // Use resolve_quantity_with_targets so that TargetZoneCardCount (and
             // DivideRounded wrapping it) can resolve against the targeted player.
-            resolve_quantity_with_targets(state, count, ability) as usize,
+            // CR 107.1b: clamp a negative result to zero before the `as usize`
+            // cast — a subtractive count would otherwise wrap huge, and the
+            // downstream library-size `min` would exile the entire library
+            // instead of nothing. Mirrors the guard in `draw.rs` / `discard.rs`.
+            resolve_quantity_with_targets(state, count, ability).max(0) as usize,
             player.clone(),
             *face_down,
         ),
@@ -57,10 +61,33 @@ pub fn resolve(
     // `change_zone::resolve`, which likewise delegates publishing to the
     // chain processor.
     for object_id in top_cards {
-        zones::move_to_zone(state, object_id, Zone::Exile, events);
+        // CR 614.6: exile the top card via the zone-change pipeline so a
+        // board-wide `Moved` exile redirect is consulted (none target Exile today
+        // — behavior-preserving, future-proof). Exile-link tracking rides the
+        // pipeline's `.track_exiled_by_source()` builder so the link is recorded by
+        // the delivery tail ONLY if the card actually lands in exile — a `Moved`
+        // redirect that sends it elsewhere correctly records no link (redirect-
+        // safe), and the tail's `push_with_kind` keeps the per-turn rolling list in
+        // lockstep exactly as the former caller-side `push_tracked_by_source` did.
+        // No Exile-targeting `Moved` redirect exists in the current pool, so this
+        // does not pause today. CR 616.1: a future Exile-targeting redirect could
+        // surface an ordering choice mid-loop; park the prompt (mirrors
+        // `exile_from_top_until`'s NeedsChoice arm) and return rather than
+        // continuing to mutate/classify the remaining cards past a parked prompt.
+        let mut request = ZoneMoveRequest::effect(object_id, Zone::Exile, ability.source_id);
         if track_exiled_by_source {
-            crate::game::exile_links::push_tracked_by_source(state, object_id, ability.source_id);
+            request = request.track_exiled_by_source();
         }
+        let result = zone_pipeline::move_object(state, request, events);
+        if let zone_pipeline::ZoneMoveResult::NeedsChoice(player) = result {
+            state.waiting_for =
+                crate::game::replacement::replacement_choice_waiting_for(player, state);
+            return Ok(());
+        }
+        // CR 406.3: The face-down mark stays in this caller's per-card epilogue —
+        // there is no pipeline knob for it (CR 708 face-down profiles are
+        // battlefield-only), so it is set directly after the move below.
+        //
         // CR 406.3: A card exiled face down can't be examined by any player
         // except when instructions allow it. Set the moved object's
         // face-down state immediately after the zone change (mirrors the
@@ -88,9 +115,9 @@ mod tests {
 
     use crate::game::zones::create_object;
     use crate::types::ability::{
-        AbilityDefinition, AbilityKind, CardTypeSetSource, ControllerRef, FilterProp,
-        LinkedExileScope, ManaProduction, QuantityExpr, QuantityRef, TargetFilter, TargetRef,
-        TypeFilter, TypedFilter,
+        AbilityDefinition, AbilityKind, AggregateFunction, CardTypeSetSource, ControllerRef,
+        FilterProp, LinkedExileScope, ManaProduction, ObjectProperty, QuantityExpr, QuantityRef,
+        TargetFilter, TargetRef, TypeFilter, TypedFilter,
     };
     use crate::types::card_type::CoreType;
     use crate::types::identifiers::{CardId, ObjectId};
@@ -527,11 +554,14 @@ mod tests {
                 },
                 enters_under: None,
                 enter_transformed: false,
-                enter_tapped: false,
+                enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                 owner_library: false,
                 enters_attacking: false,
                 up_to: false,
                 enter_with_counters: vec![],
+                conditional_enter_with_counters: vec![],
+                face_down_profile: None,
+                enters_modified_if: None,
             },
         );
         let delayed = ResolvedAbility::new(
@@ -539,6 +569,7 @@ mod tests {
                 condition: DelayedTriggerCondition::AtNextPhaseForPlayer {
                     phase: Phase::End,
                     player: PlayerId(0),
+                    gate: crate::types::ability::TurnGate::None,
                 },
                 effect: Box::new(recall_inner),
                 uses_tracked_set: true,
@@ -619,6 +650,94 @@ mod tests {
         );
     }
 
+    /// CR 609.3 + CR 202.3 + CR 120.1: Ensnared by the Mara's losing branch —
+    /// "that player exiles the top four cards of their library and ~ deals
+    /// damage equal to the total mana value of those exiled cards to that
+    /// player." The `ExileTop` publishes a tracked set (because its `DealDamage`
+    /// sub-ability references it via `TrackedSetAggregate`); the chained
+    /// `DealDamage` then sums the exiled cards' mana values from that set.
+    /// Discriminating: a fifth library card (MV 8) is NOT among the exiled four
+    /// and must not be summed.
+    #[test]
+    fn exile_top_then_deal_damage_sums_mana_value_of_those_exiled_cards() {
+        let mut state = GameState::new_two_player(42);
+
+        // Top four cards (exiled): mana values 1, 2, 3, 4 → sum 10.
+        for (i, mv) in [1u32, 2, 3, 4].iter().enumerate() {
+            let id = create_object(
+                &mut state,
+                CardId(i as u64 + 1),
+                PlayerId(0),
+                format!("Card{i}"),
+                Zone::Library,
+            );
+            state.objects.get_mut(&id).unwrap().mana_cost =
+                crate::types::mana::ManaCost::generic(*mv);
+        }
+        // Fifth card (NOT exiled): mana value 8 — must be excluded from the sum.
+        let untouched = create_object(
+            &mut state,
+            CardId(99),
+            PlayerId(0),
+            "Untouched".to_string(),
+            Zone::Library,
+        );
+        state.objects.get_mut(&untouched).unwrap().mana_cost =
+            crate::types::mana::ManaCost::generic(8);
+
+        let damage = ResolvedAbility::new(
+            Effect::DealDamage {
+                amount: QuantityExpr::Ref {
+                    qty: QuantityRef::TrackedSetAggregate {
+                        function: AggregateFunction::Sum,
+                        property: ObjectProperty::ManaValue,
+                        source: crate::types::ability::TrackedAnaphorSource::ChainSet,
+                    },
+                },
+                target: TargetFilter::Controller,
+                damage_source: None,
+                excess: None,
+            },
+            vec![],
+            ObjectId(100),
+            PlayerId(0),
+        );
+
+        let mut exile = make_exile_top_ability(4);
+        exile.sub_ability = Some(Box::new(damage));
+
+        let starting_life = state
+            .players
+            .iter()
+            .find(|p| p.id == PlayerId(0))
+            .unwrap()
+            .life;
+
+        // CR 603.7: Drive through `resolve_ability_chain` so the chain processor
+        // publishes ExileTop's tracked set before the DealDamage sub-ability
+        // reads it (mirrors live resolution).
+        let mut events = Vec::new();
+        crate::game::effects::resolve_ability_chain(&mut state, &exile, &mut events, 0).unwrap();
+
+        let ending_life = state
+            .players
+            .iter()
+            .find(|p| p.id == PlayerId(0))
+            .unwrap()
+            .life;
+        assert_eq!(
+            starting_life - ending_life,
+            10,
+            "TrackedSetAggregate must sum exactly the four exiled cards' mana values (1+2+3+4=10), excluding the untouched MV-8 card",
+        );
+
+        // Sanity: the fifth card stayed in the library (only four were exiled).
+        assert_eq!(
+            state.objects.get(&untouched).map(|obj| obj.zone),
+            Some(Zone::Library)
+        );
+    }
+
     /// CR 406.3: A face-up `Effect::ExileTop` must leave `face_down`
     /// untouched (default `false`) so cards exiled face up — the Cascade /
     /// Impulse / Adventure class — remain inspectable by every player.
@@ -652,6 +771,87 @@ mod tests {
         assert!(
             !obj.face_down,
             "face-up ExileTop must not flip the object's `face_down` flag",
+        );
+    }
+
+    /// CR 107.1b: an exile-top count that resolves negative must clamp to 0, not
+    /// wrap through the `as usize` cast and exile the whole library. Revert-probe:
+    /// without the `.max(0)` the downstream library-size `min` exiles the target's
+    /// entire library instead of nothing.
+    #[test]
+    fn exile_top_negative_count_clamps_to_zero() {
+        use crate::types::ability::PlayerScope;
+
+        let mut state = GameState::new_two_player(7);
+        // Controller (P0): 1 card in hand, 2 in library. Opponent (P1): 3 in hand.
+        create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Hand".into(),
+            Zone::Hand,
+        );
+        create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "LibA".into(),
+            Zone::Library,
+        );
+        create_object(
+            &mut state,
+            CardId(3),
+            PlayerId(0),
+            "LibB".into(),
+            Zone::Library,
+        );
+        for i in 0..3u64 {
+            create_object(
+                &mut state,
+                CardId(10 + i),
+                PlayerId(1),
+                "Theirs".into(),
+                Zone::Hand,
+            );
+        }
+
+        // count = HandSize{You} − HandSize{Opponent} = 1 − 3 = −2.
+        let count = QuantityExpr::Sum {
+            exprs: vec![
+                QuantityExpr::Ref {
+                    qty: QuantityRef::HandSize {
+                        player: PlayerScope::Controller,
+                    },
+                },
+                QuantityExpr::Multiply {
+                    factor: -1,
+                    inner: Box::new(QuantityExpr::Ref {
+                        qty: QuantityRef::HandSize {
+                            player: PlayerScope::Opponent {
+                                aggregate: AggregateFunction::Sum,
+                            },
+                        },
+                    }),
+                },
+            ],
+        };
+        let ability = ResolvedAbility::new(
+            Effect::ExileTop {
+                player: TargetFilter::Controller,
+                count,
+                face_down: false,
+            },
+            vec![],
+            ObjectId(100),
+            PlayerId(0),
+        );
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        assert_eq!(
+            state.players[0].library.len(),
+            2,
+            "CR 107.1b: a negative exile-top count must exile 0, not the whole library"
         );
     }
 }

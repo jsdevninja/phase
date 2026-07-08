@@ -4,7 +4,8 @@ use super::oracle_nom::bridge::nom_on_lower;
 use super::oracle_nom::error::OracleError;
 use super::oracle_nom::error::OracleResult;
 use super::oracle_nom::primitives as nom_primitives;
-use crate::types::ability::{Comparator, QuantityExpr, QuantityRef, TargetFilter};
+use super::oracle_quantity::parse_cda_quantity;
+use crate::types::ability::{Comparator, QuantityExpr, QuantityRef, RoundingMode, TargetFilter};
 use crate::types::card_type::{
     fixed_noncreature_subtypes, noncreature_subtype_set, CoreType, SubtypeSet,
 };
@@ -12,7 +13,7 @@ use crate::types::mana::{ManaColor, ManaCost};
 use nom::branch::alt;
 use nom::bytes::complete::{tag, take_until};
 use nom::character::complete::space1;
-use nom::combinator::{eof, opt};
+use nom::combinator::{eof, opt, peek, value};
 
 /// A borrowed pair of `(original, lowercase)` slices kept in lockstep.
 ///
@@ -254,6 +255,84 @@ pub fn strip_reminder_text(text: &str) -> String {
     result.trim().to_string()
 }
 
+/// CR 702.148a: How a square-bracketed span in a cleave spell's rules text is
+/// rendered for a given casting mode.
+///
+/// Cleave's two text variants share the same Oracle text, distinguished only by
+/// the square brackets that mark the cleave-removable span:
+///   * The **base** (printed-cost) text keeps every bracketed clause but drops
+///     the bracket characters themselves (`KeepContent`).
+///   * The **cleave-cost** text removes every bracketed span in its entirety
+///     (`RemoveSpan`), per CR 702.148a "removing all text found within square
+///     brackets."
+///
+/// Modeled as a typed enum (not a `bool`) so the bracket transform is
+/// self-documenting at every call site and extensible if a future frame
+/// mechanic needs a third bracket disposition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BracketMode {
+    /// Keep the text inside each `[...]`, dropping only the bracket characters.
+    KeepContent,
+    /// Drop each `[...]` span (brackets and inner text) entirely.
+    RemoveSpan,
+}
+
+/// CR 702.148a: Apply a `BracketMode` to a cleave spell's rules text.
+///
+/// Mirrors `strip_reminder_text`'s single-pass char filter, but operates on
+/// square brackets and handles multiple/comma-separated spans (e.g. Dig Up's
+/// `[basic land]` ... `[reveal it,]`). After removal, collapses any double
+/// spaces and orphan ", " punctuation left by a removed span so the resulting
+/// sentence parses cleanly.
+///
+/// MUST only be applied to faces carrying `Keyword::Cleave(_)` — 362
+/// planeswalkers use `[+N]`/`[−N]`/`[0]` loyalty brackets that an unconditional
+/// strip would corrupt. The cleave keyword gate at the single call site
+/// provides this guarantee.
+pub fn apply_bracket_mode(text: &str, mode: BracketMode) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut depth = 0u32;
+    for ch in text.chars() {
+        match ch {
+            '[' => depth += 1,
+            ']' => {
+                depth = depth.saturating_sub(1);
+            }
+            // RemoveSpan drops everything between the brackets; KeepContent
+            // keeps inner characters but never the bracket characters themselves.
+            _ if depth == 0 => result.push(ch),
+            _ if mode == BracketMode::KeepContent => result.push(ch),
+            _ => {}
+        }
+    }
+    normalize_bracket_removal_whitespace(&result)
+}
+
+/// Collapse the whitespace/punctuation artifacts left after a `RemoveSpan`
+/// bracket strip (e.g. "discard a card[, then ...]." → "discard a card."):
+/// double spaces, a space before a comma/period, and a leading orphan comma.
+fn normalize_bracket_removal_whitespace(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut prev_space = false;
+    for ch in text.chars() {
+        if ch == ' ' {
+            if prev_space {
+                continue;
+            }
+            prev_space = true;
+            result.push(ch);
+        } else {
+            // Drop a space immediately preceding a comma or period.
+            if matches!(ch, ',' | '.') && result.ends_with(' ') {
+                result.pop();
+            }
+            prev_space = false;
+            result.push(ch);
+        }
+    }
+    result.trim().to_string()
+}
+
 /// Replace "~" and "CARDNAME" with the actual card name, then lowercase for matching.
 pub fn self_ref(text: &str, card_name: &str) -> String {
     text.replace('~', card_name).replace("CARDNAME", card_name)
@@ -361,9 +440,9 @@ pub fn parse_count_expr(text: &str) -> Option<(QuantityExpr, &str)> {
             ));
         }
     }
-    // CR 107.1b: "equal to <quantity ref>" — composes the existing
-    // QuantityRef parser into the count-position. Strips the prefix, hands
-    // the trimmed tail to the shared `parse_quantity_ref` building block.
+    // CR 107.1b: "equal to <quantity expr>" — delegate to the shared
+    // `parse_cda_quantity` grammar so composed forms (twice/half/offset/sum/
+    // difference/max/aggregate) parse in count positions, not just bare refs.
     if let Some(((), rest_lower)) = super::oracle_nom::bridge::nom_on_lower(text, &lower, |i| {
         nom::combinator::value(
             (),
@@ -372,8 +451,8 @@ pub fn parse_count_expr(text: &str) -> Option<(QuantityExpr, &str)> {
         .parse(i)
     }) {
         let trimmed = rest_lower.trim_end_matches('.').trim_end();
-        if let Some(qty) = super::oracle_quantity::parse_quantity_ref(trimmed) {
-            return Some((QuantityExpr::Ref { qty }, ""));
+        if let Some(expr) = parse_cda_quantity(trimmed) {
+            return Some((expr, ""));
         }
     }
 
@@ -420,13 +499,78 @@ pub fn parse_count_expr(text: &str) -> Option<(QuantityExpr, &str)> {
     if let Some(rest_lower) = lower.strip_prefix('x') {
         let rest = &text[1..];
         if rest_lower.is_empty() || rest_lower.starts_with(|c: char| !c.is_alphanumeric()) {
+            // CR 107.3a + CR 701.47a: "X, where X is <description>" binds the
+            // variable to a defined quantity (e.g. amass's "where X is that
+            // spell's mana value") rather than a paid cost. Without this, X
+            // falls through to a bare `Variable` ref that always resolves to 0
+            // outside an actually-paid-X cost — a silent no-op (issue #720).
+            if let Some(description) = strip_where_x_is_clause(rest_lower) {
+                if let Some(expr) = parse_cda_quantity(description) {
+                    return Some((expr, ""));
+                }
+            }
+            // CR 107.1b + CR 107.3a: variable-first "X plus/minus <literal int N>"
+            // — the dual of the integer-first "N plus/minus <inner>" arm below.
+            // After the bare `X` ref, a "plus "/"minus " connective followed by a
+            // LITERAL integer (via `parse_number`) yields `Offset { inner: X,
+            // offset: +/-N }`, the offset stored directly (no `Multiply` wrapper).
+            // Flame Discharge / Light Up the Night: "deals X plus N damage". The
+            // integer restriction is deliberate — a dynamic operand ("X plus the
+            // number of …") must NOT be swallowed: `parse_number` fails there, so we
+            // fall through to the bare `X` ref with the connective left on the
+            // remainder (see `parse_count_expr_x_plus_dynamic_stays_bare_x`).
+            let after_x = rest.trim_start();
+            if let Ok((after_op, sign)) = nom::branch::alt((
+                nom::combinator::value(
+                    1i32,
+                    nom::bytes::complete::tag::<_, _, OracleError<'_>>("plus "),
+                ),
+                nom::combinator::value(-1i32, nom::bytes::complete::tag("minus ")),
+            ))
+            .parse(after_x)
+            {
+                // CR 107.1b + CR 107.3a: exclude a standalone `X` operand from the
+                // literal-integer offset. `parse_number` maps a bare "X" -> 0 (its
+                // numeric-only contract), so without this guard "X plus X" / "X minus X"
+                // would be wrongly consumed as `Offset { X, +/-0 }` instead of leaving the
+                // "plus X"/"minus X" connective on the remainder for the outer grammar.
+                // Peek — via the `nom_on_lower` bridge, so the check is case-insensitive —
+                // that `after_op` is NOT the `x` token as a standalone word (x followed by
+                // whitespace or end-of-input); `not` then succeeds only for a genuine
+                // literal-number operand. Regressions: parse_count_expr_x_plus_x_not_offset
+                // / parse_count_expr_x_minus_x_not_offset.
+                let after_op_lower = after_op.to_lowercase();
+                let operand_is_literal = nom_on_lower(after_op, &after_op_lower, |i| {
+                    nom::combinator::not(nom::sequence::terminated(
+                        nom::bytes::complete::tag::<_, _, OracleError<'_>>("x"),
+                        nom::branch::alt((nom::combinator::eof, nom::character::complete::space1)),
+                    ))
+                    .parse(i)
+                })
+                .is_some();
+                if operand_is_literal {
+                    if let Some((n, after_n)) = parse_number(after_op) {
+                        return Some((
+                            QuantityExpr::Offset {
+                                inner: Box::new(QuantityExpr::Ref {
+                                    qty: QuantityRef::Variable {
+                                        name: "X".to_string(),
+                                    },
+                                }),
+                                offset: sign * i32::try_from(n).unwrap_or(i32::MAX),
+                            },
+                            after_n,
+                        ));
+                    }
+                }
+            }
             return Some((
                 QuantityExpr::Ref {
                     qty: QuantityRef::Variable {
                         name: "X".to_string(),
                     },
                 },
-                rest.trim_start(),
+                after_x,
             ));
         }
     }
@@ -454,7 +598,171 @@ pub fn parse_count_expr(text: &str) -> Option<(QuantityExpr, &str)> {
             after_sup.trim_start(),
         ));
     }
+    // CR 107.1b + CR 107.3a: "N plus/minus <inner>" — a leading integer offset
+    // over a nested count expression ("three minus X" → Slumbering Trudge,
+    // "two plus X", etc.). CR 107.1b governs the arithmetic (a negative result
+    // is clamped to zero by the counter resolver); CR 107.3a covers the `X`
+    // operand. The operand recurses through the full count grammar
+    // (bare X, "twice X", fractions, "equal to <ref>"), so this composes over
+    // the existing `Offset`/`Multiply` variants rather than enumerating forms.
+    // The negative branch is modeled as `Multiply { factor: -1, inner }` inside
+    // the `Offset`, mirroring `parse_cda_quantity`'s offset arm. The "plus"/
+    // "minus" connectives are always lowercase in Oracle text and `parse_number`
+    // returns a leading-whitespace-trimmed remainder, so the tags carry no
+    // leading space (the trailing space enforces a word boundary). If the
+    // operand does not parse, fall through to the bare `Fixed` below — no
+    // regression for "N plus the number of …" (which `parse_count_expr` rejects).
+    if let Ok((after_op, sign)) = nom::branch::alt((
+        nom::combinator::value(
+            1i32,
+            nom::bytes::complete::tag::<_, _, OracleError<'_>>("plus "),
+        ),
+        nom::combinator::value(-1i32, nom::bytes::complete::tag("minus ")),
+    ))
+    .parse(rest)
+    {
+        if let Some((inner, after_inner)) = parse_count_expr(after_op) {
+            let inner_expr = if sign < 0 {
+                QuantityExpr::Multiply {
+                    factor: -1,
+                    inner: Box::new(inner),
+                }
+            } else {
+                inner
+            };
+            return Some((
+                QuantityExpr::Offset {
+                    inner: Box::new(inner_expr),
+                    offset: base,
+                },
+                after_inner,
+            ));
+        }
+    }
     Some((QuantityExpr::Fixed { value: base }, rest))
+}
+
+/// CR 107.1a: Parse a standalone trailing rounding marker left after another
+/// parser consumed the fractional quantity's noun phrase.
+///
+/// Examples include token text (`"half X Food tokens, rounded up"`) and
+/// sacrifice-choice text (`"half the creatures they control of their choice,
+/// rounded up"`), where `parse_count_expr` correctly builds `DivideRounded`
+/// from the leading fraction but cannot see the suffix until the token/choice
+/// parser peels its own grammar.
+pub(crate) fn parse_rounding_suffix_only(text: &str) -> Option<RoundingMode> {
+    let trimmed = text.trim_start();
+    let lower = trimmed.to_lowercase();
+    nom_on_lower(trimmed, &lower, |input| {
+        let (rest, rounding) = super::oracle_nom::quantity::parse_explicit_rounding_suffix(input)?;
+        let (rest, _) = opt(tag::<_, _, OracleError<'_>>(".")).parse(rest)?;
+        let (rest, _) = eof::<_, OracleError<'_>>(rest)?;
+        Ok((rest, rounding))
+    })
+    .map(|(rounding, _)| rounding)
+}
+
+/// CR 107.1a: Apply an explicit rounding mode to every fractional quantity
+/// nested inside `expr`.
+pub(crate) fn rewrite_quantity_expr_rounding(expr: &mut QuantityExpr, mode: RoundingMode) {
+    match expr {
+        QuantityExpr::DivideRounded {
+            inner,
+            divisor: _,
+            rounding,
+        } => {
+            *rounding = mode;
+            rewrite_quantity_expr_rounding(inner, mode);
+        }
+        QuantityExpr::Multiply { inner, .. }
+        | QuantityExpr::ClampMin { inner, .. }
+        | QuantityExpr::Offset { inner, .. } => rewrite_quantity_expr_rounding(inner, mode),
+        QuantityExpr::Sum { exprs } | QuantityExpr::Max { exprs } => {
+            for inner in exprs {
+                rewrite_quantity_expr_rounding(inner, mode);
+            }
+        }
+        QuantityExpr::UpTo { max } => rewrite_quantity_expr_rounding(max, mode),
+        QuantityExpr::Power { exponent, .. } => rewrite_quantity_expr_rounding(exponent, mode),
+        QuantityExpr::Difference { left, right } => {
+            rewrite_quantity_expr_rounding(left, mode);
+            rewrite_quantity_expr_rounding(right, mode);
+        }
+        QuantityExpr::Ref { .. } | QuantityExpr::Fixed { .. } => {}
+    }
+}
+
+/// Typed signal distinguishing which count-word `parse_count_expr` consumed.
+///
+/// The numeric value of a count is the same whether the text said "a", "an",
+/// "1", "any", or "another" — all yield `QuantityExpr::Fixed { value: 1 }`. But
+/// "another" is not merely a quantity: it is the source-exclusion qualifier.
+/// Callers that build a target from the remainder need to re-apply that
+/// exclusion (`FilterProp::Another`) to the parsed filter, and they must
+/// distinguish the exclusion word from an ordinary article without re-matching
+/// the raw string at the call site (CLAUDE.md forbids stringly-typed dispatch).
+/// This enum is that typed signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CountWord {
+    /// The count word was the source-exclusion "another" — the consuming caller
+    /// must re-apply `FilterProp::Another` to the target it builds.
+    SourceExclusion,
+    /// Any other count form (article "a"/"an", a digit/word number, "X", "any",
+    /// a fraction, an arithmetic offset, etc.) — no source exclusion implied.
+    Plain,
+}
+
+/// Sibling of [`parse_count_expr`] that additionally reports, via a typed
+/// [`CountWord`], whether the consumed count word was the source-exclusion
+/// "another" (as opposed to "a"/"an"/a number/"X"/"any"/a fraction).
+///
+/// Used by the sacrifice imperative path, where "sacrifice another creature or
+/// land" must re-apply `FilterProp::Another` to the parsed target so the source
+/// can't sacrifice itself (Morkrut Necropod, #4513). It dispatches the
+/// source-exclusion "another " via a nom `tag()` BEFORE delegating to
+/// `parse_count_expr` for every other count form, so the numeric result is
+/// identical to `parse_count_expr` and the only addition is the typed word
+/// signal. The remainder shape (leading whitespace trimmed) matches
+/// `parse_count_expr` exactly.
+pub(crate) fn parse_count_expr_with_exclusion(
+    text: &str,
+) -> Option<(QuantityExpr, &str, CountWord)> {
+    let text = text.trim_start();
+    let lower = text.to_lowercase();
+    // Source-exclusion "another " — implicit count of 1 that ALSO excludes
+    // the ability source from the matched set.
+    // Detected here as a typed `CountWord::SourceExclusion` so the caller can
+    // re-apply `FilterProp::Another` without re-matching the string.
+    if let Some(((), rest)) = super::oracle_nom::bridge::nom_on_lower(text, &lower, |i| {
+        nom::combinator::value(
+            (),
+            nom::bytes::complete::tag::<_, _, OracleError<'_>>("another "),
+        )
+        .parse(i)
+    }) {
+        return Some((
+            QuantityExpr::Fixed { value: 1 },
+            rest.trim_start(),
+            CountWord::SourceExclusion,
+        ));
+    }
+    let (expr, rest) = parse_count_expr(text)?;
+    Some((expr, rest, CountWord::Plain))
+}
+
+/// CR 107.3a: Strip a trailing "[, ]where x is " binder clause from the
+/// (already-lowercased) text following a bare `X`, returning the lowercase
+/// description that defines the variable. Shared by every count-position
+/// keyword that uses this binding shape (amass, mobilize, firebending).
+pub(crate) fn strip_where_x_is_clause(rest_lower: &str) -> Option<&str> {
+    let trimmed = rest_lower.trim_start();
+    let (description, _) = alt((
+        tag::<_, _, OracleError<'_>>(", where x is "),
+        tag("where x is "),
+    ))
+    .parse(trimmed)
+    .ok()?;
+    Some(description.trim_end_matches('.').trim())
 }
 
 /// Parse an English ordinal number word at the start of text.
@@ -759,8 +1067,11 @@ const SUBTYPE_PLURALS: &[(&str, &str)] = &[
     ("sphinxes", "Sphinx"),
     ("foxes", "Fox"),
     ("octopi", "Octopus"),
+    ("octopuses", "Octopus"),
     ("mice", "Mouse"),
     ("oxen", "Ox"),
+    ("pegasi", "Pegasus"),
+    ("pegasuses", "Pegasus"),
     ("allies", "Ally"),
     ("armies", "Army"),
     ("faeries", "Faerie"),
@@ -771,430 +1082,23 @@ const SUBTYPE_PLURALS: &[(&str, &str)] = &[
     ("berserkers", "Berserker"),
 ];
 
-/// Comprehensive list of MTG subtypes (creature types, land types, spell types, etc.).
-/// Case-insensitive matching is done by lowercasing the input.
-/// This covers the standard MTGJSON subtype list plus common Oracle text usage.
-const SUBTYPES: &[&str] = &[
-    // ── Creature types (alphabetical) ──
-    "Advisor",
-    "Aetherborn",
-    "Alien",
-    "Ally",
-    "Angel",
-    "Antelope",
-    "Ape",
-    "Archer",
-    "Archon",
-    "Armadillo",
-    "Army",
-    "Artificer",
-    "Assassin",
-    "Assembly-Worker",
-    "Astartes",
-    "Atog",
-    "Aurochs",
-    "Avatar",
-    "Azra",
-    "Badger",
-    "Balloon",
-    "Barbarian",
-    "Bard",
-    "Basilisk",
-    "Bat",
-    "Bear",
-    "Beast",
-    "Beeble",
-    "Beholder",
-    "Berserker",
-    "Bird",
-    "Blinkmoth",
-    "Boar",
-    "Bringer",
-    "Brushwagg",
-    "Bureaucrat",
-    "Camarid",
-    "Camel",
-    "Capybara",
-    "Caribou",
-    "Carrier",
-    "Cat",
-    "Centaur",
-    "Cephalid",
-    "Chimera",
-    "Citizen",
-    "Cleric",
-    "Clown",
-    "Cockatrice",
-    "Construct",
-    "Coward",
-    "Crab",
-    "Crocodile",
-    "Ctan",
-    "Custodes",
-    "Cyberman",
-    "Cyclops",
-    "Dalek",
-    "Dauthi",
-    "Demigod",
-    "Demon",
-    "Deserter",
-    "Detective",
-    "Devil",
-    "Dinosaur",
-    "Djinn",
-    "Doctor",
-    "Dog",
-    "Dragon",
-    "Drake",
-    "Dreadnought",
-    "Drone",
-    "Druid",
-    "Dryad",
-    "Dwarf",
-    "Efreet",
-    "Egg",
-    "Elder",
-    "Eldrazi",
-    "Elemental",
-    "Elephant",
-    "Elf",
-    "Elk",
-    "Employee",
-    "Eye",
-    "Faerie",
-    "Ferret",
-    "Fish",
-    "Flagbearer",
-    "Fox",
-    "Fractal",
-    "Frog",
-    "Fungus",
-    "Gamer",
-    "Gargoyle",
-    "Germ",
-    "Giant",
-    "Gith",
-    "Gnoll",
-    "Gnome",
-    "Goat",
-    "Goblin",
-    "God",
-    "Golem",
-    "Gorgon",
-    "Graveborn",
-    "Gremlin",
-    "Griffin",
-    "Guest",
-    "Hag",
-    "Halfling",
-    "Hamster",
-    "Harpy",
-    "Head",
-    "Hellion",
-    "Hippo",
-    "Hippogriff",
-    "Homarid",
-    "Homunculus",
-    "Horror",
-    "Horse",
-    "Human",
-    "Hydra",
-    "Hyena",
-    "Illusion",
-    "Imp",
-    "Incarnation",
-    "Inkling",
-    "Inquisitor",
-    "Insect",
-    "Jackal",
-    "Jellyfish",
-    "Juggernaut",
-    "Kavu",
-    "Kirin",
-    "Kithkin",
-    "Knight",
-    "Kobold",
-    "Kor",
-    "Kraken",
-    "Lamia",
-    "Lammasu",
-    "Leech",
-    "Leviathan",
-    "Lhurgoyf",
-    "Licid",
-    "Lizard",
-    "Llama",
-    "Locus",
-    "Manticore",
-    "Masticore",
-    "Mercenary",
-    "Merfolk",
-    "Metathran",
-    "Minion",
-    "Minotaur",
-    "Mite",
-    "Mole",
-    "Monger",
-    "Mongoose",
-    "Monk",
-    "Monkey",
-    "Moogle",
-    "Moonfolk",
-    "Mount",
-    "Mouse",
-    "Mutant",
-    "Myr",
-    "Mystic",
-    "Naga",
-    "Nautilus",
-    "Necron",
-    "Nephilim",
-    "Nightmare",
-    "Nightstalker",
-    "Ninja",
-    "Noble",
-    "Noggle",
-    "Nomad",
-    "Nymph",
-    "Octopus",
-    "Ogre",
-    "Ooze",
-    "Orb",
-    "Orc",
-    "Orgg",
-    "Otter",
-    "Ouphe",
-    "Ox",
-    "Oyster",
-    "Pangolin",
-    "Peasant",
-    "Pegasus",
-    "Pentavite",
-    "Performer",
-    "Pest",
-    "Phelddagrif",
-    "Phoenix",
-    "Phyrexian",
-    "Pilot",
-    "Pincher",
-    "Pirate",
-    "Plant",
-    "Pony",
-    "Praetor",
-    "Primarch",
-    "Prism",
-    "Processor",
-    "Rabbit",
-    "Raccoon",
-    "Ranger",
-    "Rat",
-    "Rebel",
-    "Reflection",
-    "Rhino",
-    "Rigger",
-    "Robot",
-    "Rogue",
-    "Sable",
-    "Salamander",
-    "Samurai",
-    "Sand",
-    "Saproling",
-    "Satyr",
-    "Scarecrow",
-    "Scion",
-    "Scorpion",
-    "Scout",
-    "Sculpture",
-    "Serf",
-    "Serpent",
-    "Servo",
-    "Shade",
-    "Shaman",
-    "Shapeshifter",
-    "Shark",
-    "Sheep",
-    "Siren",
-    "Skeleton",
-    "Slith",
-    "Sliver",
-    "Slug",
-    "Snail",
-    "Snake",
-    "Soldier",
-    "Soltari",
-    "Spawn",
-    "Specter",
-    "Spellshaper",
-    "Sphinx",
-    "Spider",
-    "Spike",
-    "Spirit",
-    "Splinter",
-    "Sponge",
-    "Squid",
-    "Squirrel",
-    "Starfish",
-    "Surrakar",
-    "Survivor",
-    "Suspect",
-    "Tentacle",
-    "Tetravite",
-    "Thalakos",
-    "Thopter",
-    "Thrull",
-    "Tiefling",
-    "Treefolk",
-    "Trilobite",
-    "Troll",
-    "Turtle",
-    "Tyranid",
-    "Unicorn",
-    "Vampire",
-    "Vedalken",
-    "Viashino",
-    "Volver",
-    "Wall",
-    "Walrus",
-    "Warlock",
-    "Warrior",
-    "Weasel",
-    "Weird",
-    "Werewolf",
-    "Whale",
-    "Wizard",
-    "Wolf",
-    "Wolverine",
-    "Wombat",
-    "Worm",
-    "Wraith",
-    "Wurm",
-    "Yeti",
-    "Zombie",
-    "Zubera",
-    // ── Land subtypes ──
-    "Cave",
-    "Desert",
-    "Forest",
-    "Gate",
-    "Island",
-    "Lair",
-    "Mine",
-    "Mountain",
-    "Plains",
-    "Power-Plant",
-    "Swamp",
-    "Tower",
-    "Urza's",
-    // ── Artifact subtypes ──
-    "Blood",
-    "Clue",
-    "Contraption",
-    "Equipment",
-    "Food",
-    "Fortification",
-    "Gold",
-    "Incubator",
-    "Junk",
-    "Map",
-    "Powerstone",
-    "Spacecraft", // CR 205.3g: Spacecraft is an artifact subtype.
-    "Treasure",
-    "Vehicle",
-    // ── Enchantment subtypes ──
-    "Aura",
-    "Background",
-    "Cartouche",
-    "Case",
-    "Class",
-    "Curse",
-    "Role",
-    "Room",
-    "Rune",
-    "Saga",
-    "Shard",
-    "Shrine",
-    // ── Spell subtypes ──
-    "Adventure",
-    "Arcane",
-    "Lesson",
-    "Trap",
-    // ── Planeswalker subtypes ──
-    "Ajani",
-    "Aminatou",
-    "Angrath",
-    "Arlinn",
-    "Ashiok",
-    "Basri",
-    "Bolas",
-    "Calix",
-    "Chandra",
-    "Comet",
-    "Dack",
-    "Dakkon",
-    "Daretti",
-    "Davriel",
-    "Dihada",
-    "Domri",
-    "Dovin",
-    "Ellywick",
-    "Elspeth",
-    "Estrid",
-    "Freyalise",
-    "Garruk",
-    "Gideon",
-    "Grist",
-    "Guff",
-    "Huatli",
-    "Jace",
-    "Jared",
-    "Jaya",
-    "Jeska",
-    "Kaito",
-    "Karn",
-    "Kasmina",
-    "Kaya",
-    "Kiora",
-    "Koth",
-    "Liliana",
-    "Lolth",
-    "Lukka",
-    "Minsc",
-    "Mordenkainen",
-    "Nahiri",
-    "Narset",
-    "Niko",
-    "Nissa",
-    "Nixilis",
-    "Oko",
-    "Quintorius",
-    "Ral",
-    "Rowan",
-    "Saheeli",
-    "Samut",
-    "Sarkhan",
-    "Serra",
-    "Sivitri",
-    "Sorin",
-    "Szat",
-    "Tamiyo",
-    "Teferi",
-    "Teyo",
-    "Tezzeret",
-    "Tibalt",
-    "Tyvar",
-    "Ugin",
-    "Urza",
-    "Venser",
-    "Vivien",
-    "Vraska",
-    "Will",
-    "Windgrace",
-    "Wrenn",
-    "Xenagos",
-    "Yanggu",
-    "Yanling",
-    "Zariel",
-];
+/// CR 700.12: An outlaw is an object with the Assassin, Mercenary, Pirate,
+/// Rogue, and/or Warlock creature type. Shared by every parser path that
+/// recognizes the "outlaw[s]" head noun.
+pub const OUTLAW_SUBTYPES: [&str; 5] = ["Assassin", "Mercenary", "Pirate", "Rogue", "Warlock"];
+
+/// MTGJSON CardTypes-derived **creature** subtype vocabulary (`oracle-subtypes.json`),
+/// merged at load with canonical noncreature tables from `card_type.rs`.
+static ORACLE_SUBTYPES: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| {
+    let creature: Vec<String> =
+        serde_json::from_str(include_str!("../../data/oracle-subtypes.json"))
+            .expect("oracle-subtypes.json well-formed");
+    crate::database::subtype_vocab::build_parser_subtype_vocabulary(&creature)
+});
+
+fn oracle_subtypes() -> &'static [String] {
+    &ORACLE_SUBTYPES
+}
 
 /// Test whether a lowercased candidate word names an MTG core type.
 /// CR 205.2: Core types are artifact, battle, creature, enchantment, instant,
@@ -1241,7 +1145,7 @@ pub(crate) fn is_non_subtype_subject_name(text: &str) -> bool {
 /// subtype word in their own Oracle text).
 pub(crate) fn is_subtype_word(candidate_lower: &str) -> bool {
     fixed_noncreature_subtypes().any(|s| s.eq_ignore_ascii_case(candidate_lower))
-        || SUBTYPES
+        || oracle_subtypes()
             .iter()
             .any(|s| s.eq_ignore_ascii_case(candidate_lower))
 }
@@ -1292,8 +1196,8 @@ pub fn parse_subtype(text: &str) -> Option<(String, usize)> {
     }
 
     // Check each subtype (singular and regular plural)
-    for &subtype in SUBTYPES {
-        if let Some(parsed) = parse_subtype_entry(text, subtype) {
+    for subtype in oracle_subtypes() {
+        if let Some(parsed) = parse_subtype_entry(text, subtype.as_str()) {
             return Some(parsed);
         }
     }
@@ -1319,7 +1223,117 @@ fn parse_subtype_entry(text: &str, subtype: &str) -> Option<(String, usize)> {
         }
     }
 
+    // Try regular "-es" plural: subtypes ending in a sibilant (s, x, z, ch, sh)
+    // or in consonant+o pluralize with "-es" rather than "-s" (e.g. "Hero" →
+    // "Heroes", "Sphinx" → "Sphinxes"). Without this, such plurals fall through
+    // to a naive trailing-'s' strip at call sites, corrupting the subtype name
+    // (e.g. "Heroes" → "Heroe"). Irregular forms still take priority via
+    // SUBTYPE_PLURALS above.
+    if takes_es_plural(subtype) {
+        let es_plural_len = subtype.len() + 2;
+        if text.len() >= es_plural_len
+            && text.is_char_boundary(subtype.len())
+            && text[..subtype.len()].eq_ignore_ascii_case(subtype)
+            && text[subtype.len()..es_plural_len].eq_ignore_ascii_case("es")
+        {
+            let after = &text[es_plural_len..];
+            if after.is_empty() || after.starts_with(|c: char| !c.is_alphanumeric()) {
+                return Some((subtype.to_string(), es_plural_len));
+            }
+        }
+    }
+
+    // Try regular "-ies" plural: subtypes ending in consonant + "y" pluralize by
+    // replacing "y" with "ies" (e.g. "Mercenary" → "Mercenaries", "Berserker"
+    // is unaffected). Words ending in vowel + "y" take a plain "-s" ("Monkey" →
+    // "Monkeys") and are covered by the "-s" rule above. Matching the plural
+    // surface form requires stripping the trailing "y" from the subtype stem and
+    // matching "ies" at the boundary; only the canonical singular is returned.
+    if takes_ies_plural(subtype) {
+        let stem_len = subtype.len() - 1; // drop trailing "y"
+        let ies_plural_len = stem_len + 3; // stem + "ies"
+        if text.len() >= ies_plural_len
+            && text.is_char_boundary(stem_len)
+            && text[..stem_len].eq_ignore_ascii_case(&subtype[..stem_len])
+            && text[stem_len..ies_plural_len].eq_ignore_ascii_case("ies")
+        {
+            let after = &text[ies_plural_len..];
+            if after.is_empty() || after.starts_with(|c: char| !c.is_alphanumeric()) {
+                return Some((subtype.to_string(), ies_plural_len));
+            }
+        }
+    }
+
     None
+}
+
+/// CR 205.3m creature-only subtype vocabulary, loaded from the committed
+/// `oracle-subtypes.json` (creature subtypes only — before the noncreature
+/// merge that `ORACLE_SUBTYPES` applies). Sorted longest-first so multi-word
+/// types (e.g. "Time Lord") match before shorter prefixes.
+static CREATURE_ONLY_SUBTYPES: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| {
+    let mut creature: Vec<String> =
+        serde_json::from_str(include_str!("../../data/oracle-subtypes.json"))
+            .expect("oracle-subtypes.json well-formed");
+    creature.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    creature
+});
+
+/// Try to match a *creature* subtype (CR 205.3m) at the start of `text`.
+/// Returns `(canonical_name, bytes_consumed)` or `None`. Unlike `parse_subtype`,
+/// which also matches noncreature subtypes (Aura, Saga, Equipment, …), this is
+/// restricted to creature types — the correct vocabulary for "secretly choose
+/// <T1>, <T2>, or <T3>" candidate enumeration.
+pub fn parse_creature_subtype(text: &str) -> Option<(String, usize)> {
+    for subtype in CREATURE_ONLY_SUBTYPES.iter() {
+        if let Some(parsed) = parse_subtype_entry(text, subtype) {
+            return Some(parsed);
+        }
+    }
+    None
+}
+
+/// Whether an English noun pluralizes by replacing a trailing "-y" with "-ies":
+/// nouns ending in consonant + "y" (e.g. "Mercenary" → "Mercenaries"). Nouns
+/// ending in vowel + "y" take a plain "-s" ("Monkey" → "Monkeys") and are
+/// excluded so the regular "-s" rule handles them.
+fn takes_ies_plural(word: &str) -> bool {
+    let bytes = word.as_bytes();
+    // A one-letter "y" has no preceding consonant, so the "-ies" rule cannot
+    // apply; the `len() < 2` guard also makes the penultimate index safe without
+    // `saturating_sub`/`get`.
+    if bytes.len() < 2 || !matches!(bytes.last(), Some(b'y' | b'Y')) {
+        return false;
+    }
+    !matches!(
+        bytes[bytes.len() - 2].to_ascii_lowercase(),
+        b'a' | b'e' | b'i' | b'o' | b'u'
+    )
+}
+
+/// Whether an English noun forms its plural by appending "-es" rather than
+/// "-s": nouns ending in a sibilant (s, x, z, ch, sh) or in consonant + "o"
+/// (e.g. "Hero" → "Heroes"). Words ending in vowel + "o" take a plain "-s"
+/// ("Radio" → "Radios") and are excluded.
+fn takes_es_plural(word: &str) -> bool {
+    let lower = word.to_ascii_lowercase();
+    if lower.ends_with('s') || lower.ends_with('x') || lower.ends_with('z') {
+        return true;
+    }
+    let bytes = lower.as_bytes();
+    if matches!(
+        bytes.get(bytes.len().saturating_sub(2)..),
+        Some(b"ch" | b"sh")
+    ) {
+        return true;
+    }
+    if matches!(bytes.last(), Some(b'o')) {
+        return !matches!(
+            bytes.get(bytes.len().saturating_sub(2)),
+            Some(b'a' | b'e' | b'i' | b'o' | b'u')
+        );
+    }
+    false
 }
 
 /// Infer the core type for a known subtype name.
@@ -1411,6 +1425,40 @@ fn follows_subtype_status_qualifier(haystack: &str, pos: usize) -> bool {
         .any(|qualifier| last_word.eq_ignore_ascii_case(qualifier))
 }
 
+/// nom combinator: match the type-addition marker
+/// "in addition to {pronoun} other [colors and ][creature ]types".
+///
+/// Pronoun axis (its/their/his/her) and type-scope axis (colors and?, creature?)
+/// are independent dimensions composed with `alt` + `opt` — not enumerated as
+/// the N×M cross product. Mirrors `parse_in_addition_other_types_marker` in
+/// oracle_effect/animation.rs.
+fn parse_in_addition_type_probe(i: &str) -> OracleResult<'_, ()> {
+    (
+        tag("in addition to "),
+        alt((tag("its"), tag("their"), tag("his"), tag("her"))),
+        tag(" other "),
+        opt(tag("colors and ")),
+        opt(tag("creature ")),
+        tag("types"),
+    )
+        .parse(i)
+        .map(|(rest, _)| (rest, ()))
+}
+
+/// CR 205.1b + CR 201.5: A subtype-word card name immediately followed by
+/// "in addition to its other types" is the creature TYPE being added to a
+/// permanent ("becomes a Coward in addition to its other types" — Coward),
+/// NOT a self-reference. Keep that occurrence literal so the type-change
+/// parser reads it as `AddSubtype(<name>)`; other occurrences of the same word
+/// (e.g. a genuine "When Coward dies" self-reference) still normalize to `~`.
+/// This is the per-occurrence analogue of the card-level
+/// `subtype_in_type_change_context` suppression on the "of"-based short-name
+/// path. `end` is the byte index just past the matched word.
+fn precedes_type_addition_clause(haystack: &str, end: usize) -> bool {
+    let lower = haystack[end..].trim_start().to_ascii_lowercase();
+    parse_in_addition_type_probe(&lower).is_ok()
+}
+
 fn replace_all_words_case_sensitive_preserving_subtype_status_refs(
     haystack: &str,
     needle: &str,
@@ -1429,6 +1477,7 @@ fn replace_all_words_case_sensitive_preserving_subtype_status_refs(
             && at_word_end
             && pos >= last_end
             && !follows_subtype_status_qualifier(haystack, pos)
+            && !precedes_type_addition_clause(haystack, end)
         {
             result.push_str(&haystack[last_end..pos]);
             result.push_str(replacement);
@@ -1469,14 +1518,551 @@ fn replace_all_words(haystack: &str, needle: &str, replacement: &str) -> String 
     result
 }
 
-// CR 201.4b: A card's Oracle text uses its name to refer to itself.
+/// Zone nouns that appear after a possessive in Oracle text ("your library", etc.).
+const POSSESSIVE_ZONE_NOUNS: &[&str] = &[
+    "library",
+    "hand",
+    "graveyard",
+    "battlefield",
+    "exile",
+    "stack",
+];
+
+/// Returns true when case-insensitively replacing `short_name` would rewrite a
+/// possessive zone phrase ("your library") rather than a card self-reference.
+fn of_short_name_collides_with_possessive_zone_phrase(text: &str, short_name: &str) -> bool {
+    let lower_short = short_name.to_ascii_lowercase();
+    if !POSSESSIVE_ZONE_NOUNS.contains(&lower_short.as_str()) {
+        return false;
+    }
+    let lower_text = text.to_ascii_lowercase();
+    POSSESSIVES.iter().any(|possessive| {
+        let phrase = format!("{possessive} {lower_short}");
+        nom_primitives::scan_contains(&lower_text, &phrase)
+    })
+}
+
+// CR 201.5: A card's Oracle text uses its name to refer to itself.
 /// Normalize all self-references in Oracle text to `~`.
 ///
 /// Handles full card name, Alchemy A- prefix, comma-based legendary short names
 /// ("Haliya, Guided by Light" → "Haliya"), "of"-based short names
 /// ("Rosie Cotton of South Lane" → "Rosie Cotton"), and first-word short names
 /// ("Sharuum the Hegemon" → "Sharuum"), plus generic phrases like "this creature".
+const RING_TEMPTS_YOU_PLACEHOLDER: &str = "\u{E0000}";
+
+// CR 701.54d: "Whenever the Ring tempts you" abilities trigger from the
+// temptation event, so this rules phrase must survive self-reference
+// normalization even on cards whose names contain "Ring".
+fn mask_ring_tempts_you_phrase(text: &str) -> String {
+    const PHRASE: &str = "the ring tempts you";
+    let lower = text.to_ascii_lowercase();
+    if !lower.contains(PHRASE) {
+        return text.to_string();
+    }
+
+    let mut masked = String::with_capacity(text.len());
+    let mut rest = text;
+    let mut lower_rest = lower.as_str();
+    while let Some(idx) = lower_rest.find(PHRASE) {
+        masked.push_str(&rest[..idx]);
+        masked.push_str(RING_TEMPTS_YOU_PLACEHOLDER);
+        rest = &rest[idx + PHRASE.len()..];
+        lower_rest = &lower_rest[idx + PHRASE.len()..];
+    }
+    masked.push_str(rest);
+    masked
+}
+
+fn unmask_ring_tempts_you_phrase(text: String) -> String {
+    text.replace(RING_TEMPTS_YOU_PLACEHOLDER, "the ring tempts you")
+}
+
+const KEYWORD_ACTION_PLACEHOLDER: &str = "\u{E0001}";
+const CARD_NAMED_LITERAL_PLACEHOLDER: &str = "\u{E0002}";
+
+/// CR 701.40a / CR 701.58a / CR 701.62a: A handful of cards are *named* after a
+/// keyword action ("Manifest Dread" → "Manifest dread.", "Cloak" → "Cloak …").
+/// Multi-word self-reference normalization is case-insensitive, so it would
+/// rewrite the card's own primary keyword-action verb to `~`, producing the
+/// nonsensical body "~." and a parse gap. Mask the keyword-action phrase the
+/// same way the Ring temptation phrase is protected, but ONLY when the card
+/// name *is* that keyword action — a keyword phrase that merely appears in the
+/// body of an unrelated card never collides with `~` normalization, so the
+/// narrow guard avoids touching every other card. The phrase is restored after
+/// normalization so the dispatcher sees the real keyword-action text.
+fn mask_card_name_keyword_action(text: &str, card_name: &str) -> Option<(String, Vec<String>)> {
+    // CR 701.19a / CR 701.40a / CR 701.58a / CR 701.62a: keyword actions whose
+    // phrasing can be an entire card name. These are full keyword-action verb
+    // phrases, not bare nouns, so an exact (case-insensitive) card-name match is
+    // unambiguous. "regenerate" (CR 701.19a) is the card Regenerate — without
+    // masking, the leading verb collapses to the self-reference `~` and the
+    // effect ("Regenerate target creature.") parses to a bare, verbless
+    // `~ target creature`.
+    const KEYWORD_ACTIONS: &[&str] = &["manifest dread", "cloak", "manifest", "regenerate"];
+    let name_lower = card_name.trim().to_ascii_lowercase();
+    // allow-noncombinator: Iterator::find over the keyword-action table (slice
+    // selection), not string-dispatch parsing.
+    let &phrase = KEYWORD_ACTIONS.iter().find(|kw| name_lower == **kw)?;
+
+    let lower = text.to_ascii_lowercase();
+    let mut masked = String::with_capacity(text.len());
+    // Original-cased slices captured per masked occurrence, restored in order so
+    // the dispatcher sees the printed casing ("Manifest dread.").
+    let mut originals: Vec<String> = Vec::new();
+    let mut rest = text;
+    let mut lower_rest = lower.as_str();
+    // allow-noncombinator: structural occurrence-masking before `~` normalization
+    // (mirrors `mask_ring_tempts_you_phrase`), not parsing dispatch.
+    while let Some(idx) = lower_rest.find(phrase) {
+        // CR 201.5 boundary: only mask a free-standing occurrence of the
+        // keyword phrase (the body verb), never a substring inside a longer
+        // word (so "manifested"/"cloaked" are left intact).
+        let before_ok = idx == 0
+            || !rest[..idx]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_alphanumeric());
+        let after = idx + phrase.len();
+        let after_ok = after >= rest.len()
+            || !rest[after..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_alphanumeric());
+        if before_ok && after_ok {
+            masked.push_str(&rest[..idx]);
+            masked.push_str(KEYWORD_ACTION_PLACEHOLDER);
+            originals.push(rest[idx..after].to_string());
+        } else {
+            masked.push_str(&rest[..after]);
+        }
+        rest = &rest[after..];
+        lower_rest = &lower_rest[after..];
+    }
+    masked.push_str(rest);
+    Some((masked, originals))
+}
+
+/// Restore the original-cased keyword-action occurrences masked by
+/// [`mask_card_name_keyword_action`], in the order they were captured.
+fn unmask_card_name_keyword_action(text: String, originals: &[String]) -> String {
+    let mut result = text;
+    for original in originals {
+        result = result.replacen(KEYWORD_ACTION_PLACEHOLDER, original, 1);
+    }
+    result
+}
+
+fn parse_card_named_literal_prefix(input: &str) -> OracleResult<'_, usize> {
+    alt((
+        value("permanents named ".len(), tag("permanents named ")),
+        value("permanent named ".len(), tag("permanent named ")),
+        value("creatures named ".len(), tag("creatures named ")),
+        value("creature named ".len(), tag("creature named ")),
+        value("artifacts named ".len(), tag("artifacts named ")),
+        value("artifact named ".len(), tag("artifact named ")),
+        value("enchantments named ".len(), tag("enchantments named ")),
+        value("enchantment named ".len(), tag("enchantment named ")),
+        value("lands named ".len(), tag("lands named ")),
+        value("land named ".len(), tag("land named ")),
+        value("spells named ".len(), tag("spells named ")),
+        value("spell named ".len(), tag("spell named ")),
+        value("cards named ".len(), tag("cards named ")),
+        value("card named ".len(), tag("card named ")),
+    ))
+    .parse(input)
+}
+
+fn parse_card_named_article(input: &str) -> OracleResult<'_, ()> {
+    value((), alt((tag("a "), tag("another ")))).parse(input)
+}
+
+fn parse_card_named_list_boundary(input: &str) -> OracleResult<'_, ()> {
+    let (input, _) = space1::<_, OracleError<'_>>(input)?;
+    let (input, _) = alt((tag("and"), tag("or"))).parse(input)?;
+    let (input, _) = space1::<_, OracleError<'_>>(input)?;
+    let (input, _) = opt(parse_card_named_article).parse(input)?;
+    let (input, _) = parse_card_named_literal_prefix(input)?;
+    Ok((input, ()))
+}
+
+fn parse_card_named_zone_qualifier(input: &str) -> OracleResult<'_, ()> {
+    value(
+        (),
+        alt((
+            tag("your "),
+            tag("their "),
+            tag("his "),
+            tag("her "),
+            tag("that player's "),
+            tag("target player's "),
+            tag("a player's "),
+            tag("each player's "),
+            tag("its owner's "),
+            tag("an opponent's "),
+            tag("each opponent's "),
+            tag("opponent's "),
+            tag("the "),
+            tag("a "),
+        )),
+    )
+    .parse(input)
+}
+
+fn parse_card_named_possessed_zone(input: &str) -> OracleResult<'_, ()> {
+    let (input, _) = opt(parse_card_named_zone_qualifier).parse(input)?;
+    let (input, _) = alt((
+        tag("hands"),
+        tag("hand"),
+        tag("graveyards"),
+        tag("graveyard"),
+        tag("libraries"),
+        tag("library"),
+    ))
+    .parse(input)?;
+    Ok((input, ()))
+}
+
+fn parse_card_named_any_zone(input: &str) -> OracleResult<'_, ()> {
+    alt((
+        value((), tag("the battlefield")),
+        value((), tag("battlefield")),
+        value((), tag("exile")),
+        parse_card_named_possessed_zone,
+    ))
+    .parse(input)
+}
+
+fn parse_card_named_zone_tail_boundary(input: &str) -> OracleResult<'_, ()> {
+    if input.is_empty() {
+        return Ok((input, ()));
+    }
+    value(
+        (),
+        peek(alt((
+            tag("."),
+            tag(","),
+            tag(";"),
+            tag(":"),
+            tag(" tapped"),
+            tag(" face down"),
+            tag(" under "),
+            tag(" this way"),
+            tag(" and "),
+            tag(" then "),
+        ))),
+    )
+    .parse(input)
+}
+
+fn parse_card_named_zone_boundary(input: &str) -> OracleResult<'_, ()> {
+    let (input, _) = space1::<_, OracleError<'_>>(input)?;
+    let (input, _) = alt((
+        value((), (tag("into "), parse_card_named_any_zone)),
+        value((), (tag("onto "), parse_card_named_any_zone)),
+        value((), (tag("from "), parse_card_named_any_zone)),
+        value((), (tag("in "), parse_card_named_any_zone)),
+    ))
+    .parse(input)?;
+    let (input, _) = parse_card_named_zone_tail_boundary(input)?;
+    Ok((input, ()))
+}
+
+fn parse_card_named_revealed_boundary(input: &str) -> OracleResult<'_, ()> {
+    let (input, _) = space1::<_, OracleError<'_>>(input)?;
+    let (input, _) = alt((tag("was"), tag("were"))).parse(input)?;
+    let (input, _) = space1::<_, OracleError<'_>>(input)?;
+    let (input, _) = tag("revealed").parse(input)?;
+    Ok((input, ()))
+}
+
+fn parse_card_named_turn_boundary(input: &str) -> OracleResult<'_, ()> {
+    let (input, _) = space1::<_, OracleError<'_>>(input)?;
+    let (input, _) = alt((tag("this turn"), tag("this game"))).parse(input)?;
+    Ok((input, ()))
+}
+
+fn parse_card_named_comma_instruction_boundary(input: &str) -> OracleResult<'_, ()> {
+    let (input, _) = tag(", ").parse(input)?;
+    let (input, _) = alt((
+        tag("reveal "),
+        tag("put "),
+        tag("sacrifice "),
+        tag("then "),
+        tag("you "),
+        tag("it "),
+        tag("that "),
+        tag("this "),
+    ))
+    .parse(input)?;
+    Ok((input, ()))
+}
+
+fn parse_card_named_clause_boundary(input: &str) -> OracleResult<'_, ()> {
+    value((), alt((tag("."), tag(":")))).parse(input)
+}
+
+fn parse_card_named_literal_boundary(input: &str) -> OracleResult<'_, ()> {
+    alt((
+        parse_card_named_list_boundary,
+        parse_card_named_zone_boundary,
+        parse_card_named_revealed_boundary,
+        parse_card_named_turn_boundary,
+        parse_card_named_comma_instruction_boundary,
+        parse_card_named_clause_boundary,
+    ))
+    .parse(input)
+}
+
+fn next_card_named_literal_prefix(lower: &str) -> Option<(usize, usize)> {
+    lower.char_indices().find_map(|(idx, _)| {
+        let is_word_boundary = idx == 0
+            || lower[..idx]
+                .chars()
+                .next_back()
+                .is_none_or(|c| !c.is_alphanumeric());
+        is_word_boundary
+            .then(|| parse_card_named_literal_prefix(&lower[idx..]).ok())
+            .flatten()
+            .map(|(_, prefix_len)| (idx, prefix_len))
+    })
+}
+
+fn card_named_literal_span_len(lower: &str) -> usize {
+    lower
+        .char_indices()
+        .find_map(|(idx, _)| {
+            parse_card_named_literal_boundary(&lower[idx..])
+                .is_ok()
+                .then_some(idx)
+        })
+        .unwrap_or(lower.len())
+}
+
+/// CR 201.2 / CR 201.5: the text after "[object] named ..." is a literal name,
+/// not a self-reference to the source card. Mask only that literal name span
+/// while `normalize_card_name_refs` runs so first-word fallback cannot rewrite
+/// cards like Emerald Collector's "Mox Emerald" into "Mox ~" or Kookus's
+/// "Keeper of Kookus" into "Keeper of ~".
+fn mask_card_named_literal_spans(text: &str) -> (String, Vec<String>) {
+    let lower = text.to_ascii_lowercase();
+    let mut masked = String::with_capacity(text.len());
+    let mut originals = Vec::new();
+    let mut rest = text;
+    let mut lower_rest = lower.as_str();
+
+    while let Some((idx, prefix_len)) = next_card_named_literal_prefix(lower_rest) {
+        let name_start = idx + prefix_len;
+        let name_len = card_named_literal_span_len(&lower_rest[name_start..]);
+        if name_len == 0 {
+            masked.push_str(&rest[..name_start]);
+            rest = &rest[name_start..];
+            lower_rest = &lower_rest[name_start..];
+            continue;
+        }
+
+        let name_end = name_start + name_len;
+        masked.push_str(&rest[..name_start]);
+        masked.push_str(CARD_NAMED_LITERAL_PLACEHOLDER);
+        originals.push(rest[name_start..name_end].to_string());
+        rest = &rest[name_end..];
+        lower_rest = &lower_rest[name_end..];
+    }
+
+    masked.push_str(rest);
+    (masked, originals)
+}
+
+fn unmask_card_named_literal_spans(text: String, originals: &[String]) -> String {
+    let mut result = text;
+    for original in originals {
+        result = result.replacen(CARD_NAMED_LITERAL_PLACEHOLDER, original, 1);
+    }
+    result
+}
+
+/// CR 201.5a: The granting-object self-reference marker. Emitted by
+/// [`mask_granting_self_reference_in_quotes`] when a card's own printed name
+/// appears in a self-reference (verb-object) position inside a *quoted granted
+/// body*. Unlike the other placeholders in this module it is deliberately NOT
+/// unmasked at the end of normalization — it survives into the parser, where
+/// `parse_self_reference` and the cost self-ref combinators map it to
+/// `TargetFilter::GrantingObject` (concretized to the granting object at
+/// grant-clone time). Any un-migrated parser path that still sees it degrades it
+/// to `~` (host `SelfRef`) via a final cleanup in `parse_quoted_ability`, so a
+/// missed site is never worse than the pre-fix host binding.
+pub(crate) const GRANTING_SELF_PLACEHOLDER: &str = "\u{E0002}";
+
+/// CR 201.5a: Self-reference verb-object trigger phrases — the positions whose
+/// downstream combinator (`parse_cost_self_reference` in `oracle_cost.rs` /
+/// `parse_self_reference` in `oracle_nom/target.rs`) actually CONSUMES the
+/// placeholder as `TargetFilter::GrantingObject`. The masker is an ALLOWLIST: an
+/// in-quote name occurrence is marked ONLY when its immediately-preceding text
+/// ends with one of these. This keeps the placeholder confined to positions that
+/// consume it (so it never survives unconsumed) and leaves every other position
+/// — QuantityRef, condition, damage-source, exclusion, name-filter (`named
+/// <name>`), and nullary self-costs (`unattach`/`tap` <name>) — to normalize to
+/// `~` exactly as before, preserving byte-identical pre-fix parse output.
+///
+/// Singular `counter on ` (PutCounter target: "put a <kind> counter on <name>")
+/// is included; plural `counters on ` (QuantityRef: "number of <kind> counters
+/// on <name>") is deliberately NOT a prefix of it, so the two are distinguished.
+const GRANTER_SELF_REF_VERB_PREFIXES: &[&str] = &[
+    "sacrifice ",  // Sacrifice cost
+    "exile ",      // Exile cost
+    "return ",     // ReturnToHand cost / Bounce effect
+    "counter on ", // PutCounter target ("put a <kind> counter on <name>")
+];
+// Deliberately excluded: `destroy ` / `control of ` — no measured class card
+// references its own name cleanly in those positions (Shuriken's "gains control
+// of Shuriken unless it was unattached from a Ninja" carries an unless-rider that
+// parses to `Unimplemented`, so masking it would leak the placeholder rather than
+// producing GrantingObject). Add such a verb only with a card that provably
+// consumes the placeholder there. Nullary self-costs (`unattach`/`tap <name>`)
+// are also excluded — they carry no TargetFilter and expect `~`.
+
+/// CR 201.5a: Within each double-quoted region of `text`, replace occurrences of
+/// the card's own name with [`GRANTING_SELF_PLACEHOLDER`] ONLY in a
+/// self-reference verb-object position (see [`GRANTER_SELF_REF_VERB_PREFIXES`]),
+/// so a granted ability's by-name reference to its GRANTING object survives
+/// distinct from the host self-reference (`~`, "this creature").
+///
+/// Bounded to quoted regions and to consumer-taught verb-object positions:
+/// everywhere else (outside quotes, or in-quote QuantityRef / condition /
+/// damage-source / exclusion / name-filter positions) the card name still
+/// normalizes to `~` (host self-ref), byte-identical to pre-fix. Only the
+/// deterministic proper-noun variants (full multi-word name and comma-separated
+/// short name) are masked, mirroring `normalize_card_name_refs` strategies 1–2;
+/// the risky single-word / of-short fallbacks are skipped to avoid matching
+/// English words.
+fn mask_granting_self_reference_in_quotes(text: &str, card_name: &str) -> String {
+    // allow-noncombinator: structural masking of a card-name self-reference
+    // before `~` normalization (mirrors `mask_card_name_keyword_action`), not
+    // parsing dispatch.
+    // allow-noncombinator: strip MTGJSON A- prefix (structural, mirrors normalize_card_name_refs)
+    let effective_name = card_name.strip_prefix("A-").unwrap_or(card_name);
+    // (name, case_sensitive). Multi-word / comma-short are case-insensitive
+    // (proper nouns); a single-word name is matched case-sensitively so it only
+    // hits the capitalized card-name occurrence — mirroring
+    // `normalize_card_name_refs`' single-word discipline. Position-gating (the
+    // verb-object allowlist) makes even single-word masking safe here.
+    let mut variants: Vec<(&str, bool)> = Vec::new();
+    if effective_name.contains(' ') {
+        variants.push((effective_name, false));
+    } else if effective_name.len() >= 3 {
+        // `>= 3`: skip 1-2 char names, matching normalize_card_name_refs guards.
+        variants.push((effective_name, true));
+    }
+    // allow-noncombinator: comma-short name extraction (structural, not parsing dispatch)
+    if let Some(comma_pos) = effective_name.find(", ") {
+        let short = &effective_name[..comma_pos];
+        // `>= 2`: matches the comma-short guard in `normalize_card_name_refs`.
+        if short.len() >= 2 && short.contains(' ') {
+            variants.push((short, false));
+        }
+    }
+    if variants.is_empty() {
+        return text.to_string();
+    }
+    // Segments split on `"`: odd indices are inside a quoted region.
+    let mut result = String::with_capacity(text.len());
+    for (seg_idx, segment) in text.split('"').enumerate() {
+        if seg_idx > 0 {
+            result.push('"');
+        }
+        if seg_idx % 2 == 1 {
+            let mut masked = segment.to_string();
+            for &(name, case_sensitive) in &variants {
+                masked = mask_name_occurrences_in_segment(&masked, name, case_sensitive);
+            }
+            result.push_str(&masked);
+        } else {
+            result.push_str(segment);
+        }
+    }
+    result
+}
+
+/// Word-boundary-aware, case-insensitive replacement of `name` occurrences with
+/// [`GRANTING_SELF_PLACEHOLDER`] within a single (already inside-quotes)
+/// `segment`, masking ONLY occurrences in a self-reference verb-object position
+/// ([`GRANTER_SELF_REF_VERB_PREFIXES`]).
+fn mask_name_occurrences_in_segment(segment: &str, name: &str, case_sensitive: bool) -> String {
+    // allow-noncombinator: structural occurrence masking mirroring
+    // `mask_card_name_keyword_action`, not parsing dispatch.
+    let lower_seg = segment.to_ascii_lowercase();
+    let lower_name = name.to_ascii_lowercase();
+    // Case-sensitive matching searches the original segment; case-insensitive
+    // searches the lowercased copy. The verb-object lookbehind always uses the
+    // lowercased prefix.
+    let (haystack, needle): (&str, &str) = if case_sensitive {
+        (segment, name)
+    } else {
+        (lower_seg.as_str(), lower_name.as_str())
+    };
+    let mut out = String::with_capacity(segment.len());
+    let mut rest = segment;
+    let mut hay_rest = haystack;
+    while let Some(idx) = hay_rest.find(needle) {
+        let after = idx + needle.len();
+        let before_ok = idx == 0
+            || !rest[..idx]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_alphanumeric());
+        let after_ok = after >= rest.len()
+            || !rest[after..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_alphanumeric());
+        // `rest` is always a tail slice of `segment`, so the absolute start of
+        // this occurrence is recoverable for the verb-object lookbehind.
+        let abs_start = segment.len() - rest.len() + idx;
+        let prefix_lower = segment[..abs_start].to_ascii_lowercase();
+        // CR 201.5a: mask (→ GrantingObject) ONLY in a self-reference verb-object
+        // position a downstream self-ref combinator consumes. Positions NOT in the
+        // allowlist — QuantityRef ("... counters on <name>"), condition,
+        // damage-source ("dealt ... by <name>"), exclusion ("other than <name>"),
+        // name-filter ("named <name>"), nullary self-costs ("unattach/tap <name>")
+        // — are left to normalize to `~` (host), byte-identical to pre-fix.
+        //
+        // KNOWN CR 201.5a FOLLOW-UP: the declined non-verb-object granter-name
+        // references (QuantityRef / condition / damage-source / exclusion) host-bind
+        // today but per CR 201.5a should bind to the GRANTER — e.g. Gutter Grime's
+        // token counting "slime counters on Gutter Grime" should count the granting
+        // enchantment's counters, not the token's. Restoring the host binding here
+        // is not a new regression (it is the pre-fix behavior); the correct
+        // granter binding for these channels is a deferred fix-sweep, and this
+        // guard is the boundary that sweep must extend.
+        // allow-noncombinator: verb-object lookbehind (structural masking, not parsing dispatch)
+        let is_self_ref_object = before_ok
+            && after_ok
+            && GRANTER_SELF_REF_VERB_PREFIXES
+                .iter()
+                .any(|p| prefix_lower.ends_with(p));
+        if is_self_ref_object {
+            out.push_str(&rest[..idx]);
+            out.push_str(GRANTING_SELF_PLACEHOLDER);
+        } else {
+            out.push_str(&rest[..after]);
+        }
+        rest = &rest[after..];
+        hay_rest = &hay_rest[after..];
+    }
+    out.push_str(rest);
+    out
+}
+
 pub fn normalize_card_name_refs(text: &str, card_name: &str) -> String {
+    let pre = mask_ring_tempts_you_phrase(text);
+    // CR 701.40a/701.58a/701.62a: protect the keyword-action body verb on cards
+    // named after a keyword action ("Manifest Dread", "Cloak") so it survives
+    // self-reference `~` normalization. The original casing is restored at the end.
+    let (text, kw_action_originals) = match mask_card_name_keyword_action(&pre, card_name) {
+        Some((masked, originals)) => (masked, originals),
+        None => (pre, Vec::new()),
+    };
+    let (text, card_named_originals) = mask_card_named_literal_spans(&text);
     // Strip A- prefix (Alchemy rebalanced cards in MTGJSON)
     let effective_name = card_name.strip_prefix("A-").unwrap_or(card_name);
 
@@ -1486,6 +2072,11 @@ pub fn normalize_card_name_refs(text: &str, card_name: &str) -> String {
     // "A-" doesn't cling to a `~` placeholder when the suffix is replaced.
     // Both case-variants ("A-…" and "a-…") show up in normalized text.
     let mut result = text.to_string();
+    // CR 201.5a: mark the card's own name inside quoted granted bodies as a
+    // granting-object self-reference (GRANTING_SELF_PLACEHOLDER) BEFORE it
+    // collapses to `~` below. Bounded to quoted regions and skips `named <name>`
+    // filter positions, so only a granter self-ref is marked.
+    result = mask_granting_self_reference_in_quotes(&result, card_name);
     // allow-noncombinator: structural detection of MTGJSON A-/a- card-name prefix (not parsing)
     if card_name.starts_with("A-") || card_name.starts_with("a-") {
         let prefixed_upper = format!("A-{effective_name}");
@@ -1569,7 +2160,30 @@ pub fn normalize_card_name_refs(text: &str, card_name: &str) -> String {
                         | "away"
                         | "off"
                 );
-            if short_name.len() >= 3 && !is_common_english_word {
+            // CR 201.3a: a card's "of"-derived short name normalizes to `~`
+            // (interchangeable name reference). Suppress this ONLY when the
+            // short name is a creature subtype AND the text adds that subtype to
+            // the card itself (copy / type-change context, e.g. Wall of Stolen
+            // Identity: "enter as a copy … except it's a Wall in addition to its
+            // other types"). A blanket subtype suppression wrongly leaves the
+            // short name literal for cards like Curse of Misfortunes, exposing a
+            // search-filter suffix to the target-fallback path. Use the
+            // word-boundary scanner for anchor dispatch, never raw contains().
+            let subtype_in_type_change_context = is_subtype_word(&lower_short)
+                && [
+                    "in addition to its other types",
+                    "enter as a copy",
+                    "enters as a copy",
+                    "become a copy",
+                    "becomes a copy",
+                ]
+                .iter()
+                .any(|anchor| nom_primitives::scan_contains(&result.to_ascii_lowercase(), anchor));
+            if short_name.len() >= 3
+                && !is_common_english_word
+                && !subtype_in_type_change_context
+                && !of_short_name_collides_with_possessive_zone_phrase(&result, short_name)
+            {
                 result = replace_all_words(&result, short_name, "~");
             }
         }
@@ -1611,6 +2225,11 @@ pub fn normalize_card_name_refs(text: &str, card_name: &str) -> String {
                         || is_non_subtype_subject_name(&lower_candidate)
                         || is_supertype_word(&lower_candidate)
                         || super::oracle_nom::primitives::is_keyword_word(&lower_candidate)
+                        // CR 201.5: a sentence-initial imperative verb ("Search
+                        // your library...") is never a self-reference, even when
+                        // it is the first word of a verb-named card ("Search for
+                        // Tomorrow"). Reject it so the verb survives unmangled.
+                        || super::oracle_nom::primitives::is_verb_word(&lower_candidate)
                         || is_subtype_word(&lower_candidate)
                     {
                         continue;
@@ -1638,6 +2257,17 @@ pub fn normalize_card_name_refs(text: &str, card_name: &str) -> String {
                         // E.g. "Merfolk Mistbinder" → "Other Merfolk you control get +1/+1."
                         // would become "Other ~ you control..." without this guard.
                         || replaced.contains("~ you control")
+                        // CR 111.10 + CR 303.7: Named token guard. A card-name first word
+                        // immediately followed by a token-subtype noun ("Role"/"Aura") is the
+                        // *token's* name, not a self-reference — the named-Role/Aura-token class
+                        // is "<Name> Role token attached to ..." (Royal Treatment's "Royal Role",
+                        // Cursed/Monster/Wicked/Sorcerer/Virtuous Roles). Replacing the first
+                        // word there ("Royal" → "~") destroys the token name and the token
+                        // parser can no longer recognize it.
+                        // allow-noncombinator: structural guard on already-normalized output (mirrors the "~ creatures"/"~ you control" guards above), not parsing dispatch
+                        || replaced.contains("~ Role")
+                        // allow-noncombinator: structural guard on already-normalized output, not parsing dispatch
+                        || replaced.contains("~ Aura")
                     {
                         continue;
                     }
@@ -1653,7 +2283,9 @@ pub fn normalize_card_name_refs(text: &str, card_name: &str) -> String {
     let effective_name_str = effective_name;
     result = result.replace("named ~", &format!("named {effective_name_str}"));
 
-    result
+    result = unmask_card_named_literal_spans(result, &card_named_originals);
+    result = unmask_card_name_keyword_action(result, &kw_action_originals);
+    unmask_ring_tempts_you_phrase(result)
 }
 
 /// Strip a comparator prefix from a comparison clause, returning (Comparator, remainder).
@@ -1721,6 +2353,15 @@ pub(crate) fn parse_comparison_suffix(text: &str) -> Option<(Comparator, i32)> {
             return Some((Comparator::LT, n as i32));
         }
     }
+    // "exactly N" — CR 608.2c post-effect equality condition ("if its power is
+    // exactly 20"). Uses a nom `tag` combinator (parser-combinator gate scopes
+    // src/parser/ and rejects new string-literal strip_prefix dispatch).
+    if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("exactly ").parse(text) {
+        let (n, remainder) = parse_number(rest)?;
+        if remainder.trim().is_empty() {
+            return Some((Comparator::EQ, n as i32));
+        }
+    }
     None
 }
 
@@ -1765,6 +2406,232 @@ mod tests {
     }
 
     #[test]
+    fn normalize_preserves_keyword_action_card_name_regenerate() {
+        // CR 701.19a: the card Regenerate's own name IS the keyword-action verb.
+        // `mask_card_name_keyword_action` must protect the leading verb from `~`
+        // normalization; otherwise "Regenerate target creature." collapses to the
+        // verbless self-reference "~ target creature" and fails to parse.
+        assert_eq!(
+            normalize_card_name_refs("Regenerate target creature.", "Regenerate"),
+            "Regenerate target creature."
+        );
+        // Longer words containing the keyword phrase are not masked (guard
+        // against over-masking): only free-standing "regenerate" occurrences are
+        // spared.
+        assert_eq!(
+            normalize_card_name_refs(
+                "Regenerate target creature. When it's regenerated, tap it.",
+                "Regenerate"
+            ),
+            "Regenerate target creature. When it's regenerated, tap it."
+        );
+    }
+
+    #[test]
+    fn normalize_ring_watcher_preserves_ring_tempts_you_trigger() {
+        assert_eq!(
+            normalize_card_name_refs("Whenever the Ring tempts you, draw a card.", "Ring Watcher"),
+            "Whenever the ring tempts you, draw a card."
+        );
+    }
+
+    #[test]
+    fn normalize_card_named_after_keyword_action_preserves_keyword_phrase() {
+        // CR 701.62a: The card "Manifest Dread" has the keyword-action body
+        // "Manifest dread." Self-reference normalization is case-insensitive for
+        // multi-word names, so without the keyword-action mask the body would be
+        // rewritten to "~." (a parse gap). The keyword phrase must survive.
+        assert_eq!(
+            normalize_card_name_refs("Manifest dread.", "Manifest Dread"),
+            "Manifest dread."
+        );
+        // CR 701.40a / CR 701.58a: same class for single-word keyword-action
+        // names — "Cloak"/"Manifest" body verbs must not normalize to `~`.
+        assert_eq!(
+            normalize_card_name_refs("Cloak the top card of your library.", "Cloak"),
+            "Cloak the top card of your library."
+        );
+        // The mask is word-boundary-aware: it must not touch a longer word that
+        // merely starts with the keyword phrase ("manifested").
+        assert_eq!(
+            normalize_card_name_refs(
+                "Manifest dread. A manifested permanent you control gets +1/+1.",
+                "Manifest Dread"
+            ),
+            "Manifest dread. A manifested permanent you control gets +1/+1."
+        );
+    }
+
+    #[test]
+    fn normalize_card_named_literal_preserves_named_card_first_word() {
+        // CR 201.2 / CR 201.5: "Mox Emerald" is the literal card name being
+        // conjured, not a reference to Emerald Collector. The first-word
+        // fallback must not rewrite it to "Mox ~".
+        assert_eq!(
+            normalize_card_name_refs(
+                "Conjure a card named Mox Emerald into your hand.",
+                "Emerald Collector",
+            ),
+            "Conjure a card named Mox Emerald into your hand."
+        );
+    }
+
+    #[test]
+    fn normalize_card_named_literal_stops_before_trailing_instruction() {
+        assert_eq!(
+            normalize_card_name_refs(
+                "Search your library for a card named Dragonstorm Globe, reveal it, then this creature deals 1 damage.",
+                "Dragonstorm Forecaster",
+            ),
+            "Search your library for a card named Dragonstorm Globe, reveal it, then ~ deals 1 damage."
+        );
+    }
+
+    #[test]
+    fn normalize_card_named_literal_keeps_comma_inside_card_name() {
+        assert_eq!(
+            normalize_card_name_refs(
+                "Search your library for a card named Squee, Goblin Nabob, reveal it.",
+                "Nabob Collector",
+            ),
+            "Search your library for a card named Squee, Goblin Nabob, reveal it."
+        );
+    }
+
+    #[test]
+    fn normalize_card_named_literal_keeps_in_inside_card_name() {
+        assert_eq!(
+            normalize_card_name_refs(
+                "Search your library for a card named Lost in the Woods, reveal it.",
+                "Woods Collector",
+            ),
+            "Search your library for a card named Lost in the Woods, reveal it."
+        );
+    }
+
+    #[test]
+    fn normalize_card_named_literal_keeps_from_inside_card_name() {
+        assert_eq!(
+            normalize_card_name_refs(
+                "Conjure a card named Extract from Darkness into your hand.",
+                "Darkness Collector",
+            ),
+            "Conjure a card named Extract from Darkness into your hand."
+        );
+    }
+
+    #[test]
+    fn normalize_card_named_literal_prefix_requires_unicode_boundary() {
+        assert!(next_card_named_literal_prefix("nazgûlcard named mox emerald").is_none());
+        assert_eq!(
+            next_card_named_literal_prefix("nazgûl card named mox emerald"),
+            Some(("nazgûl ".len(), "card named ".len()))
+        );
+    }
+
+    #[test]
+    fn normalize_card_named_literal_stops_before_colon_self_reference() {
+        assert_eq!(
+            normalize_card_name_refs(
+                "Grandeur — Discard another card named Tarox Bladewing: Tarox Bladewing gets +X/+X until end of turn.",
+                "Tarox Bladewing",
+            ),
+            "Grandeur — Discard another card named Tarox Bladewing: ~ gets +X/+X until end of turn."
+        );
+    }
+
+    #[test]
+    fn normalize_card_named_literal_stops_before_revealed_rider() {
+        assert_eq!(
+            normalize_card_name_refs(
+                "If a card named Stomping Slabs was revealed this way, Stomping Slabs deals 7 damage to any target.",
+                "Stomping Slabs",
+            ),
+            "If a card named Stomping Slabs was revealed this way, ~ deals 7 damage to any target."
+        );
+    }
+
+    #[test]
+    fn normalize_named_object_literal_preserves_embedded_source_name() {
+        assert_eq!(
+            normalize_card_name_refs(
+                "At the beginning of your upkeep, if you don't control a creature named Keeper of Kookus, this creature deals 3 damage to you.",
+                "Kookus",
+            ),
+            "At the beginning of your upkeep, if you don't control a creature named Keeper of Kookus, ~ deals 3 damage to you."
+        );
+    }
+
+    #[test]
+    fn normalize_card_named_literal_keeps_comma_name_before_cost_list() {
+        assert_eq!(
+            normalize_card_name_refs(
+                "Grandeur — Discard another card named Skoa, Embermage, Sacrifice two Mountains: Skoa deals 4 damage to any target.",
+                "Skoa, Embermage",
+            ),
+            "Grandeur — Discard another card named Skoa, Embermage, Sacrifice two Mountains: ~ deals 4 damage to any target."
+        );
+    }
+
+    #[test]
+    fn normalize_verb_first_word_name_preserves_instruction_verb() {
+        // CR 201.5: "Search for Tomorrow" begins its Oracle text with the
+        // imperative verb "Search", not a self-reference. The strategy-5
+        // first-word fallback must not rewrite the verb to `~`.
+        assert_eq!(
+            normalize_card_name_refs(
+                "Search your library for a basic land card, put it onto the battlefield, then shuffle.",
+                "Search for Tomorrow"
+            ),
+            "Search your library for a basic land card, put it onto the battlefield, then shuffle."
+        );
+        // Same class: "Destroy the Evidence" / "Return to Battle".
+        assert_eq!(
+            normalize_card_name_refs("Destroy target land.", "Destroy the Evidence"),
+            "Destroy target land."
+        );
+        assert_eq!(
+            normalize_card_name_refs(
+                "Return target creature card from your graveyard to your hand.",
+                "Return to Battle"
+            ),
+            "Return target creature card from your graveyard to your hand."
+        );
+        // Sibling instruction verbs also in the lexicon: "Seek New Knowledge",
+        // "Choose Your Weapon", "Double Trouble" must not mangle their leading
+        // verb either.
+        assert_eq!(
+            normalize_card_name_refs(
+                "Seek two nonland cards, then put a card from your hand on the bottom of your library.",
+                "Seek New Knowledge"
+            ),
+            "Seek two nonland cards, then put a card from your hand on the bottom of your library."
+        );
+        assert_eq!(
+            normalize_card_name_refs("Choose one —", "Choose Your Weapon"),
+            "Choose one —"
+        );
+        assert_eq!(
+            normalize_card_name_refs(
+                "Double the power of each creature you control until end of turn.",
+                "Double Trouble"
+            ),
+            "Double the power of each creature you control until end of turn."
+        );
+    }
+
+    #[test]
+    fn normalize_verb_guard_preserves_split_half_self_ref() {
+        // The verb guard must not over-reach: a split-card half-name that is a
+        // noun ("Fire", "Cut", "Assault") is still a genuine self-reference and
+        // must normalize to `~`.
+        assert_eq!(
+            normalize_card_name_refs("Fire deals 2 damage divided as you choose.", "Fire // Ice"),
+            "~ deals 2 damage divided as you choose."
+        );
+    }
+
+    #[test]
     fn normalize_a_prefix_full_name() {
         assert_eq!(
             normalize_card_name_refs("When Sprouting Goblin enters", "A-Sprouting Goblin"),
@@ -1796,6 +2663,19 @@ mod tests {
         assert_eq!(
             normalize_card_name_refs("When Rosie Cotton enters", "Rosie Cotton of South Lane"),
             "When ~ enters"
+        );
+    }
+
+    #[test]
+    fn normalize_of_short_name_preserves_possessive_zone_library() {
+        // CR 201.5: "Library of Leng" derives short name "Library", which must
+        // not rewrite the zone phrase "your library" on this card's replacement line.
+        assert_eq!(
+            normalize_card_name_refs(
+                "If an effect causes you to discard a card, discard it, but you may put it on top of your library instead of into your graveyard.",
+                "Library of Leng"
+            ),
+            "If an effect causes you to discard a card, discard it, but you may put it on top of your library instead of into your graveyard."
         );
     }
 
@@ -1917,6 +2797,40 @@ mod tests {
     }
 
     #[test]
+    fn normalize_of_short_name_skips_creature_subtype_wall() {
+        // Wall of Stolen Identity: the "of"-derived short name "Wall" is also a
+        // creature subtype in except-clause text ("except it's a Wall in addition
+        // to its other types") and must not be rewritten to ~.
+        let result = normalize_card_name_refs(
+            "You may have this creature enter as a copy of any creature on the battlefield, \
+             except it's a Wall in addition to its other types and has defender.",
+            "Wall of Stolen Identity",
+        );
+        assert!(
+            result.contains("it's a Wall in addition"), // allow-noncombinator: test assertion, not parsing dispatch
+            "creature subtype Wall must survive normalization, got: {result}"
+        );
+    }
+
+    #[test]
+    fn normalize_of_short_name_normalizes_subtype_outside_type_change() {
+        // CR 201.3a: Curse of Misfortunes — the "of"-derived short name "Curse"
+        // is a subtype word, but the text does NOT add that subtype to the card
+        // (no copy / "in addition to its other types" anchor). It is a plain
+        // self-reference and must normalize to ~ so the trailing search filter
+        // parses, rather than falling through to the target-fallback path.
+        let result = normalize_card_name_refs(
+            "At the beginning of your upkeep, you may search your library for a Curse card, \
+             put it onto the battlefield attached to enchanted player, then shuffle.",
+            "Curse of Misfortunes",
+        );
+        assert!(
+            result.contains('~'), // allow-noncombinator: test assertion, not parsing dispatch
+            "subtype short name outside a type-change context must normalize, got: {result}"
+        );
+    }
+
+    #[test]
     fn normalize_full_name_takes_priority() {
         // Full name match should fire before first-word
         assert_eq!(
@@ -1986,17 +2900,87 @@ mod tests {
 
     #[test]
     fn is_subtype_word_recognizes_registered_subtypes() {
-        // Subtypes from the SUBTYPES registry — used by strategy-5 to guard
-        // cards whose first name-word is a subtype (e.g. "Cleric Class",
-        // "Druid Arcanist", "Coward").
+        // Valid creature + noncreature subtypes from the validated vocabulary.
         assert!(is_subtype_word("cleric"));
         assert!(is_subtype_word("druid"));
         assert!(is_subtype_word("coward"));
         assert!(is_subtype_word("sliver"));
         assert!(is_subtype_word("merfolk"));
+        assert!(is_subtype_word("jace"));
+        assert!(is_subtype_word("nahiri"));
+        assert!(is_subtype_word("plains"));
+        assert!(is_subtype_word("equipment"));
         // Not a subtype.
         assert!(!is_subtype_word("sharuum"));
         assert!(!is_subtype_word("flying")); // that's a keyword, not a subtype
+    }
+
+    #[test]
+    fn is_subtype_word_recognizes_token_only_creature_subtypes() {
+        for (lower, canonical) in [
+            ("army", "Army"),
+            ("germ", "Germ"),
+            ("servo", "Servo"),
+            ("tentacle", "Tentacle"),
+            ("camarid", "Camarid"),
+            ("tetravite", "Tetravite"),
+        ] {
+            assert!(
+                is_subtype_word(lower),
+                "{lower} must be parser-authoritative"
+            );
+            assert_eq!(
+                parse_subtype(lower),
+                Some((canonical.to_string(), lower.len())),
+                "{lower} must parse as a subtype head"
+            );
+        }
+    }
+
+    #[test]
+    fn is_subtype_word_rejects_plane_and_spell_subtypes_from_noncreature_faces() {
+        // Plane — Time and Elemental Instant — Fire must not register as parser
+        // subtypes; otherwise "time travel" lowers incorrectly and split-card
+        // half-names like "Fire // Ice" fail to normalize to ~.
+        for non_creature in ["time", "fire"] {
+            assert!(
+                !is_subtype_word(non_creature),
+                "{non_creature} must not be a parser subtype"
+            );
+        }
+    }
+
+    #[test]
+    fn is_subtype_word_rejects_oracle_function_words_and_mtgjson_garbage() {
+        for garbage in ["the", "you", "and/or", "of", "elemental?", "baddest,"] {
+            assert!(
+                !is_subtype_word(garbage),
+                "{garbage} must not register as a subtype"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_subtype_recognizes_two_word_time_lord() {
+        // CR 205.3m: "Time Lord" is the only two-word creature type. The
+        // two-word match is handled by `parse_subtype_entry`/`starts_with_word_ci`
+        // (full-entry match + word boundary), so the registry entry alone is
+        // sufficient — no SUBTYPE_PLURALS or canonicalization change is needed.
+        assert_eq!(
+            parse_subtype("Time Lord"),
+            Some(("Time Lord".to_string(), 9))
+        );
+        assert_eq!(
+            parse_subtype("time lord creature card"),
+            Some(("Time Lord".to_string(), 9))
+        );
+        // Regular plural via the +"s" branch — no SUBTYPE_PLURALS entry.
+        assert_eq!(
+            parse_subtype("Time Lords"),
+            Some(("Time Lord".to_string(), 10))
+        );
+        // Negative: trailing fragment of a two-word subtype must not match.
+        assert_eq!(parse_subtype("lord creature"), None);
     }
 
     #[test]
@@ -2179,6 +3163,147 @@ mod tests {
     }
 
     #[test]
+    fn parse_count_expr_three_minus_x() {
+        // CR 107.1b: "three minus X" → Offset { Multiply { -1, X }, offset: 3 }
+        // (Slumbering Trudge's stun-counter count). At X=0 this resolves to 3.
+        let (qty, rest) = parse_count_expr("three minus X").unwrap();
+        match qty {
+            QuantityExpr::Offset { inner, offset } => {
+                assert_eq!(offset, 3);
+                match *inner {
+                    QuantityExpr::Multiply { factor, inner } => {
+                        assert_eq!(factor, -1);
+                        assert!(matches!(
+                            *inner,
+                            QuantityExpr::Ref {
+                                qty: QuantityRef::Variable { .. }
+                            }
+                        ));
+                    }
+                    other => panic!("Expected Multiply{{-1, X}}, got {other:?}"),
+                }
+            }
+            other => panic!("Expected Offset, got {other:?}"),
+        }
+        assert_eq!(rest, "");
+    }
+
+    #[test]
+    fn parse_count_expr_two_plus_x() {
+        // CR 107.1b: "two plus X" → Offset { X, offset: 2 } (no negation wrapper).
+        let (qty, _rest) = parse_count_expr("two plus X").unwrap();
+        match qty {
+            QuantityExpr::Offset { inner, offset } => {
+                assert_eq!(offset, 2);
+                assert!(matches!(
+                    *inner,
+                    QuantityExpr::Ref {
+                        qty: QuantityRef::Variable { .. }
+                    }
+                ));
+            }
+            other => panic!("Expected Offset, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_count_expr_x_plus_two() {
+        // CR 107.1b + CR 107.3a: variable-first "X plus 2" -> Offset { X, offset: 2 }
+        // (Flame Discharge / Light Up the Night's "deals X plus N damage"). Mirror
+        // of the integer-first "two plus X" arm; the literal operand's remainder is
+        // preserved for the caller (here the trailing "damage").
+        let (qty, rest) = parse_count_expr("X plus 2 damage").unwrap();
+        match qty {
+            QuantityExpr::Offset { inner, offset } => {
+                assert_eq!(offset, 2);
+                assert!(matches!(
+                    *inner,
+                    QuantityExpr::Ref {
+                        qty: QuantityRef::Variable { .. }
+                    }
+                ));
+            }
+            other => panic!("Expected Offset {{X, +2}}, got {other:?}"),
+        }
+        assert_eq!(rest, "damage");
+    }
+
+    #[test]
+    fn parse_count_expr_x_minus_one() {
+        // CR 107.1b + CR 107.3a: variable-first "X minus 1" -> Offset { X, offset: -1 }.
+        // The negative offset (stored directly, not an inner Multiply) is clamped to
+        // zero by the resolver when X < 1, matching the integer-first arm's math.
+        let (qty, rest) = parse_count_expr("X minus 1 cards").unwrap();
+        match qty {
+            QuantityExpr::Offset { inner, offset } => {
+                assert_eq!(offset, -1);
+                assert!(matches!(
+                    *inner,
+                    QuantityExpr::Ref {
+                        qty: QuantityRef::Variable { .. }
+                    }
+                ));
+            }
+            other => panic!("Expected Offset {{X, -1}}, got {other:?}"),
+        }
+        assert_eq!(rest, "cards");
+    }
+
+    #[test]
+    fn parse_count_expr_x_plus_dynamic_stays_bare_x() {
+        // Regression / no-over-reach guard: the variable-first offset is literal
+        // integer only. A dynamic operand ("X plus the number of ...") must NOT be
+        // swallowed into an Offset; it falls through to the bare-X ref with the
+        // connective left on the remainder, exactly as before this arm existed.
+        let (qty, rest) = parse_count_expr("X plus the number of creatures you control").unwrap();
+        assert!(matches!(
+            qty,
+            QuantityExpr::Ref {
+                qty: QuantityRef::Variable { .. }
+            }
+        ));
+        assert_eq!(rest, "plus the number of creatures you control");
+    }
+
+    #[test]
+    fn parse_count_expr_x_plus_x_not_offset() {
+        // CR 107.3a: the variable-first offset is LITERAL-integer only. `parse_number`
+        // maps a bare "X" -> 0 (its numeric-only contract), so "X plus X" must NOT be
+        // swallowed into `Offset { X, +0 }`; the standalone-`X` operand guard rejects
+        // it and the count falls through to a bare-X ref, leaving the "plus X ..."
+        // connective on the remainder for the outer grammar.
+        let (qty, rest) = parse_count_expr("X plus X damage").unwrap();
+        assert!(
+            matches!(
+                qty,
+                QuantityExpr::Ref {
+                    qty: QuantityRef::Variable { .. }
+                }
+            ),
+            "expected bare Variable X ref, got {qty:?}"
+        );
+        assert_eq!(rest, "plus X damage");
+    }
+
+    #[test]
+    fn parse_count_expr_x_minus_x_not_offset() {
+        // CR 107.3a: mirror of the "plus" case for subtraction. "X minus X" must not
+        // become `Offset { X, -0 }`; the standalone-`X` operand is excluded from the
+        // literal-int offset, leaving the bare-X ref with "minus X ..." on the remainder.
+        let (qty, rest) = parse_count_expr("X minus X counters").unwrap();
+        assert!(
+            matches!(
+                qty,
+                QuantityExpr::Ref {
+                    qty: QuantityRef::Variable { .. }
+                }
+            ),
+            "expected bare Variable X ref, got {qty:?}"
+        );
+        assert_eq!(rest, "minus X counters");
+    }
+
+    #[test]
     fn parse_count_expr_half_x() {
         let (qty, rest) = parse_count_expr("half X cards").unwrap();
         match qty {
@@ -2229,6 +3354,19 @@ mod tests {
     }
 
     #[test]
+    fn parse_rounding_suffix_only_accepts_standalone_suffixes() {
+        assert_eq!(
+            parse_rounding_suffix_only(", rounded up."),
+            Some(crate::types::ability::RoundingMode::Up)
+        );
+        assert_eq!(
+            parse_rounding_suffix_only(", round down"),
+            Some(crate::types::ability::RoundingMode::Down)
+        );
+        assert_eq!(parse_rounding_suffix_only("Food tokens, rounded up"), None);
+    }
+
+    #[test]
     fn parse_count_expr_fixed_regression() {
         // Ensure "3 cards" still returns Fixed, not DivideRounded
         let (qty, rest) = parse_count_expr("3 cards").unwrap();
@@ -2256,6 +3394,33 @@ mod tests {
             other => panic!("expected Multiply, got {other:?}"),
         }
         assert_eq!(rest, "stun counters");
+    }
+
+    /// CR 107.1b: "equal to" in count positions must compose full quantity
+    /// expressions, not just bare `QuantityRef` leaves (Tormented Thoughts /
+    /// Ulamog enter-with-counters class).
+    #[test]
+    fn parse_count_expr_equal_to_composed_quantity() {
+        use crate::types::ability::{AggregateFunction, ObjectProperty};
+
+        let (qty, rest) =
+            parse_count_expr("equal to twice the number of creatures you control").unwrap();
+        assert!(matches!(qty, QuantityExpr::Multiply { factor: 2, .. }));
+        assert!(rest.is_empty());
+
+        let (qty, rest) =
+            parse_count_expr("equal to the greatest mana value among cards in exile").unwrap();
+        assert!(matches!(
+            qty,
+            QuantityExpr::Ref {
+                qty: QuantityRef::Aggregate {
+                    function: AggregateFunction::Max,
+                    property: ObjectProperty::ManaValue,
+                    ..
+                }
+            }
+        ));
+        assert!(rest.is_empty());
     }
 
     #[test]
@@ -2339,6 +3504,51 @@ mod tests {
         assert_eq!(
             strip_reminder_text("Destroy target creature."),
             "Destroy target creature."
+        );
+    }
+
+    #[test]
+    fn apply_bracket_mode_keep_content_drops_only_brackets() {
+        // CR 702.148a base text: keep the bracketed clause, drop the brackets.
+        assert_eq!(
+            apply_bracket_mode(
+                "You choose a nonland card from it [with mana value 2 or less].",
+                BracketMode::KeepContent
+            ),
+            "You choose a nonland card from it with mana value 2 or less."
+        );
+    }
+
+    #[test]
+    fn apply_bracket_mode_remove_span_drops_clause() {
+        // CR 702.148a cleave text: drop the entire bracketed span and tidy
+        // the trailing punctuation.
+        assert_eq!(
+            apply_bracket_mode(
+                "You choose a nonland card from it [with mana value 2 or less].",
+                BracketMode::RemoveSpan
+            ),
+            "You choose a nonland card from it."
+        );
+    }
+
+    #[test]
+    fn apply_bracket_mode_remove_span_handles_multiple_spans() {
+        // Dig Up shape: multiple bracketed spans, one ending in a comma
+        // (`[reveal it,]`). RemoveSpan drops both and collapses the artifacts.
+        assert_eq!(
+            apply_bracket_mode(
+                "Search your library for a [basic land] card, [reveal it,] put it into your hand, then shuffle.",
+                BracketMode::RemoveSpan
+            ),
+            "Search your library for a card, put it into your hand, then shuffle."
+        );
+        assert_eq!(
+            apply_bracket_mode(
+                "Search your library for a [basic land] card, [reveal it,] put it into your hand, then shuffle.",
+                BracketMode::KeepContent
+            ),
+            "Search your library for a basic land card, reveal it, put it into your hand, then shuffle."
         );
     }
 
@@ -2566,6 +3776,26 @@ mod tests {
     }
 
     #[test]
+    fn parse_subtype_es_plural() {
+        // Regression: "-es" plurals for sibilant-ending and consonant+o subtypes
+        // must resolve to the canonical singular rather than falling through to a
+        // naive trailing-'s' strip (which produced "Heroe" from "Heroes").
+        assert_eq!(parse_subtype("Heroes"), Some(("Hero".to_string(), 6)));
+        assert_eq!(parse_subtype("heroes"), Some(("Hero".to_string(), 6)));
+        assert_eq!(parse_subtype("sphinxes"), Some(("Sphinx".to_string(), 8)));
+        assert_eq!(
+            parse_subtype("Heroes you control"),
+            Some(("Hero".to_string(), 6))
+        );
+        // The singular still parses, and an unrelated word does not.
+        assert_eq!(parse_subtype("Hero"), Some(("Hero".to_string(), 4)));
+        // "Synth" is now registered (real artifact-creature subtype, Fallout set).
+        assert_eq!(parse_subtype("Synth"), Some(("Synth".to_string(), 5)));
+        assert_eq!(parse_subtype("Synths"), Some(("Synth".to_string(), 6)));
+        assert_eq!(parse_subtype("Villains"), Some(("Villain".to_string(), 8)));
+    }
+
+    #[test]
     fn parse_subtype_irregular_plural() {
         assert_eq!(parse_subtype("elves"), Some(("Elf".to_string(), 5)));
         assert_eq!(parse_subtype("dwarves"), Some(("Dwarf".to_string(), 7)));
@@ -2574,6 +3804,8 @@ mod tests {
             parse_subtype("werewolves"),
             Some(("Werewolf".to_string(), 10))
         );
+        assert_eq!(parse_subtype("pegasi"), Some(("Pegasus".to_string(), 6)));
+        assert_eq!(parse_subtype("pegasuses"), Some(("Pegasus".to_string(), 9)));
     }
 
     #[test]
@@ -2842,5 +4074,38 @@ mod tests {
         let (before, after) = tp.split_around(" \u{2014} ").unwrap();
         assert_eq!(before.original, "Choose one");
         assert_eq!(after.original, "Effect text");
+    }
+
+    /// CR 205.1b + CR 201.5: A card whose single-word name IS a creature subtype
+    /// (Coward) must NOT normalize that word to `~` when it is the type being
+    /// added — "becomes a Coward in addition to its other types" denotes the
+    /// creature TYPE, not a self-reference. Other occurrences (a genuine "When
+    /// Coward dies" self-reference) still normalize.
+    #[test]
+    fn normalize_subtype_name_in_type_addition_stays_literal() {
+        let out = normalize_card_name_refs(
+            "Target creature can't block this turn and becomes a Coward in addition to its other types until end of turn.",
+            "Coward",
+        );
+        assert!(
+            // allow-noncombinator: test assertion on normalized output, not parsing dispatch
+            out.contains("becomes a Coward in addition to its other types"),
+            "subtype-in-type-addition must stay literal, got: {out}"
+        );
+        // A real self-reference of the same subtype-word name still normalizes.
+        let out2 = normalize_card_name_refs(
+            "When Coward dies, target creature becomes a Coward in addition to its other types.",
+            "Coward",
+        );
+        assert!(
+            // allow-noncombinator: test assertion on normalized output, not parsing dispatch
+            out2.contains("When ~ dies"),
+            "self-reference occurrence must normalize to ~, got: {out2}"
+        );
+        assert!(
+            // allow-noncombinator: test assertion on normalized output, not parsing dispatch
+            out2.contains("becomes a Coward in addition to its other types"),
+            "subtype occurrence must stay literal, got: {out2}"
+        );
     }
 }

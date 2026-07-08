@@ -68,9 +68,34 @@ pub fn parse_enters_origin_zone(input: &str) -> OracleResult<'_, Zone> {
     .parse(input)
 }
 
+/// Parse a *bare* zone name with NO preposition lead-in: "exile",
+/// "a graveyard", "their graveyard", "a library", "their library", "the stack".
+///
+/// Companion to [`parse_zone_filter`] (which requires an "in/on/of/from <zone>"
+/// preposition) and [`parse_enters_origin_zone`] (which requires the "from
+/// <zone>" suffix). Use this ONLY where the preposition lead-in is supplied
+/// separately by the caller AND that lead-in is not a bare "from " — e.g.
+/// "or after being cast from <zone>", where `parse_enters_origin_zone`'s bundled
+/// `tag("from exile")` does not fit because the grammatical lead-in is "being
+/// cast from ". For the plain "would enter from <zone>" suffix, prefer
+/// [`parse_enters_origin_zone`] directly. Composed in the same
+/// `value(Zone::X, tag(...))` idiom as [`parse_zone_filter`].
+pub fn parse_zone_word(input: &str) -> OracleResult<'_, Zone> {
+    alt((
+        value(Zone::Exile, tag("exile")),
+        value(Zone::Graveyard, tag("a graveyard")),
+        value(Zone::Graveyard, tag("their graveyard")),
+        value(Zone::Library, tag("a library")),
+        value(Zone::Library, tag("their library")),
+        value(Zone::Stack, tag("the stack")),
+    ))
+    .parse(input)
+}
+
 /// Parse a zone owner/controller qualifier following a zone filter.
 ///
-/// Matches "you control", "an opponent controls", "you own", "you don't control".
+/// Matches "you control", "an opponent controls", "your opponents control",
+/// "you don't control", "target player controls", "defending player controls".
 pub fn parse_zone_controller(input: &str) -> OracleResult<'_, ControllerRef> {
     alt((
         value(ControllerRef::You, tag("you control")),
@@ -83,6 +108,38 @@ pub fn parse_zone_controller(input: &str) -> OracleResult<'_, ControllerRef> {
         // (see `collect_target_slots` in `game/ability_utils.rs`) so the player
         // is selected as part of target declaration.
         value(ControllerRef::TargetPlayer, tag("target player controls")),
+        // CR 109.4 + CR 102.2 / CR 102.3: "target opponent controls" — filter
+        // controller is the opponent chosen as a target. Consumer surfaces an
+        // opponent-only companion slot (see `companion_target_player_legal_targets`
+        // in `game/ability_utils.rs`). Runtime read identical to TargetPlayer.
+        value(
+            ControllerRef::TargetOpponent,
+            tag("target opponent controls"),
+        ),
+        // CR 508.5 / CR 508.5a: "defending player controls" — the controller
+        // scope is the defending player (or that player's planeswalker
+        // controller / battle protector) the attacking creature is attacking.
+        // Resolved per attacker at runtime by
+        // `combat::defending_player_for_attacker`. Shares no prefix with the
+        // arms above, so dispatch order is not load-bearing.
+        value(
+            ControllerRef::DefendingPlayer,
+            tag("defending player controls"),
+        ),
+        // CR 303.4b + CR 702.5a: "enchanted player controls" — the controller
+        // scope is the player the source Aura is attached to. Resolved at
+        // runtime by reading `source.attached_to.as_player()`. Powers the
+        // Curse cycle (Trespasser's Curse, Curse of Clinging Webs, etc.).
+        value(
+            ControllerRef::EnchantedPlayer,
+            tag("enchanted player controls"),
+        ),
+        // CR 102.1: "the active player controls" — the turn player. Shares no
+        // prefix with the arms above, so dispatch order is not load-bearing.
+        value(
+            ControllerRef::ActivePlayer,
+            tag("the active player controls"),
+        ),
     ))
     .parse(input)
 }
@@ -95,7 +152,9 @@ pub fn parse_property_filter(input: &str) -> OracleResult<'_, FilterProp> {
     alt((
         value(FilterProp::Tapped, tag("tapped")),
         value(FilterProp::Untapped, tag("untapped")),
-        value(FilterProp::Attacking, tag("attacking")),
+        // CR 702.171b: "saddled Mount/creature" selector.
+        value(FilterProp::IsSaddled, tag("saddled")),
+        value(FilterProp::Attacking { defender: None }, tag("attacking")),
         value(FilterProp::Blocking, tag("blocking")),
         value(FilterProp::Token, tag("token")),
         value(FilterProp::NonToken, tag("nontoken")),
@@ -122,16 +181,25 @@ pub fn parse_with_property(input: &str) -> OracleResult<'_, FilterProp> {
     preceded((tag("with"), space1), parse_with_inner).parse(input)
 }
 
+/// CR 113.1 + CR 113.3: an object with none of the four ability categories
+/// (spell, activated, triggered, static) — i.e. "no abilities". Narrow primitive
+/// shared by the target-suffix scanner (oracle_target.rs) and the search-library
+/// filter scanner (oracle_effect/search.rs); each call site supplies its own
+/// surrounding "with " grammar, so this matches the bare predicate only.
+pub fn parse_no_abilities(input: &str) -> OracleResult<'_, FilterProp> {
+    value(FilterProp::HasNoAbilities, tag("no abilities")).parse(input)
+}
+
 /// Parse the inner content of a "with" clause.
 fn parse_with_inner(input: &str) -> OracleResult<'_, FilterProp> {
     alt((
-        // CR 510.1c relative comparison — must precede the general P/T
-        // combinator so "toughness greater than its power" wins over a
-        // "toughness <comparator>" numeric parse.
-        value(
-            FilterProp::ToughnessGTPower,
-            tag("toughness greater than its power"),
-        ),
+        // CR 208.1 self-referential comparisons (a creature's own toughness vs its
+        // own power, or own power vs own base power) — must precede the general P/T
+        // combinator so they win over a numeric parse. Singular and plural
+        // possessives both accepted via the shared `parse_self_referential_pt`
+        // helper (also reached through `parse_pt_comparison` for the `parse_target`
+        // call sites that bypass `parse_with_inner`).
+        parse_self_referential_pt,
         // CR 509.1b: "greater power" — relative to source.
         value(FilterProp::PowerGTSource, tag("greater power")),
         // CR 208: the shared power/toughness comparison combinator (handles
@@ -144,9 +212,9 @@ fn parse_with_inner(input: &str) -> OracleResult<'_, FilterProp> {
 
 /// CR 208 + CR 208.4b + CR 613.4b: the single, shared power/toughness comparison
 /// combinator. This is the canonical home for the
-/// `[base ][each ](power|toughness|power or toughness) <comparison> N` grammar;
-/// every context (target suffixes, "with" clauses, sacrifice filters) delegates
-/// here so the grammar lives in exactly one place.
+/// `[base ][each ](power|toughness|power or toughness|total power and toughness)
+/// <comparison> N` grammar; every context (target suffixes, "with" clauses,
+/// sacrifice filters) delegates here so the grammar lives in exactly one place.
 ///
 /// Axes parsed:
 /// - optional leading `each ` — the distributive qualifier in "creatures each
@@ -155,7 +223,7 @@ fn parse_with_inner(input: &str) -> OracleResult<'_, FilterProp> {
 ///   discarded.
 /// - optional `base ` → `PtValueScope::Base` (CR 208.4b); otherwise `Current`.
 /// - stat selector: `power or toughness` (disjunction → `AnyOf` of two
-///   `PtComparison`), `power`, or `toughness`.
+///   `PtComparison`), `total power and toughness`, `power`, or `toughness`.
 /// - comparison tail: either the postfix `N or less` / `N or greater` form, or
 ///   the infix `less than [or equal to] N` / `greater than [or equal to] N`
 ///   form (resolving to LE/GE with an `Offset` for strict `<`/`>`).
@@ -163,6 +231,18 @@ pub fn parse_pt_comparison(input: &str) -> OracleResult<'_, FilterProp> {
     // Optional distributive "each " qualifier (no semantic effect).
     let (input, _) = opt(tag("each ")).parse(input)?;
     let (input, _) = opt((tag("with"), space1)).parse(input)?;
+    // CR 208.1: self-referential comparison "(power|toughness) greater than
+    // <poss> (power|toughness)" — a creature's own stat versus its own other
+    // stat. This MUST precede the general "<stat> greater than <quantity>" tail,
+    // which would otherwise resolve the possessive "its/their power" through the
+    // quantity grammar as the *source* object's power (wrong scope for a filter
+    // applied per candidate). Both possessive forms ("its" singular, "their"
+    // plural) and both directions collapse to the dedicated self-referential
+    // props the runtime evaluates against each candidate (`ToughnessGTPower`,
+    // `PowerExceedsBase`).
+    if let Ok((rest, prop)) = parse_self_referential_pt(input) {
+        return Ok((rest, prop));
+    }
     // Optional "base " scope marker (CR 208.4b).
     let (input, scope) = map(opt(tag("base ")), |b| {
         if b.is_some() {
@@ -172,8 +252,12 @@ pub fn parse_pt_comparison(input: &str) -> OracleResult<'_, FilterProp> {
         }
     })
     .parse(input)?;
-    // Stat selector. "power or toughness" must be tried before "power".
+    // Stat selector. Longer phrases must be tried before "power".
     let (input, stats): (_, &[PtStat]) = alt((
+        value(
+            &[PtStat::TotalPowerToughness][..],
+            tag("total power and toughness"),
+        ),
         value(
             &[PtStat::Power, PtStat::Toughness][..],
             tag("power or toughness"),
@@ -198,6 +282,40 @@ pub fn parse_pt_comparison(input: &str) -> OracleResult<'_, FilterProp> {
         FilterProp::AnyOf { props }
     };
     Ok((rest, prop))
+}
+
+/// CR 208.1: Possessive pronoun introducing a creature's *own* stat in a
+/// self-referential P/T comparison — "its" (singular subject) or "their" (plural
+/// subject). Both refer to the candidate object itself, not the ability source.
+fn parse_pt_possessive(input: &str) -> OracleResult<'_, &str> {
+    alt((tag("its"), tag("their"))).parse(input)
+}
+
+/// CR 208.1: "toughness greater than <poss> power" → [`FilterProp::ToughnessGTPower`]
+/// and "power greater than <poss> base power" → [`FilterProp::PowerExceedsBase`].
+/// These are the self-referential P/T comparisons (a creature's own stat vs its
+/// own other stat), distinct from the numeric/quantity-threshold comparisons the
+/// rest of `parse_pt_comparison` handles. Accepts singular and plural possessives.
+fn parse_self_referential_pt(input: &str) -> OracleResult<'_, FilterProp> {
+    alt((
+        value(
+            FilterProp::ToughnessGTPower,
+            (
+                tag("toughness greater than "),
+                parse_pt_possessive,
+                tag(" power"),
+            ),
+        ),
+        value(
+            FilterProp::PowerExceedsBase,
+            (
+                tag("power greater than "),
+                parse_pt_possessive,
+                tag(" base power"),
+            ),
+        ),
+    ))
+    .parse(input)
 }
 
 /// CR 208.1 + CR 107.3a: Parse the comparison tail of a P/T constraint, after the
@@ -391,10 +509,18 @@ mod tests {
         assert_eq!(rest, " creatures");
     }
 
+    // CR 702.171b: "saddled Mount/creature" selector → FilterProp::IsSaddled.
+    #[test]
+    fn test_parse_property_filter_saddled() {
+        let (rest, p) = parse_property_filter("saddled Mount you control").unwrap();
+        assert_eq!(p, FilterProp::IsSaddled);
+        assert_eq!(rest, " Mount you control");
+    }
+
     #[test]
     fn test_parse_property_filter_attacking() {
         let (rest, p) = parse_property_filter("attacking").unwrap();
-        assert_eq!(p, FilterProp::Attacking);
+        assert_eq!(p, FilterProp::Attacking { defender: None });
         assert_eq!(rest, "");
     }
 
@@ -422,6 +548,29 @@ mod tests {
     #[test]
     fn test_parse_property_filter_failure() {
         assert!(parse_property_filter("flying").is_err());
+    }
+
+    #[test]
+    fn test_parse_no_abilities() {
+        // CR 113.1 + CR 113.3: bare "no abilities" predicate → HasNoAbilities,
+        // fully consumed.
+        let (rest, prop) = parse_no_abilities("no abilities").unwrap();
+        assert_eq!(prop, FilterProp::HasNoAbilities);
+        assert_eq!(rest, "");
+    }
+
+    #[test]
+    fn test_parse_no_abilities_residual() {
+        // Only the bare predicate is consumed; trailing grammar is left for the
+        // call site's scanner.
+        let (rest, prop) = parse_no_abilities("no abilities and more").unwrap();
+        assert_eq!(prop, FilterProp::HasNoAbilities);
+        assert_eq!(rest, " and more");
+    }
+
+    #[test]
+    fn test_parse_no_abilities_failure() {
+        assert!(parse_no_abilities("flying").is_err());
     }
 
     #[test]
@@ -501,6 +650,21 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_pt_comparison_total_power_toughness() {
+        let (rest, p) = parse_pt_comparison("total power and toughness 5 or less").unwrap();
+        assert_eq!(rest, "");
+        assert_eq!(
+            p,
+            FilterProp::PtComparison {
+                stat: PtStat::TotalPowerToughness,
+                scope: PtValueScope::Current,
+                comparator: Comparator::LE,
+                value: QuantityExpr::Fixed { value: 5 },
+            }
+        );
+    }
+
+    #[test]
     fn test_parse_pt_comparison_exact_base_power() {
         let (rest, p) = parse_with_property("with base power 1").unwrap();
         assert_eq!(rest, "");
@@ -575,6 +739,22 @@ mod tests {
         let (rest2, c2) = parse_zone_controller("you don't control").unwrap();
         assert_eq!(c2, ControllerRef::Opponent);
         assert_eq!(rest2, "");
+    }
+
+    // CR 508.5 / CR 508.5a: "defending player controls" scopes the filter
+    // controller to the defending player for attack-trigger targets (Kogla,
+    // The Tarrasque, ~42 cards). Class-level combinator behavior, not one card.
+    #[test]
+    fn test_parse_zone_controller_defending_player() {
+        let (rest, c) = parse_zone_controller("defending player controls").unwrap();
+        assert_eq!(c, ControllerRef::DefendingPlayer);
+        assert_eq!(rest, "");
+
+        // Remainder preservation: the new arm consumes only the qualifier and
+        // does not over-consume trailing text.
+        let (rest2, c2) = parse_zone_controller("defending player controls and ").unwrap();
+        assert_eq!(c2, ControllerRef::DefendingPlayer);
+        assert_eq!(rest2, " and ");
     }
 
     #[test]

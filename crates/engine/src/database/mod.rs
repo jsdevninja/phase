@@ -1,12 +1,37 @@
+pub mod augment;
 pub mod bracket_lists;
 pub mod card_db;
+pub mod contraptions;
+pub mod embalm_eternalize;
+pub mod encore;
 #[cfg(feature = "forge")]
 pub mod forge;
+pub mod haunt;
+pub mod hideaway;
 pub mod legality;
+pub mod meld;
 pub mod mtgjson;
 pub mod oracle_loader;
+pub mod removed_cards;
 pub mod search;
+pub mod set_catalog;
+pub mod set_gating;
+pub mod subtype_vocab;
 pub mod synthesis;
+pub mod unearth;
+
+#[cfg(test)]
+mod augment_tests;
+#[cfg(test)]
+mod embalm_eternalize_tests;
+#[cfg(test)]
+mod encore_tests;
+#[cfg(test)]
+mod hideaway_tests;
+#[cfg(test)]
+mod meld_tests;
+#[cfg(test)]
+mod unearth_tests;
 
 pub use bracket_lists::{BracketLists, BracketSignals};
 pub use card_db::CardDatabase;

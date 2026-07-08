@@ -55,22 +55,38 @@ const mocks = vi.hoisted(() => ({
     actions: [],
     autoPassRecommended: false,
   })),
+  projectSeatView: vi.fn(async (stateJson: string) => {
+    const state = JSON.parse(stateJson) as {
+      seats: Array<{ type: string }>;
+      format: unknown;
+      gameStarted: boolean;
+    };
+    return {
+      seats: state.seats,
+      format: state.format,
+      isFull: state.seats.every((seat) => seat.type !== "WaitingHuman"),
+      gameStarted: state.gameStarted,
+    };
+  }),
   setMultiplayerMode: vi.fn(async (_enabled: boolean) => undefined),
 }));
 
 vi.mock("../wasm-adapter", () => ({
-  WasmAdapter: vi.fn().mockImplementation(() => ({
-    initialize: vi.fn(async () => undefined),
-    initializeGame: mocks.initializeGame,
-    submitAction: vi.fn(async () => ({ events: [] })),
-    getState: vi.fn(async () => ({})),
-    getLegalActions: mocks.getLegalActions,
-    getLegalActionsForViewer: mocks.getLegalActionsForViewer,
-    getFilteredState: mocks.getFilteredState,
-    getViewerSnapshot: mocks.getViewerSnapshot,
-    setMultiplayerMode: mocks.setMultiplayerMode,
-    dispose: vi.fn(),
-  })),
+  WasmAdapter: vi.fn().mockImplementation(function () {
+    return {
+      initialize: vi.fn(async () => undefined),
+      initializeGame: mocks.initializeGame,
+      submitAction: vi.fn(async () => ({ events: [] })),
+      getState: vi.fn(async () => ({})),
+      getLegalActions: mocks.getLegalActions,
+      getLegalActionsForViewer: mocks.getLegalActionsForViewer,
+      getFilteredState: mocks.getFilteredState,
+      getViewerSnapshot: mocks.getViewerSnapshot,
+      projectSeatView: mocks.projectSeatView,
+      setMultiplayerMode: mocks.setMultiplayerMode,
+      dispose: vi.fn(),
+    };
+  }),
 }));
 
 interface FakePeer {

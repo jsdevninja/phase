@@ -12,6 +12,13 @@
     "data": "Dane"
   },
   "gameplay": {
+    "collapseLands": "Zwiń Lands",
+    "collapseSupport": "Zwiń Support",
+    "collapseZoneOptions": {
+      "auto": "Auto",
+      "on": "Zawsze wł.",
+      "off": "Zawsze wył."
+    },
     "title": "Rozgrywka",
     "language": "Język",
     "cardSize": "Rozmiar kart",
@@ -32,6 +39,11 @@
       "customUrl": "Niestandardowy URL",
       "none": "Brak"
     },
+    "commandZoneOptions": {
+      "compact": "Kompaktowy",
+      "inline": "Wbudowany",
+      "auto": "Auto"
+    },
     "cardSizeOptions": {
       "small": "Małe",
       "medium": "Średnie",
@@ -49,15 +61,64 @@
     "showKeywords": "Pokaż słowa kluczowe na kartach na polu bitwy",
     "opponentHoverPreview": "Podgląd po najechaniu na przeciwnika",
     "showOpponentBoard": "Pokaż pole bitwy przeciwnika po najechaniu na HUD",
+    "multiplayerBoardLayout": "Układ planszy wieloosobowej",
+    "multiplayerBoardLayoutOptions": {
+      "focused": "Skupiony przeciwnik",
+      "split": "Podzielony stół"
+    },
+    "cardPreviewDelay": "Opóźnienie podglądu",
+    "cardPreviewDelayInstant": "Natychmiast",
+    "cardPreviewDelayValue": "{{ms}} ms",
+    "cardPreviewDelayHint": "Odczekaj tyle czasu po najechaniu na kartę, zanim pojawi się podgląd.",
+    "cardPreview": "Podgląd karty po najechaniu",
+    "cardPreviewOptions": {
+      "follow": "Podążaj za kursorem",
+      "side": "Zadokuj z boku",
+      "shift": "Przytrzymaj Shift"
+    },
+    "cardPreviewHint": {
+      "follow": "Powiększony podgląd podąża za kursorem, gdy najeżdżasz na kartę.",
+      "side": "Podgląd dokuje się przy krawędzi ekranu, więc nigdy nie zasłania pola bitwy.",
+      "shift": "Podgląd pojawia się tylko wtedy, gdy przytrzymasz klawisz Shift, tak jak w Tabletop Simulator."
+    },
     "cardArtPreferences": "Preferencje grafiki kart",
     "clearArtOverrides_one": "Wyczyść wszystkie nadpisania grafiki ({{count}})",
     "clearArtOverrides_other": "Wyczyść wszystkie nadpisania grafiki ({{count}})",
     "clearArtOverridesConfirm_one": "Wyczyścić {{count}} nadpisanie grafiki?",
     "clearArtOverridesConfirm_other": "Wyczyścić wszystkie nadpisania grafiki ({{count}})?",
+    "clearArtOverridesAction": "Wyczyść",
     "vfxQualityOptions": {
       "full": "Pełna",
       "reduced": "Zredukowana",
       "minimal": "Minimalna"
+    }
+  },
+  "flexLayout": {
+    "title": "Elastyczny układ",
+    "description": "Przeciągaj panele i HUD w dowolne miejsce i zmieniaj rozmiar stref planszy.",
+    "edit": "Dostosuj układ…",
+    "done": "Gotowe",
+    "reset": "Zresetuj układ",
+    "preset": "Ustawienie",
+    "hint": "Przeciągnij panel, aby go przesunąć. Przeciągnij świecące paski, aby zmienić rozmiar stref.",
+    "align": {
+      "left": "Wyrównaj do lewej",
+      "center": "Wyśrodkuj",
+      "right": "Wyrównaj do prawej"
+    },
+    "presets": {
+      "default": { "label": "Układ 1", "description": "Standardowy, zrównoważony układ." },
+      "layout2": { "label": "Układ 2", "description": "Większe pole bitwy ze schowanymi rękami." },
+      "layout3": { "label": "Układ 3", "description": "Wyższa dolna część." }
+    },
+    "zones": {
+      "playerHud": "Twój HUD",
+      "opponentHud": "HUD przeciwnika",
+      "stackPanel": "Stos",
+      "logPanel": "Dziennik",
+      "actionRail": "Akcje",
+      "playerPiles": "Twoje strefy",
+      "opponentPiles": "Strefy przeciwnika"
     }
   },
   "audio": {
@@ -112,6 +173,10 @@
     "description": "Eksport pakuje twoje preferencje, zaimportowane talie i subskrypcje kanałów do jednego pliku JSON. Import przywraca je na innym komputerze. Pamięci podręczne IndexedDB (pamięć kanałów, pamięć dźwięku, zapisane gry) nie są dołączane — odbudowują się automatycznie.",
     "exportBackup": "Eksportuj kopię zapasową…",
     "importBackup": "Importuj kopię zapasową…",
+    "importModeTitle": "Importuj kopię zapasową",
+    "importModeMessage": "Zastąp wszystko kopią zapasową (destrukcyjnie) lub scal — zachowaj istniejące talie i dodaj nowe z kopii.",
+    "importOverwrite": "Zastąp wszystko",
+    "importMerge": "Scal",
     "importConfirm": "Nadpisać istniejące preferencje i talie?\n\nOK: zastąp wszystko kopią zapasową (destrukcyjne).\nAnuluj: scal — zachowaj istniejące talie, dodaj nowe z kopii zapasowej.",
     "backupDownloaded": "Kopia zapasowa pobrana.",
     "imported_one": "Zaimportowano {{count}} talię.",
@@ -119,11 +184,14 @@
     "importedWithPreferences_one": "Zaimportowano {{count}} talię i preferencje.",
     "importedWithPreferences_other": "Zaimportowano {{count}} talii i preferencje.",
     "skippedMalformed_one": "Pominięto {{count}} nieprawidłowy wpis.",
-    "skippedMalformed_other": "Pominięto {{count}} nieprawidłowych wpisów."
+    "skippedMalformed_other": "Pominięto {{count}} nieprawidłowych wpisów.",
+    "telemetry": "Wysyłaj anonimowe raporty o awariach i użyciu",
+    "telemetryDescription": "Pomaga naprawiać awarie i ustalać priorytety obsługi kart. Bez konta, bez danych osobowych — tylko liczniki błędów i podsumowań gier."
   },
   "resetAll": {
     "confirm": "Zresetować wszystkie preferencje do wartości domyślnych? Spowoduje to wyczyszczenie każdego ustawienia w tym oknie.",
-    "button": "Zresetuj wszystkie preferencje"
+    "button": "Zresetuj wszystkie preferencje",
+    "confirmAction": "Zresetuj"
   },
   "pacing": {
     "title": "Tempo",

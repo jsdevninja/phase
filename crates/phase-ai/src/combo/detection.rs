@@ -13,6 +13,7 @@ use engine::types::mana::ManaCost;
 use engine::types::player::PlayerId;
 
 use crate::combo::line::{CardPredicate, ComboLine, ComboPiece, ComboReachability, ComboStep};
+use engine::types::game_state::CastPaymentMode;
 
 pub trait ComboDetector: Send + Sync {
     fn assess(&self, state: &GameState, line: &ComboLine, ai: PlayerId) -> ComboReachability;
@@ -44,7 +45,10 @@ impl ComboDetector for StructuralComboDetector {
             // Delegates to the engine's color-accurate affordability primitive, which also
             // enforces summoning sickness (CR 302.6).
             let affordable = match &line.mana_cost {
-                ManaCost::NoCost | ManaCost::SelfManaCost => true,
+                ManaCost::NoCost
+                | ManaCost::SelfManaCost
+                | ManaCost::SelfManaValue
+                | ManaCost::SelfManaCostReduced { .. } => true,
                 ManaCost::Cost { .. } => cost_bearing_source(line, state, ai).is_some_and(|src| {
                     can_pay_cost_after_auto_tap(state, ai, src, &line.mana_cost)
                 }),
@@ -149,6 +153,8 @@ fn resolve_action_sequence(
                         object_id,
                         card_id,
                         targets: Vec::new(),
+
+                        payment_mode: CastPaymentMode::Auto,
                     })
                 })?
             }

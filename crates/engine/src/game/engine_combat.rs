@@ -1,4 +1,5 @@
 use crate::game::combat::{AttackTarget, DamageAssignment, DamageTarget, TrampleKind};
+use crate::types::ability::{CostPaidObjectSnapshot, TargetRef};
 use crate::types::events::GameEvent;
 use crate::types::game_state::{
     CombatDamageAssignmentMode, CombatTaxContext, CombatTaxPending, DamageSlot, GameState,
@@ -18,6 +19,7 @@ pub(super) fn handle_declare_attackers(
     state: &mut GameState,
     player: PlayerId,
     attacks: &[(ObjectId, AttackTarget)],
+    bands: &[Vec<ObjectId>],
     events: &mut Vec<GameEvent>,
 ) -> Result<WaitingFor, EngineError> {
     if state.active_player != player {
@@ -37,15 +39,292 @@ pub(super) fn handle_declare_attackers(
             per_creature,
             pending: CombatTaxPending::Attack {
                 attacks: attacks.to_vec(),
+                // CR 702.22c + CR 702.22h: preserve band declarations across the
+                // tax-payment pause so the resume path re-runs
+                // `declare_attackers_with_bands` and the band is grouped for
+                // blocking rather than being silently dropped.
+                bands: bands.to_vec(),
             },
         });
     }
-    super::combat::declare_attackers(state, attacks, events).map_err(EngineError::InvalidAction)?;
+    let declaration_start = events.len();
+    // CR 702.22c: declare attackers together with any banding declarations so
+    // `band_id` is stamped on the attacking-band members before block
+    // propagation (CR 702.22h) and damage assignment (CR 702.22j/k).
+    super::combat::declare_attackers_with_bands(state, attacks, bands, events)
+        .map_err(EngineError::InvalidAction)?;
 
-    triggers::process_triggers(state, events);
-    // CR 603.3b (#531): if process_triggers paused on OrderTriggers (the
-    // active player has 2+ simultaneous triggers awaiting their ordering
-    // choice), surface that prompt instead of overwriting it with Priority.
+    // CR 508.1g + CR 701.43d: before attack triggers are put on the stack, the
+    // active player pays any optional "exert this creature as it attacks" costs.
+    // Offer each eligible attacker one at a time; the post-declaration
+    // trigger/priority logic resumes via `finish_declare_attackers` once the
+    // exert queue is drained.
+    let candidates = exert_candidates(state, attacks);
+    if let Some((first, rest)) = candidates.split_first() {
+        // CR 508.2: defer the declaration triggers until after the exert
+        // sub-step so attack and exert "when you do" triggers are placed on the
+        // stack simultaneously.
+        state.pending_attack_trigger_events = events[declaration_start..].to_vec();
+        return Ok(WaitingFor::ExertChoice {
+            player,
+            attacker: *first,
+            remaining: rest.to_vec(),
+        });
+    }
+
+    if let Some(waiting_for) = next_enlist_choice(state, player, enlist_candidates(state, attacks))
+    {
+        // CR 508.2: defer declaration triggers until after Enlist optional
+        // attack costs, so attack and linked "when you do" triggers are placed
+        // on the stack before priority.
+        state.pending_attack_trigger_events = events[declaration_start..].to_vec();
+        return Ok(waiting_for);
+    }
+
+    finish_declare_attackers(state, events, attacks.is_empty())
+}
+
+/// CR 701.43d: Attackers carrying an "exert as it attacks" ability (a
+/// `TriggerMode::Exerted` triggered ability) that have not yet been exerted this
+/// turn, in declaration order. These attackers are offered the optional exert
+/// cost per CR 508.1g.
+fn exert_candidates(state: &GameState, attacks: &[(ObjectId, AttackTarget)]) -> Vec<ObjectId> {
+    attacks
+        .iter()
+        .map(|(attacker_id, _)| *attacker_id)
+        .filter(|attacker_id| {
+            !state.exerted_this_turn.contains(attacker_id)
+                && state.objects.get(attacker_id).is_some_and(|obj| {
+                    super::functioning_abilities::active_trigger_definitions(state, obj)
+                        .any(|(_, def)| def.mode == crate::types::triggers::TriggerMode::Exerted)
+                })
+        })
+        .collect()
+}
+
+/// CR 702.154b + CR 702.154d: each Enlist instance represents an independent
+/// optional attack cost linked to its own "when you do" trigger. Return one
+/// queue entry per active `TriggerMode::Enlisted` definition, preserving attack
+/// declaration order and per-instance multiplicity.
+fn enlist_candidates(state: &GameState, attacks: &[(ObjectId, AttackTarget)]) -> Vec<ObjectId> {
+    attacks
+        .iter()
+        .flat_map(|(attacker_id, _)| {
+            let count = state.objects.get(attacker_id).map_or(0, |obj| {
+                super::functioning_abilities::active_trigger_definitions(state, obj)
+                    .filter(|(_, def)| def.mode == crate::types::triggers::TriggerMode::Enlisted)
+                    .count()
+            });
+            (0..count).map(|_| *attacker_id)
+        })
+        .collect()
+}
+
+fn current_enlist_candidates(state: &GameState) -> Vec<ObjectId> {
+    let Some(combat) = state.combat.as_ref() else {
+        return Vec::new();
+    };
+    let attacks: Vec<_> = combat
+        .attackers
+        .iter()
+        .map(|attacker| (attacker.object_id, attacker.attack_target))
+        .collect();
+    enlist_candidates(state, &attacks)
+}
+
+pub(super) fn next_enlist_choice(
+    state: &GameState,
+    player: PlayerId,
+    candidates: Vec<ObjectId>,
+) -> Option<WaitingFor> {
+    let mut remaining = candidates;
+    while !remaining.is_empty() {
+        let attacker = remaining.remove(0);
+        let eligible = enlist_eligible_targets(state, attacker);
+        if !eligible.is_empty() {
+            return Some(WaitingFor::EnlistChoice {
+                player,
+                attacker,
+                eligible,
+                remaining,
+            });
+        }
+    }
+    None
+}
+
+pub(super) fn next_current_enlist_choice(
+    state: &GameState,
+    player: PlayerId,
+) -> Option<WaitingFor> {
+    next_enlist_choice(state, player, current_enlist_candidates(state))
+}
+
+fn enlist_eligible_targets(state: &GameState, attacker: ObjectId) -> Vec<ObjectId> {
+    let Some(attacker_obj) = state.objects.get(&attacker) else {
+        return Vec::new();
+    };
+    super::targeting::find_legal_targets(
+        state,
+        &crate::database::synthesis::enlist_tap_target_filter(),
+        attacker_obj.controller,
+        attacker,
+    )
+    .into_iter()
+    .filter_map(|target| match target {
+        TargetRef::Object(id) => Some(id),
+        TargetRef::Player(_) => None,
+    })
+    // CR 508.1g + CR 702.154b + CR 701.26a: enlisting taps a non-attacking
+    // creature to pay an optional attack cost, so a "can't become tapped"
+    // creature (e.g. one goaded by Ood Sphere's Red-Eye) is ineligible. Unlike
+    // the attacker-declaration tap (CR 508.1f), this tap IS a cost, so the
+    // declaration exemption does not apply. Mirrors the convoke/crew auto-tap
+    // gate — the single `object_cant_tap` authority filters at the offer layer.
+    .filter(|&id| !super::restrictions::object_cant_tap(state, id))
+    .collect()
+}
+
+/// CR 701.43a + CR 701.43c: Pay the optional exert cost for an attacking
+/// creature — record it as exerted this turn, add the "doesn't untap during your
+/// next untap step" effect (mirroring the `AbilityCost::Exert` cost path), and
+/// emit `CreatureExerted` so the linked "when you do" trigger (CR 701.43d)
+/// fires. No-op if the creature has left the battlefield since attackers were
+/// declared.
+pub(super) fn apply_attack_exert(
+    state: &mut GameState,
+    attacker: ObjectId,
+    events: &mut Vec<GameEvent>,
+) {
+    let Some(obj) = state.objects.get(&attacker) else {
+        return;
+    };
+    if obj.zone != Zone::Battlefield {
+        return;
+    }
+    let controller = obj.controller;
+    state.exerted_this_turn.insert(attacker);
+    state.add_transient_continuous_effect(
+        attacker,
+        controller,
+        crate::types::ability::Duration::UntilNextStepOf {
+            step: Phase::Untap,
+            player: crate::types::ability::PlayerScope::Controller,
+        },
+        crate::types::ability::TargetFilter::SpecificObject { id: attacker },
+        vec![
+            crate::types::ability::ContinuousModification::AddStaticMode {
+                mode: crate::types::statics::StaticMode::CantUntap,
+            },
+        ],
+        None,
+    );
+    let exerted = GameEvent::CreatureExerted {
+        object_id: attacker,
+    };
+    // Buffer for deferred trigger matching (CR 508.2) and surface to the
+    // per-action event stream for the frontend.
+    state.pending_attack_trigger_events.push(exerted.clone());
+    events.push(exerted);
+}
+
+/// CR 702.154a-c: Pay one Enlist optional attack cost by tapping an eligible
+/// creature. The normal tap event and the linked Enlist event are both buffered
+/// for CR 508.2 trigger processing after all attack costs are chosen.
+pub(super) fn apply_attack_enlist(
+    state: &mut GameState,
+    attacker: ObjectId,
+    tapped: ObjectId,
+    events: &mut Vec<GameEvent>,
+) -> Result<(), EngineError> {
+    if !enlist_eligible_targets(state, attacker).contains(&tapped) {
+        return Err(EngineError::InvalidAction(format!(
+            "{tapped:?} is not eligible to be enlisted"
+        )));
+    }
+
+    let Some(obj) = state.objects.get(&tapped) else {
+        return Ok(());
+    };
+    let snapshot = CostPaidObjectSnapshot {
+        object_id: tapped,
+        lki: obj.snapshot_public_characteristics(),
+    };
+
+    // CR 508.1g + CR 702.154b + CR 701.26a: the enlisted creature is tapped to
+    // pay an optional attack cost, so route it through the single tap-cost
+    // authority (`tap_permanent_for_cost`) that refuses a "can't become tapped"
+    // creature. This is a defensive backstop behind `enlist_eligible_targets`,
+    // which already excludes such creatures at the offer layer. Unlike the
+    // attacker-declaration tap (CR 508.1f), this tap IS a cost and is not exempt.
+    let tap_event_start = events.len();
+    crate::game::restrictions::tap_permanent_for_cost(state, tapped, events)?;
+
+    let enlisted = GameEvent::CreatureEnlisted {
+        attacker,
+        tapped,
+        tapped_snapshot: Box::new(snapshot),
+    };
+    // CR 508.2: buffer the tap event(s) alongside the linked Enlist event for
+    // deferred trigger matching after all attack costs are chosen.
+    state
+        .pending_attack_trigger_events
+        .extend_from_slice(&events[tap_event_start..]);
+    state.pending_attack_trigger_events.push(enlisted.clone());
+    events.push(enlisted);
+    Ok(())
+}
+
+fn process_declaration_triggers_with_delayed_phase(
+    state: &mut GameState,
+    trigger_events: &[GameEvent],
+    events: &mut Vec<GameEvent>,
+) -> Option<WaitingFor> {
+    let waiting_before = state.waiting_for.clone();
+    let mut batch_events = vec![GameEvent::PhaseChanged { phase: state.phase }];
+    batch_events.extend_from_slice(trigger_events);
+    let outcome = triggers::process_triggers_with_delayed_phase_events(
+        state,
+        &batch_events,
+        &batch_events,
+        events,
+    );
+    outcome.prompt.filter(|prompt| {
+        matches!(prompt, WaitingFor::OrderTriggers { .. }) || *prompt != waiting_before
+    })
+}
+
+/// Post-declaration tail of `handle_declare_attackers`, shared with the exert
+/// prompt resumption: process attack/exert triggers, then route to trigger
+/// ordering, pending trigger-target selection, the no-attackers end-of-combat
+/// path, or priority.
+pub(super) fn finish_declare_attackers(
+    state: &mut GameState,
+    events: &mut Vec<GameEvent>,
+    attacks_empty: bool,
+) -> Result<WaitingFor, EngineError> {
+    // CR 508.2: process the buffered declaration events together with any
+    // `CreatureExerted` events from the exert sub-step. In the common (no-exert)
+    // path the buffer is empty and the per-action `events` slice carries the
+    // declaration events.
+    let deferred = std::mem::take(&mut state.pending_attack_trigger_events);
+    if deferred.is_empty() {
+        let trigger_events = events.clone();
+        if let Some(prompt) =
+            process_declaration_triggers_with_delayed_phase(state, &trigger_events, events)
+        {
+            return Ok(prompt);
+        }
+    } else {
+        if let Some(prompt) =
+            process_declaration_triggers_with_delayed_phase(state, &deferred, events)
+        {
+            return Ok(prompt);
+        }
+    }
+    // CR 603.3b (#531): if process_triggers paused on OrderTriggers (the active
+    // player has 2+ simultaneous triggers awaiting their ordering choice),
+    // surface that prompt instead of overwriting it with Priority.
     if matches!(state.waiting_for, WaitingFor::OrderTriggers { .. }) {
         return Ok(state.waiting_for.clone());
     }
@@ -53,7 +332,7 @@ pub(super) fn handle_declare_attackers(
         return Ok(waiting_for);
     }
 
-    if attacks.is_empty() {
+    if attacks_empty {
         state.phase = Phase::EndCombat;
         events.push(GameEvent::PhaseChanged {
             phase: Phase::EndCombat,
@@ -144,8 +423,8 @@ pub(super) fn handle_pay_combat_tax(
             total_mana_value: total_cost.mana_value(),
         });
         match pending {
-            CombatTaxPending::Attack { attacks } => {
-                return resume_declare_attackers(state, &attacks, events);
+            CombatTaxPending::Attack { attacks, bands } => {
+                return resume_declare_attackers(state, &attacks, &bands, events);
             }
             CombatTaxPending::Block { assignments } => {
                 return resume_declare_blockers(state, player, &assignments, events);
@@ -157,16 +436,34 @@ pub(super) fn handle_pay_combat_tax(
     let taxed: std::collections::HashSet<ObjectId> =
         per_creature.iter().map(|(id, _)| *id).collect();
     match pending {
-        CombatTaxPending::Attack { attacks } => {
+        CombatTaxPending::Attack { attacks, bands } => {
             let filtered: Vec<(ObjectId, AttackTarget)> = attacks
                 .into_iter()
                 .filter(|(id, _)| !taxed.contains(id))
+                .collect();
+            // CR 702.22f: a creature dropped from the attack (because its tax was
+            // declined) is also removed from its band. Filter the taxed members
+            // out of every band. CR 702.22c: a band must still contain at least
+            // one creature with banding to remain a band — drop any band that no
+            // longer does (this also discards bands left empty). Survivors of a
+            // dissolved band stay in `filtered` as ungrouped individual attackers.
+            let filtered_bands: Vec<Vec<ObjectId>> = bands
+                .into_iter()
+                .map(|band| {
+                    band.into_iter()
+                        .filter(|id| !taxed.contains(id))
+                        .collect::<Vec<_>>()
+                })
+                .filter(|band| {
+                    band.iter()
+                        .any(|&id| crate::game::combat::has_banding(state, id))
+                })
                 .collect();
             events.push(GameEvent::CombatTaxDeclined {
                 player,
                 dropped: taxed.iter().copied().collect(),
             });
-            resume_declare_attackers(state, &filtered, events)
+            resume_declare_attackers(state, &filtered, &filtered_bands, events)
         }
         CombatTaxPending::Block { assignments } => {
             let filtered: Vec<(ObjectId, ObjectId)> = assignments
@@ -186,15 +483,26 @@ pub(super) fn handle_pay_combat_tax(
 fn resume_declare_attackers(
     state: &mut GameState,
     attacks: &[(ObjectId, AttackTarget)],
+    bands: &[Vec<ObjectId>],
     events: &mut Vec<GameEvent>,
 ) -> Result<WaitingFor, EngineError> {
     if attacks.is_empty() {
         // CR 508.8: No creatures declared as attackers — skip to end of combat.
         return handle_empty_attackers(state, events);
     }
-    super::combat::declare_attackers(state, attacks, events).map_err(EngineError::InvalidAction)?;
+    // CR 702.22c + CR 702.22h: re-run the band-aware declaration so `band_id` is
+    // stamped on the attacking-band members and block propagation groups them
+    // (this resume path previously dropped bands, leaving members individually
+    // blockable behind a combat-tax static like Ghostly Prison).
+    super::combat::declare_attackers_with_bands(state, attacks, bands, events)
+        .map_err(EngineError::InvalidAction)?;
 
-    triggers::process_triggers(state, events);
+    let trigger_events = events.clone();
+    if let Some(prompt) =
+        process_declaration_triggers_with_delayed_phase(state, &trigger_events, events)
+    {
+        return Ok(prompt);
+    }
     // CR 603.3b (#531): process_triggers may have paused on OrderTriggers
     // for a player with 2+ simultaneous triggers. Propagate that prompt
     // instead of overwriting it with Priority below.
@@ -441,6 +749,78 @@ pub(super) fn handle_assign_combat_damage(
     Ok(WaitingFor::Priority { player })
 }
 
+/// CR 510.1d + CR 702.22k: Record the active player's division of a banded
+/// blocker's combat damage among the attackers it's blocking, then re-enter the
+/// combat-damage resolver.
+///
+/// Validation (CR 510.1e — the total assignment is checked, not individual
+/// assignments): the submitted amounts must sum to the blocker's combat power,
+/// and every target must be an attacker the blocker is actually blocking. There
+/// is NO lethal requirement — a blocker divides its damage freely (CR 510.1d).
+///
+/// The server bypasses its legality-enumeration gate for this state
+/// (`accepts_freeform_blocker_damage_assignment`), so this handler is the real
+/// validation boundary.
+pub(super) fn handle_assign_blocker_damage(
+    state: &mut GameState,
+    _player: PlayerId,
+    blocker_id: ObjectId,
+    total_damage: u32,
+    attackers: &[ObjectId],
+    assignments: &[(ObjectId, u32)],
+    events: &mut Vec<GameEvent>,
+) -> Result<WaitingFor, EngineError> {
+    // CR 510.1e: the total damage assigned must equal the blocker's combat power.
+    let assigned_total: u32 = assignments.iter().map(|(_, amount)| *amount).sum();
+    if assigned_total != total_damage {
+        return Err(EngineError::InvalidAction(format!(
+            "Blocker {:?} damage assignment total {} != combat power {}",
+            blocker_id, assigned_total, total_damage
+        )));
+    }
+
+    // CR 510.1d: every target must be an attacker this blocker is blocking.
+    for (attacker_id, _) in assignments {
+        if !attackers.contains(attacker_id) {
+            return Err(EngineError::InvalidAction(format!(
+                "{:?} is not an attacker blocked by {:?}",
+                attacker_id, blocker_id
+            )));
+        }
+    }
+
+    if let Some(combat) = &mut state.combat {
+        // Record into the per-sub-step resume-skip key so the re-entered blocker
+        // loop in `collect_damage_assignments` skips this blocker. A non-empty
+        // entry is what the skip check keys on; mirror the auto-split bookkeeping.
+        let mut recorded: Vec<DamageAssignment> = Vec::new();
+        for (attacker_id, amount) in assignments {
+            if *amount > 0 {
+                let da = DamageAssignment {
+                    target: DamageTarget::Object(*attacker_id),
+                    amount: *amount,
+                };
+                combat.pending_damage.push((blocker_id, da.clone()));
+                recorded.push(da);
+            }
+        }
+        // Guard against an all-zero division (would otherwise leave the skip key
+        // empty and re-prompt forever); total_damage > 0 is guaranteed by the
+        // power==0 skip in `collect_damage_assignments`, and the total-equality
+        // check above ensures `recorded` is non-empty here.
+        combat.damage_assignments.insert(blocker_id, recorded);
+    }
+
+    if let Some(waiting_for) = super::combat_damage::resolve_combat_damage(state, events) {
+        return Ok(waiting_for);
+    }
+
+    priority::reset_priority(state);
+    Ok(WaitingFor::Priority {
+        player: state.active_player,
+    })
+}
+
 /// CR 508.8: If no creatures are declared as attackers, skip declare blockers and combat damage steps.
 ///
 /// This helper is intentionally asymmetric with `handle_empty_blockers`:
@@ -458,7 +838,12 @@ pub(super) fn handle_empty_attackers(
 ) -> Result<WaitingFor, EngineError> {
     super::combat::declare_attackers(state, &[], events).map_err(EngineError::InvalidAction)?;
 
-    triggers::process_triggers(state, events);
+    let trigger_events = events.clone();
+    if let Some(prompt) =
+        process_declaration_triggers_with_delayed_phase(state, &trigger_events, events)
+    {
+        return Ok(prompt);
+    }
     // CR 603.3b (#531): if process_triggers paused on OrderTriggers (the
     // active player has 2+ simultaneous triggers awaiting their ordering
     // choice), surface that prompt instead of overwriting it with Priority.
@@ -514,7 +899,11 @@ fn next_blocker_or_finish_declaration(
         .as_mut()
         .map(|combat| std::mem::take(&mut combat.pending_blocker_declaration_events))
         .unwrap_or_default();
-    triggers::process_triggers(state, &blocker_events);
+    if let Some(prompt) =
+        process_declaration_triggers_with_delayed_phase(state, &blocker_events, _events)
+    {
+        return Ok(prompt);
+    }
     // CR 603.3b (#531): if process_triggers paused on OrderTriggers (the
     // active player has 2+ simultaneous triggers awaiting their ordering
     // choice), surface that prompt instead of overwriting it with Priority.
@@ -596,6 +985,211 @@ mod tests {
         obj.counters
             .insert(crate::types::counter::CounterType::Loyalty, loyalty);
         id
+    }
+
+    fn add_enlist_trigger(state: &mut GameState, attacker: ObjectId) {
+        use crate::types::ability::{
+            AbilityDefinition, AbilityKind, ObjectScope, PtValue, QuantityExpr, QuantityRef,
+            TargetFilter,
+        };
+        use crate::types::triggers::TriggerMode;
+
+        let pump = AbilityDefinition::new(
+            AbilityKind::Spell,
+            crate::types::ability::Effect::Pump {
+                power: PtValue::Quantity(QuantityExpr::Ref {
+                    qty: QuantityRef::Power {
+                        scope: ObjectScope::Anaphoric,
+                    },
+                }),
+                toughness: PtValue::Fixed(0),
+                target: TargetFilter::SelfRef,
+            },
+        );
+        let trigger = crate::types::ability::TriggerDefinition::new(TriggerMode::Enlisted)
+            .valid_card(TargetFilter::SelfRef)
+            .execute(pump);
+        state
+            .objects
+            .get_mut(&attacker)
+            .unwrap()
+            .trigger_definitions
+            .push(trigger);
+        crate::types::game_state::TriggerIndex::rebuild_from_battlefield(state);
+    }
+
+    fn declare_single_enlist_attacker(state: &mut GameState, attacker: ObjectId) -> WaitingFor {
+        let attacks = vec![(attacker, AttackTarget::Player(PlayerId(1)))];
+        let mut events = Vec::new();
+        handle_declare_attackers(state, PlayerId(0), &attacks, &[], &mut events)
+            .expect("declare attackers")
+    }
+
+    #[test]
+    fn enlist_prompts_before_priority_and_stack() {
+        let mut state = setup();
+        let attacker = create_creature(&mut state, PlayerId(0), "Enlister", 2, 2);
+        let helper = create_creature(&mut state, PlayerId(0), "Helper", 3, 3);
+        add_enlist_trigger(&mut state, attacker);
+
+        let waiting = declare_single_enlist_attacker(&mut state, attacker);
+
+        assert!(
+            matches!(
+                waiting,
+                WaitingFor::EnlistChoice {
+                    attacker: id,
+                    ref eligible,
+                    ..
+                } if id == attacker && eligible.contains(&helper)
+            ),
+            "declare attackers must pause for Enlist before priority, got {waiting:?}"
+        );
+        assert!(
+            state.stack.is_empty(),
+            "no Enlist trigger is stacked before the cost choice"
+        );
+        assert!(
+            !state.objects[&helper].tapped,
+            "the enlisted creature is not tapped until the Enlist choice is paid"
+        );
+    }
+
+    /// CR 508.1g + CR 701.26a: a "can't become tapped" creature (e.g. one goaded
+    /// by Ood Sphere's Red-Eye) can't pay the Enlist tap cost, so it must be
+    /// excluded at the offer layer. Unlike attacker declaration (CR 508.1f), the
+    /// enlist tap IS a cost, so the declaration exemption does not apply.
+    #[test]
+    fn enlist_excludes_cant_tap_creature() {
+        use crate::types::statics::StaticMode;
+        let mut state = setup();
+        let attacker = create_creature(&mut state, PlayerId(0), "Enlister", 2, 2);
+        let helper = create_creature(&mut state, PlayerId(0), "Goaded Helper", 3, 3);
+        add_enlist_trigger(&mut state, attacker);
+
+        // Reach-guard: without the restriction the helper IS an eligible target,
+        // proving the exclusion below is not vacuous.
+        assert!(
+            enlist_eligible_targets(&state, attacker).contains(&helper),
+            "plain helper must be enlist-eligible before the CantTap grant"
+        );
+
+        // Grant a printed CantTap static and re-run layers so it is active.
+        {
+            let obj = state.objects.get_mut(&helper).unwrap();
+            let def = crate::types::ability::StaticDefinition::new(StaticMode::CantTap)
+                .affected(crate::types::ability::TargetFilter::SelfRef);
+            obj.static_definitions.push(def.clone());
+            std::sync::Arc::make_mut(&mut obj.base_static_definitions).push(def);
+        }
+        crate::game::layers::evaluate_layers(&mut state);
+
+        assert!(
+            !enlist_eligible_targets(&state, attacker).contains(&helper),
+            "a can't-become-tapped creature must not be offered as an Enlist target"
+        );
+
+        // The declare-attackers flow must not pause on an EnlistChoice when the
+        // only helper can't become tapped, and the helper stays untapped.
+        let waiting = declare_single_enlist_attacker(&mut state, attacker);
+        assert!(
+            !matches!(waiting, WaitingFor::EnlistChoice { .. }),
+            "no Enlist prompt when the only helper can't become tapped, got {waiting:?}"
+        );
+        assert!(
+            !state.objects[&helper].tapped,
+            "the can't-become-tapped helper must remain untapped"
+        );
+    }
+
+    #[test]
+    fn decline_enlist_taps_nothing_and_stacks_no_linked_trigger() {
+        let mut state = setup();
+        let attacker = create_creature(&mut state, PlayerId(0), "Enlister", 2, 2);
+        let helper = create_creature(&mut state, PlayerId(0), "Helper", 3, 3);
+        add_enlist_trigger(&mut state, attacker);
+        state.waiting_for = declare_single_enlist_attacker(&mut state, attacker);
+
+        let result = crate::game::engine::apply(
+            &mut state,
+            PlayerId(0),
+            crate::types::actions::GameAction::ChooseEnlist { target: None },
+        )
+        .expect("decline enlist");
+
+        assert!(matches!(result.waiting_for, WaitingFor::Priority { .. }));
+        assert!(!state.objects[&helper].tapped);
+        assert!(state.stack.is_empty());
+        assert!(
+            !result
+                .events
+                .iter()
+                .any(|event| matches!(event, GameEvent::CreatureEnlisted { .. })),
+            "declining Enlist must not fire the linked trigger"
+        );
+    }
+
+    #[test]
+    fn paid_enlist_seeds_tapped_creature_lki_on_linked_trigger() {
+        let mut state = setup();
+        let attacker = create_creature(&mut state, PlayerId(0), "Enlister", 2, 2);
+        let helper = create_creature(&mut state, PlayerId(0), "Helper", 3, 3);
+        add_enlist_trigger(&mut state, attacker);
+        state.waiting_for = declare_single_enlist_attacker(&mut state, attacker);
+
+        crate::game::engine::apply(
+            &mut state,
+            PlayerId(0),
+            crate::types::actions::GameAction::ChooseEnlist {
+                target: Some(helper),
+            },
+        )
+        .expect("pay enlist");
+
+        let ability = match &state.stack.back().expect("Enlist trigger on stack").kind {
+            crate::types::game_state::StackEntryKind::TriggeredAbility { ability, .. } => ability,
+            other => panic!("expected triggered ability, got {other:?}"),
+        };
+        let snapshot = ability
+            .effect_context_object
+            .as_ref()
+            .expect("Enlist trigger must carry tapped creature LKI");
+        assert_eq!(snapshot.object_id, helper);
+        assert_eq!(snapshot.lki.power, Some(3));
+    }
+
+    #[test]
+    fn multiple_enlist_instances_offer_independent_choices() {
+        let mut state = setup();
+        let attacker = create_creature(&mut state, PlayerId(0), "Enlister", 2, 2);
+        let first = create_creature(&mut state, PlayerId(0), "First Helper", 3, 3);
+        let second = create_creature(&mut state, PlayerId(0), "Second Helper", 4, 4);
+        add_enlist_trigger(&mut state, attacker);
+        add_enlist_trigger(&mut state, attacker);
+        state.waiting_for = declare_single_enlist_attacker(&mut state, attacker);
+
+        let result = crate::game::engine::apply(
+            &mut state,
+            PlayerId(0),
+            crate::types::actions::GameAction::ChooseEnlist {
+                target: Some(first),
+            },
+        )
+        .expect("pay first enlist");
+
+        assert!(state.objects[&first].tapped);
+        assert!(
+            matches!(
+                result.waiting_for,
+                WaitingFor::EnlistChoice {
+                    attacker: id,
+                    ref eligible,
+                    ..
+                } if id == attacker && eligible.contains(&second) && !eligible.contains(&first)
+            ),
+            "second Enlist instance must offer a fresh eligible set, got {:?}",
+            result.waiting_for
+        );
     }
 
     #[test]
@@ -901,7 +1495,8 @@ mod tests {
             .add(ManaUnit {
                 color: ManaType::White,
                 source_id: ObjectId(0),
-                snow: false,
+                pip_id: crate::types::mana::ManaPipId(0),
+                supertype: None,
                 source_could_produce_two_or_more_colors: false,
                 restrictions: Vec::new(),
                 grants: vec![],
@@ -916,7 +1511,7 @@ mod tests {
 
         // Step 1: declare-attackers must pause for the tax (no deadlock).
         let mut events = Vec::new();
-        let waiting = handle_declare_attackers(&mut state, PlayerId(0), &attacks, &mut events)
+        let waiting = handle_declare_attackers(&mut state, PlayerId(0), &attacks, &[], &mut events)
             .expect("declare-attackers must yield WaitingFor::CombatTaxPayment, not error");
         let WaitingFor::CombatTaxPayment {
             player,
@@ -977,7 +1572,8 @@ mod tests {
                 .add(ManaUnit {
                     color: ManaType::Colorless,
                     source_id: ObjectId(0),
-                    snow: false,
+                    pip_id: crate::types::mana::ManaPipId(0),
+                    supertype: None,
                     source_could_produce_two_or_more_colors: false,
                     restrictions: Vec::new(),
                     grants: vec![],
@@ -988,7 +1584,7 @@ mod tests {
 
         let attacks = vec![(a1, AttackTarget::Player(PlayerId(1)))];
         let mut events = Vec::new();
-        let waiting = handle_declare_attackers(&mut state, PlayerId(0), &attacks, &mut events)
+        let waiting = handle_declare_attackers(&mut state, PlayerId(0), &attacks, &[], &mut events)
             .expect("declare-attackers must yield CombatTaxPayment");
         assert!(matches!(waiting, WaitingFor::CombatTaxPayment { .. }));
 

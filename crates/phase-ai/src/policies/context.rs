@@ -1,8 +1,11 @@
 use engine::ai_support::{AiDecisionContext, CandidateAction};
 use engine::game::game_object::GameObject;
-use engine::types::ability::{AbilityDefinition, Effect, ResolvedAbility};
+use engine::game::targeting::find_legal_targets;
+use engine::types::ability::{AbilityDefinition, Effect, ResolvedAbility, TargetFilter, TargetRef};
 use engine::types::actions::GameAction;
+use engine::types::card_type::CoreType;
 use engine::types::game_state::{GameState, WaitingFor};
+use engine::types::identifiers::ObjectId;
 use engine::types::player::PlayerId;
 
 use crate::cast_facts::{
@@ -10,6 +13,23 @@ use crate::cast_facts::{
 };
 use crate::config::{AiConfig, PolicyPenalties};
 use crate::eval::{strategic_intent, StrategicIntent};
+#[cfg(test)]
+use engine::types::game_state::CastPaymentMode;
+
+/// Position of the node being scored within the current AI decision's search
+/// tree. `Root` is the node the AI will actually commit an action at
+/// (`score_candidates_core`); `Lookahead` is any hypothetical node inside beam
+/// alpha-beta or rollout. Expensive policies (board-wide affordability sweeps,
+/// `find_legal_targets`, `SimulationFilter` clones) should run their full
+/// analysis only at `Root` via [`PolicyContext::at_root`] and return neutral in
+/// lookahead, where the resulting-state eval already accounts for the action.
+/// Mirrors the `deadline`/projection-budget self-gating precedent, but is a
+/// per-node field (not an `AiContext` value) because depth varies per node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchDepth {
+    Root,
+    Lookahead,
+}
 
 pub struct PolicyContext<'a> {
     pub state: &'a GameState,
@@ -19,6 +39,24 @@ pub struct PolicyContext<'a> {
     pub config: &'a AiConfig,
     pub context: &'a crate::context::AiContext,
     pub cast_facts: Option<CastFacts<'a>>,
+    pub search_depth: SearchDepth,
+}
+
+/// Batch-constant scoring inputs for [`super::registry::PolicyRegistry::priors`] —
+/// every value that stays fixed across all candidates in a single `priors`
+/// call, as opposed to `candidates` itself (what's being scored). Grouping
+/// these keeps `priors` under clippy's argument-count limit; every field
+/// flows unchanged into the per-candidate [`PolicyContext`] built inside the
+/// scoring loop. `search_depth` stays a distinct field here (not folded into
+/// `AiContext`) for the same reason it's distinct on `PolicyContext`: it
+/// varies per search node, unlike the ambient `AiContext`.
+pub struct PriorsEnv<'a> {
+    pub state: &'a GameState,
+    pub decision: &'a AiDecisionContext,
+    pub ai_player: PlayerId,
+    pub config: &'a AiConfig,
+    pub context: &'a crate::context::AiContext,
+    pub search_depth: SearchDepth,
 }
 
 impl<'a> PolicyContext<'a> {
@@ -56,6 +94,14 @@ impl<'a> PolicyContext<'a> {
             .deadline
             .remaining()
             .is_none_or(|r| r.as_millis() >= floor)
+    }
+
+    /// True when this is the node the AI will commit an action at. Policies whose
+    /// only correctness role is stopping a *committed* action (and whose analysis
+    /// is board-wide/expensive) should gate that work behind this and return
+    /// neutral otherwise — the lookahead eval already dominates no-op lines.
+    pub fn at_root(&self) -> bool {
+        matches!(self.search_depth, SearchDepth::Root)
     }
 
     pub fn source_object(&self) -> Option<&'a GameObject> {
@@ -148,6 +194,26 @@ impl<'a> PolicyContext<'a> {
         }
         effect_profile_for_action(self.state, &self.candidate.action, self.ai_player)
     }
+
+    /// CR 702.11 / 702.16 / 702.18: True when `filter` has at least one legal
+    /// opponent-controlled creature target, per the engine's targeting legality.
+    pub(crate) fn has_legal_opponent_creature_target(
+        &self,
+        filter: &TargetFilter,
+        source_id: ObjectId,
+        mut is_relevant: impl FnMut(ObjectId) -> bool,
+    ) -> bool {
+        find_legal_targets(self.state, filter, self.ai_player, source_id)
+            .into_iter()
+            .any(|target| match target {
+                TargetRef::Object(id) => self.state.objects.get(&id).is_some_and(|object| {
+                    object.controller != self.ai_player
+                        && object.card_types.core_types.contains(&CoreType::Creature)
+                        && is_relevant(id)
+                }),
+                TargetRef::Player(_) => false,
+            })
+    }
 }
 
 /// Walk a ResolvedAbility's sub_ability chain, collecting all effects.
@@ -210,6 +276,7 @@ mod tests {
                     legal_targets: vec![],
                     optional: false,
                 }],
+                mode_labels: Vec::new(),
                 selection: Default::default(),
             },
             candidates: Vec::new(),
@@ -231,6 +298,7 @@ mod tests {
             config: &config,
             context: &crate::context::AiContext::empty(&config.weights),
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
 
         let effects = ctx.effects();
@@ -273,6 +341,7 @@ mod tests {
                     legal_targets: vec![],
                     optional: false,
                 }],
+                mode_labels: Vec::new(),
                 selection: Default::default(),
             },
             candidates: Vec::new(),
@@ -292,6 +361,7 @@ mod tests {
             config: &config,
             context: &crate::context::AiContext::empty(&config.weights),
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
 
         let effects = ctx.effects();
@@ -344,6 +414,8 @@ mod tests {
                 object_id: spell_id,
                 card_id,
                 targets: Vec::new(),
+
+                payment_mode: CastPaymentMode::Auto,
             },
             metadata: ActionMetadata {
                 actor: Some(PlayerId(0)),
@@ -358,6 +430,7 @@ mod tests {
             config: &config,
             context: &crate::context::AiContext::empty(&config.weights),
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
 
         let effects = ctx.effects();
@@ -415,6 +488,8 @@ mod tests {
                 object_id,
                 card_id: CardId(9),
                 targets: Vec::new(),
+
+                payment_mode: CastPaymentMode::Auto,
             },
             metadata: ActionMetadata {
                 actor: Some(PlayerId(0)),
@@ -429,6 +504,7 @@ mod tests {
             config: &config,
             context: &crate::context::AiContext::empty(&config.weights),
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
 
         assert_eq!(ctx.effects().len(), 1);
@@ -452,6 +528,7 @@ mod tests {
             config,
             context,
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         }
     }
 
@@ -486,6 +563,7 @@ mod tests {
                     legal_targets: vec![],
                     optional: false,
                 }],
+                mode_labels: Vec::new(),
                 selection: Default::default(),
             },
             candidates: Vec::new(),
@@ -536,6 +614,7 @@ mod tests {
                     legal_targets: vec![],
                     optional: false,
                 }],
+                mode_labels: Vec::new(),
                 selection: Default::default(),
             },
             candidates: Vec::new(),
@@ -585,6 +664,7 @@ mod tests {
                     legal_targets: vec![],
                     optional: false,
                 }],
+                mode_labels: Vec::new(),
                 selection: Default::default(),
             },
             candidates: Vec::new(),

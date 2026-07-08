@@ -1,6 +1,8 @@
 use engine::parser::oracle::{keyword_display_name, parse_oracle_text};
 use engine::types::ability::{
-    ChosenSubtypeKind, ContinuousModification, ControllerRef, Effect, TargetFilter, TypeFilter,
+    ChosenSubtypeKind, ContinuousModification, ControllerRef, DamageModification,
+    DamageTargetFilter, DamageTargetPlayerScope, Effect, FilterProp, StaticCondition, TargetFilter,
+    TypeFilter,
 };
 use engine::types::keywords::Keyword;
 use engine::types::statics::StaticMode;
@@ -276,6 +278,136 @@ fn xenograft_full_oracle_applies_chosen_type_to_creatures_you_control() {
 }
 
 #[test]
+fn roaming_throne_self_static_uses_creature_chosen_type() {
+    let result = parse(
+        "As Roaming Throne enters, choose a creature type.\nRoaming Throne is the chosen type in addition to its other types.\nIf a triggered ability of another creature you control of the chosen type triggers, it triggers an additional time.",
+        "Roaming Throne",
+        &[],
+        &["Artifact", "Creature"],
+        &["Golem"],
+    );
+
+    assert!(result.statics.iter().any(|static_def| {
+        static_def.modifications.iter().any(|modification| {
+            matches!(
+                modification,
+                ContinuousModification::AddChosenSubtype {
+                    kind: ChosenSubtypeKind::CreatureType
+                }
+            )
+        })
+    }));
+}
+
+#[test]
+fn thran_portal_self_static_uses_basic_land_chosen_type() {
+    let result = parse(
+        "This land enters tapped unless you control two or fewer other lands.\nAs this land enters, choose a basic land type.\nThis land is the chosen type in addition to its other types.\nMana abilities of this land cost an additional 1 life to activate.",
+        "Thran Portal",
+        &[],
+        &["Land"],
+        &[],
+    );
+
+    assert!(result.statics.iter().any(|static_def| {
+        static_def.modifications.iter().any(|modification| {
+            matches!(
+                modification,
+                ContinuousModification::AddChosenSubtype {
+                    kind: ChosenSubtypeKind::BasicLandType
+                }
+            )
+        })
+    }));
+}
+
+#[test]
+fn steely_resolve_grants_shroud_keyword_to_chosen_type_creatures() {
+    let result = parse(
+        "As Steely Resolve enters, choose a creature type.\nCreatures of the chosen type have shroud.",
+        "Steely Resolve",
+        &[],
+        &["Enchantment"],
+        &[],
+    );
+
+    let static_def = result
+        .statics
+        .iter()
+        .find(|static_def| {
+            static_def.modifications.iter().any(|modification| {
+                matches!(
+                    modification,
+                    ContinuousModification::AddKeyword {
+                        keyword: Keyword::Shroud
+                    }
+                )
+            })
+        })
+        .expect("expected chosen-type creatures to gain shroud as a keyword");
+
+    assert_eq!(static_def.mode, StaticMode::Continuous);
+    match &static_def.affected {
+        Some(TargetFilter::Typed(filter)) => {
+            assert!(filter.type_filters.contains(&TypeFilter::Creature));
+            assert!(filter
+                .properties
+                .contains(&FilterProp::IsChosenCreatureType));
+        }
+        other => panic!("expected chosen-type creature filter, got {other:?}"),
+    }
+}
+
+#[test]
+fn stuffy_doll_damage_trigger_uses_source_chosen_player() {
+    let result = parse(
+        "As Stuffy Doll enters, choose a player.\nIndestructible\nWhenever Stuffy Doll is dealt damage, it deals that much damage to the chosen player.",
+        "Stuffy Doll",
+        &[Keyword::Indestructible],
+        &["Artifact", "Creature"],
+        &["Toy"],
+    );
+
+    let trigger = result
+        .triggers
+        .iter()
+        .find_map(|trigger| trigger.execute.as_deref())
+        .expect("expected damage trigger");
+
+    match trigger.effect.as_ref() {
+        Effect::DealDamage {
+            target: TargetFilter::SourceChosenPlayer,
+            ..
+        } => {}
+        other => panic!("expected damage to source chosen player, got {other:?}"),
+    }
+}
+
+#[test]
+fn sawhorn_nemesis_damage_replacement_scopes_to_source_chosen_player() {
+    let result = parse(
+        "As Sawhorn Nemesis enters, choose a player.\nIf a source would deal damage to the chosen player or a permanent they control, it deals double that damage instead.",
+        "Sawhorn Nemesis",
+        &[],
+        &["Creature"],
+        &["Dinosaur"],
+    );
+
+    let replacement = result
+        .replacements
+        .iter()
+        .find(|replacement| replacement.damage_modification == Some(DamageModification::Double))
+        .expect("expected double-damage replacement");
+
+    assert_eq!(
+        replacement.damage_target_filter,
+        Some(DamageTargetFilter::PlayerOrPermanentsControlledBy {
+            player: DamageTargetPlayerScope::SourceChosenPlayer,
+        })
+    );
+}
+
+#[test]
 fn snapshot_goblin_chainwhirler() {
     let result = parse(
         "First strike\nWhen Goblin Chainwhirler enters the battlefield, it deals 1 damage to each opponent and each creature and planeswalker they control.",
@@ -388,7 +520,7 @@ fn krosan_verge_lowers_to_dual_search_choice() {
                     engine::types::zones::Zone::Battlefield,
                     "ChangeZone destination should be Battlefield",
                 );
-                assert!(*enter_tapped, "found lands should enter tapped");
+                assert!(enter_tapped.is_tapped(), "found lands should enter tapped");
                 "ChangeZone"
             }
             Effect::Shuffle { .. } => "Shuffle",
@@ -544,4 +676,144 @@ fn snapshot_harold_and_bob_first_numens() {
         &["Troll", "Warrior"],
     );
     insta::assert_json_snapshot!(result);
+}
+
+#[test]
+fn inverted_as_long_as_flash_grant_attaches_condition() {
+    // CR 601.3b + CR 702.8a + CR 611.3a: The inverted conditional flash-grant
+    // "As long as <cond>, you may cast [type] spells as though they had flash"
+    // must lower to a `CastWithKeyword { Flash }` static carrying the condition
+    // — not silently collapse into a bare conditionless Continuous fallback.
+    let result = parse(
+        "As long as it's your turn, you may cast creature spells as though they had flash.",
+        "Test Inverted Flash Grant",
+        &[],
+        &["Enchantment"],
+        &[],
+    );
+
+    let static_def = result
+        .statics
+        .iter()
+        .find(|static_def| {
+            matches!(
+                static_def.mode,
+                StaticMode::CastWithKeyword {
+                    keyword: Keyword::Flash
+                }
+            )
+        })
+        .expect("expected inverted flash grant to lower to CastWithKeyword { Flash }");
+
+    // "it's your turn" is recognized by parse_static_condition → DuringYourTurn,
+    // not just a generic Unrecognized fallback.
+    assert!(
+        matches!(static_def.condition, Some(StaticCondition::DuringYourTurn)),
+        "expected DuringYourTurn condition on the CastWithKeyword static, \
+         got condition: {:#?}",
+        static_def.condition
+    );
+}
+
+/// CR 111.3 + CR 111.4: a created token's quoted inline ability text is the
+/// token's own "text", not a static clause of the host spell. Before the fix,
+/// the Priority-7 static gate matched a static-shaped marker (e.g. "can't
+/// block", "can't be blocked") INSIDE the quoted token ability and routed the
+/// whole spell to the static parser, producing `abilities: []` and a bogus
+/// static. Masking double-quoted spans for spell-line static classification
+/// restores the spell's own effect chain (>=1 ability, no bogus static).
+#[test]
+fn token_grant_spells_no_longer_misroute_to_static() {
+    // (oracle, name, types, subtypes)
+    let cases: &[(&str, &str, &[&str], &[&str])] = &[
+        (
+            "You gain X life. Create X 1/1 colorless Phyrexian Mite artifact creature \
+             tokens with toxic 1 and \"This token can't block.\" If X is 5 or more, \
+             destroy all other creatures.",
+            "White Sun's Twilight",
+            &["Sorcery"],
+            &[],
+        ),
+        (
+            "Create two 1/1 black Rat creature tokens with \"This token can't block.\"",
+            "Pest Problem",
+            &["Instant"],
+            &["Adventure"],
+        ),
+        (
+            "Create two 1/1 blue Fish creature tokens with \"This token can't be \
+             blocked.\" Then for each kind of counter among creatures you control, \
+             put a counter of that kind on either of those tokens.",
+            "Exotic Pets",
+            &["Instant"],
+            &[],
+        ),
+        (
+            "Return up to one target creature to its owner's hand. Create a 1/1 \
+             colorless Spirit creature token with \"This token can't block or be \
+             blocked by non-Spirit creatures.\"",
+            "Lost in the Spirit World",
+            &["Sorcery"],
+            &[],
+        ),
+    ];
+
+    for (oracle, name, types, subtypes) in cases {
+        let result = parse(oracle, name, &[], types, subtypes);
+        assert!(
+            !result.abilities.is_empty(),
+            "{name}: expected >=1 spell ability after masking the quoted token text, \
+             got abilities={:#?}",
+            result.abilities
+        );
+        // The bogus host-line static (a CantBlock the gate manufactured from the
+        // token's quoted text) must be gone. The token's own can't-block lives
+        // on the created token inside the Effect::Token, not in `statics`.
+        assert!(
+            !result
+                .statics
+                .iter()
+                .any(|s| matches!(s.mode, StaticMode::CantBlock)),
+            "{name}: a bogus host-line CantBlock static must not be produced, \
+             got statics={:#?}",
+            result.statics
+        );
+    }
+}
+
+/// Negative control: Brood Birthing's "have \"…\"" grant marker is OUTSIDE the
+/// quoted span, so masking must NOT change its parse — it still lowers to its
+/// functional `GrantAbility` static (the sacrifice-for-mana grant). This is the
+/// invariant the masking fix must preserve.
+#[test]
+fn brood_birthing_grant_static_unchanged_by_masking() {
+    use engine::types::ability::ContinuousModification;
+
+    let result = parse(
+        "If you control an Eldrazi Spawn, create three 0/1 colorless Eldrazi Spawn \
+         creature tokens. They have \"Sacrifice this token: Add {C}.\" Otherwise, \
+         create one of those tokens.",
+        "Brood Birthing",
+        &[],
+        &["Sorcery"],
+        &[],
+    );
+
+    assert_eq!(
+        result.statics.len(),
+        1,
+        "Brood Birthing keeps exactly one static (the GrantAbility grant): {:#?}",
+        result.statics
+    );
+    let grants_ability = matches!(result.statics[0].mode, StaticMode::Continuous)
+        && result.statics[0]
+            .modifications
+            .iter()
+            .any(|m| matches!(m, ContinuousModification::GrantAbility { .. }));
+    assert!(
+        grants_ability,
+        "Brood Birthing's static must remain the functional GrantAbility grant, \
+         got: {:#?}",
+        result.statics[0]
+    );
 }

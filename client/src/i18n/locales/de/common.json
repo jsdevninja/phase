@@ -28,15 +28,36 @@
     "updateIssue": "Update-Problem",
     "updated": "aktualisiert"
   },
+  "comboDetector": {
+    "label": "Combo-Detektor",
+    "title": "Unendliche Schleifen erkennen: Pflichtschleifen automatisch beenden und ∞-Ressourcen anzeigen (standardmäßig aus)",
+    "on": "An",
+    "off": "Aus"
+  },
   "gameMenu": {
+    "sections": {
+      "view": "Ansicht",
+      "tools": "Werkzeuge",
+      "game": "Spiel"
+    },
+    "reportCard": "Karte melden",
     "menu": "Spielmenü",
     "sandboxTools": "Sandbox-Werkzeuge",
     "sandboxToolsTitle": "Sandbox-Werkzeuge — beliebigen Spielzustand einrichten (`)",
+    "openSandboxTools": "Sandbox-Werkzeuge öffnen",
+    "clickModeButton": "Klickmodus-Schaltfläche",
+    "shown": "Sichtbar",
+    "hidden": "Ausgeblendet",
     "resume": "Fortsetzen",
     "settings": "Einstellungen",
+    "boardLayoutSplit": "Geteilt",
+    "boardLayoutLegacy": "Legacy",
+    "switchToSplitView": "Zur geteilten Tischansicht wechseln",
+    "switchToLegacyView": "Zur fokussierten Legacy-Ansicht wechseln",
     "helpShortcuts": "Hilfe & Tastenkürzel",
     "showAiHand": "KI-Hand anzeigen",
     "hideAiHand": "KI-Hand verbergen",
+    "requestTakeback": "Rücknahme beantragen",
     "concede": "Aufgeben",
     "backToDraft": "Zurück zum Draft",
     "mainMenu": "Hauptmenü",
@@ -49,10 +70,13 @@
     "volume": "Lautstärke"
   },
   "hostControl": {
+    "collapse": "Einklappen",
+    "expand": "Host-Panel ausklappen",
     "seatHost": "Host",
     "seatPlayer": "Spieler",
     "seatOpen": "Frei",
     "seatAi": "KI ({{difficulty}})",
+    "teamLabel": "Team {{number}}",
     "waiting": "Warten…",
     "seatLabel": "Platz {{id}}",
     "addAi": "KI hinzufügen",
@@ -69,7 +93,9 @@
     "seatsOccupied": "{{occupied}}/{{total}} Plätze belegt",
     "startGame": "Spiel starten",
     "startNow": "Jetzt starten",
-    "fillWithAi": "Mit KI auffüllen"
+    "fillWithAi": "Mit KI auffüllen",
+    "joinLinkCopied": "Beitrittslink kopiert",
+    "copyJoinLink": "Beitrittslink kopieren: {{joinShare}}"
   },
   "grantDebug": {
     "heading": "Sandbox: Debug-Berechtigungen",
@@ -190,6 +216,12 @@
       "message": "Richte mit den <tools>Sandbox-Werkzeugen</tools> einen beliebigen Spielzustand ein — füge Karten und Spielsteine hinzu, ändere Leben und Marken, kopiere bleibende Karten oder springe zwischen Phasen. Öffne sie jederzeit mit der Taste <key>`</key>.",
       "dismiss": "Schließen",
       "open": "Sandbox-Werkzeuge öffnen"
+    },
+    "reportCardNudge": {
+      "message": "Wird eine Karte falsch dargestellt oder gespielt? Tippe oben links auf die <flag>Melden-Flagge</flag>, um sie zu melden, damit wir sie beheben können.",
+      "dismiss": "Schließen",
+      "open": "Karte melden",
+      "debugPrompt": "Wird eine Karte falsch dargestellt oder gespielt? Melde sie, damit wir sie beheben können."
     }
   },
   "splash": {
@@ -199,10 +231,33 @@
   "turnBanner": {
     "turn": "Zug {{number}}"
   },
+  "diceRoll": {
+    "rollingForFirst": "Auswürfeln, wer beginnt",
+    "tieReroll": "Gleichstand — neu würfeln!",
+    "versus": "VS",
+    "skip": "Zum Überspringen tippen",
+    "continue": "Zum Fortfahren tippen",
+    "you": "Du",
+    "youPlayFirst": "Du beginnst",
+    "playerPlaysFirst": "{{name}} beginnt",
+    "heads": "Kopf",
+    "tails": "Zahl"
+  },
   "chrome": {
     "back": "Zurück",
     "settings": "Einstellungen",
     "languageSettings": "Sprache ({{lang}}) — Einstellungen öffnen",
     "languageTitle": "Sprache: {{lang}}"
+  },
+  "errorBoundary": {
+    "heading": "Etwas ist schiefgelaufen",
+    "body": "Die App ist auf einen unerwarteten Fehler gestoßen und kann auf diesem Bildschirm nicht fortfahren. Ein Neuladen behebt das meist.",
+    "reload": "Neu laden"
+  },
+  "actionError": {
+    "title": "{{action}} fehlgeschlagen",
+    "skipTarget": "Ziel überspringen",
+    "genericAction": "Aktion",
+    "unknownEngineError": "Unbekannter Engine-Fehler"
   }
 }

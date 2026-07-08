@@ -11,7 +11,13 @@ use crate::strategy_profile::StrategyProfile;
 /// cost of search quality on slow hardware. The same deadline gates expensive
 /// tactical projections so optional lookahead cannot dominate a move.
 ///
-/// Deterministic test and duel-suite runs call [`AiConfig::into_deterministic`]
+/// Search runs iterative deepening (rung `0 -> max_depth-1`): this budget now
+/// bounds the *rungs* — the deepest fully-completed rung's scores are returned
+/// on expiry (rather than a single fixed-depth pass collapsing to a
+/// tactical-only score). Measurement mode pins the iteration ceiling and never
+/// consults the wall clock, preserving byte-determinism.
+///
+/// Measurement test and duel-suite runs call [`AiConfig::into_measurement`]
 /// to disable this wall-clock cap and remain bounded solely by node/depth
 /// budgets.
 ///
@@ -75,6 +81,22 @@ pub enum Platform {
     Wasm,
 }
 
+/// Runtime mode for AI execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionMode {
+    /// Production and interactive callers use latency-bounded search and
+    /// caller-supplied entropy.
+    Interactive,
+    /// Regression measurement is a pure function of `(binary, config, seed)`.
+    Measurement { seed: u64 },
+}
+
+impl ExecutionMode {
+    pub fn is_measurement(self) -> bool {
+        matches!(self, ExecutionMode::Measurement { .. })
+    }
+}
+
 /// Search algorithm configuration.
 #[derive(Debug, Clone)]
 pub struct SearchConfig {
@@ -92,12 +114,6 @@ pub struct SearchConfig {
     /// truth — every call-site should reference that constant rather than
     /// writing a literal.
     pub time_budget_ms: Option<u32>,
-    /// When `true`, wall-clock deadlines are disabled — search is bounded only
-    /// by `max_nodes` / `max_depth`. Integration tests and `ai-duel` regression
-    /// runs pin this to `true` so they don't observe wall-clock flake.
-    /// Benchmarks and production code leave this `false` to measure the real
-    /// deadline-bounded regime users experience.
-    pub deterministic: bool,
     /// How much the AI reasons about opponent hand threats.
     pub threat_awareness: ThreatAwareness,
     /// Minimum remaining wall-clock budget (ms) required before running an
@@ -111,6 +127,16 @@ pub struct SearchConfig {
     /// runs still allow projections because they have no wall-clock deadline.
     /// Set to 0 to always run projections.
     pub projection_min_budget_ms: u128,
+    /// Number of determinized opponent-hidden-zone samples to average the
+    /// `score_candidates` ensemble over. `0` disables determinization entirely
+    /// (perfect-information search, byte-identical to the pre-feature path) — the
+    /// disabled sentinel, matching the `max_nodes`/`rollout_samples` numeric-knob
+    /// convention rather than a bool flag. `K > 0` replaces the opponent's real
+    /// hidden hand/library with K resampled plausible worlds and means the
+    /// per-action scores across them (§7 of the determinization plan). Higher
+    /// tiers set larger K; Medium keeps `0` to preserve the default-tier strength
+    /// floor.
+    pub determinization_samples: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -171,9 +197,9 @@ impl Default for SearchConfig {
             rollout_samples: 0,
             opponent_model: OpponentModel::DeterministicBestReply,
             time_budget_ms: AI_SEARCH_TIME_BUDGET_MS,
-            deterministic: false,
             threat_awareness: ThreatAwareness::None,
             projection_min_budget_ms: 2000,
+            determinization_samples: 0,
         }
     }
 }
@@ -210,8 +236,6 @@ pub struct PolicyPenalties {
     /// Per-mana-value bonus for bouncing expensive permanents.
     pub bounce_expensive_bonus_per_mv: f64,
 
-    /// Penalty for casting Destroy at an indestructible creature.
-    pub indestructible_destroy_penalty: f64,
     /// Base penalty for targeting a creature with ward (scaled by cost severity).
     pub ward_cost_penalty_base: f64,
 
@@ -280,6 +304,126 @@ pub struct PolicyPenalties {
     /// combo line that is reachable next turn. Consumed by `ComboLinePolicy`.
     #[serde(default = "default_combo_progress_next_turn_bonus")]
     pub combo_progress_next_turn_bonus: f64,
+    /// CR 701.6a: Penalty for casting a spell whose mana value matches the
+    /// charge-counter count on a Chalice-of-the-Void-class permanent the AI
+    /// controls — the spell is countered for free, pure tempo and card loss.
+    /// Consumed by `ChaliceAvoidancePolicy`.
+    #[serde(default = "default_own_chalice_counter_penalty")]
+    pub own_chalice_counter_penalty: f64,
+    /// CR 701.6a: Penalty for casting a spell that an opponent's Chalice-class
+    /// permanent would counter. Lighter than the own-Chalice penalty: the AI
+    /// may still want the spell on the stack (e.g. to bait, or when the spell's
+    /// value clears the loss), so this demotes rather than vetoes.
+    #[serde(default = "default_opponent_chalice_counter_penalty")]
+    pub opponent_chalice_counter_penalty: f64,
+    /// CR 702.41a / CR 702.126a: Bonus for casting an affinity-for-artifacts or
+    /// improvise spell in an artifacts-matter deck — the cost payoff gets
+    /// cheaper/easier the wider the artifact board. Consumed by
+    /// `ArtifactSynergyPolicy`.
+    #[serde(default = "default_artifact_cost_payoff_bonus")]
+    pub artifact_cost_payoff_bonus: f64,
+    /// CR 301.1: Nudge for deploying an artifact in an artifacts-matter deck,
+    /// growing the count that affinity/improvise/metalcraft payoffs scale on.
+    /// Consumed by `ArtifactSynergyPolicy`.
+    #[serde(default = "default_deploy_artifact_bonus")]
+    pub deploy_artifact_bonus: f64,
+    /// CR 119.3 / CR 702.15a: Bonus for casting a lifegain *source* (lifelink or
+    /// "you gain N life") in a deck that has lifegain payoffs — each life-gain
+    /// event feeds those payoffs. Consumed by `LifegainPayoffPolicy`, which is
+    /// payoff-gated so this never applies to incidental lifegain in non-lifegain
+    /// decks.
+    #[serde(default = "default_lifegain_source_bonus")]
+    pub lifegain_source_bonus: f64,
+    /// CR 601.2i / CR 603.6a: Bonus for casting an enchantment in a deck that has
+    /// enchantment payoffs (enchantress / constellation) — each enchantment feeds
+    /// those payoffs. Consumed by `EnchantmentsPayoffPolicy`, which is
+    /// payoff-gated so this never applies to decks with no enchantment payoff.
+    #[serde(default = "default_enchantment_cast_bonus")]
+    pub enchantment_cast_bonus: f64,
+    /// CR 404.1 + CR 110.1: Bonus for casting a reanimation spell (graveyard →
+    /// battlefield) in a reanimator deck that has a worthwhile target — cheating
+    /// a fat body into play ahead of curve. Consumed by `ReanimatorPayoffPolicy`,
+    /// which is payoff-gated so this never applies to non-reanimator decks.
+    #[serde(default = "default_reanimation_cast_bonus")]
+    pub reanimation_cast_bonus: f64,
+    /// CR 701.17a / CR 701.9a: Bonus for casting a graveyard enabler (self-mill /
+    /// discard outlet) in a reanimator deck — loading the graveyard so a
+    /// reanimation has fuel. Consumed by `ReanimatorPayoffPolicy`; smaller than
+    /// the reanimation bonus because it is setup, not the payoff.
+    #[serde(default = "default_graveyard_enabler_bonus")]
+    pub graveyard_enabler_bonus: f64,
+    /// CR 301.5: Bonus for deploying an Equipment in an equipment-committed deck
+    /// (one with both Equipment density and payoffs) — growing the voltron
+    /// package. Consumed by `EquipmentPayoffPolicy`, which is payoff-gated so
+    /// this never applies to decks running incidental Equipment.
+    #[serde(default = "default_deploy_equipment_bonus")]
+    pub deploy_equipment_bonus: f64,
+    /// CR 701.23 / CR 702.6: Bonus for casting an equipment-matters support card
+    /// (tutor / auto-attacher / equip-cost grant / equipment-cast payoff) in an
+    /// equipment-committed deck. Consumed by `EquipmentPayoffPolicy`.
+    #[serde(default = "default_equipment_payoff_cast_bonus")]
+    pub equipment_payoff_cast_bonus: f64,
+    /// CR 603.7: Bonus for deploying a flicker enabler in a blink-committed deck
+    /// (one with both flicker density and ETB payoffs) — the engine that
+    /// re-triggers ETBs. Consumed by `BlinkPayoffPolicy`, which is payoff-gated so
+    /// this never applies to decks running incidental flicker.
+    #[serde(default = "default_deploy_flicker_engine_bonus")]
+    pub deploy_flicker_engine_bonus: f64,
+    /// CR 603.6a: Bonus for casting a value-ETB creature in a blink-committed
+    /// deck — a re-triggerable payoff, worth a premium on top of its one-shot ETB
+    /// value because the deck can flicker it. Consumed by `BlinkPayoffPolicy`.
+    #[serde(default = "default_etb_payoff_cast_bonus")]
+    pub etb_payoff_cast_bonus: f64,
+    /// Bonus for casting an opponent-mill spell in a mill-committed deck.
+    /// Scales with library-size urgency (×2 below 15 cards, ×3 below 5 cards).
+    /// Consumed by `MillPayoffPolicy`.
+    #[serde(default = "default_mill_cast_bonus")]
+    pub mill_cast_bonus: f64,
+    /// Bonus for casting an energy-relevant spell (producer or sink body) in an
+    /// energy-committed deck. Scales with the casting player's reserve momentum
+    /// (×2 at 2–4 {E}, ×3 at ≥5 {E}).
+    /// Consumed by `EnergyPayoffPolicy`.
+    #[serde(default = "default_energy_cast_bonus")]
+    pub energy_cast_bonus: f64,
+    /// Penalty for a "wasted cast" the AI should avoid — a spell that whiffs or
+    /// backfires: a legendary duplicate the legend rule will immediately kill, an
+    /// ETB whose only target is illegal, or a creature-targeting spell with no
+    /// legal creature target (beneficial with no own creature, harmful
+    /// creature-only with no opponent creature, or bounce with no opponent
+    /// permanent). Consumed by `AntiSelfHarmPolicy`.
+    #[serde(default = "default_wasted_cast_penalty")]
+    pub wasted_cast_penalty: f64,
+    /// Bonus for untapping the AI's own tapped creature (frees a blocker /
+    /// re-enables a tapped attacker). Consumed by `AntiSelfHarmPolicy`.
+    #[serde(default = "default_untap_own_tapped_bonus")]
+    pub untap_own_tapped_bonus: f64,
+    /// Penalty for an untap effect that would untap an opponent's tapped creature
+    /// (hands them back a blocker/attacker). Consumed by `AntiSelfHarmPolicy`.
+    #[serde(default = "default_untap_opponent_tapped_penalty")]
+    pub untap_opponent_tapped_penalty: f64,
+    /// Penalty for targeting an already-untapped creature with an untap effect —
+    /// no state change, so the effect is wasted. Consumed by `AntiSelfHarmPolicy`.
+    #[serde(default = "default_untap_untapped_penalty")]
+    pub untap_untapped_penalty: f64,
+    /// Penalty for non-lethal removal aimed at a tapped opponent creature during
+    /// the pre-combat main phase — a tapped creature can't block, so there is no
+    /// urgency advantage over waiting. Consumed by `AntiSelfHarmPolicy`.
+    #[serde(default = "default_tapped_removal_no_urgency_penalty")]
+    pub tapped_removal_no_urgency_penalty: f64,
+    /// CR 119.4: Per-point cost of a self-inflicted pay-life activation cost,
+    /// before runtime life-pressure scaling. Mirrors the `player_impact`
+    /// GainLife/LoseLife weight (0.15). Consumed by `SelfCostValuePolicy`.
+    #[serde(default = "default_self_cost_pay_life_per_point")]
+    pub self_cost_pay_life_per_point: f64,
+    /// CR 701.9a: Per-card cost of a self-inflicted discard activation cost (one
+    /// card ≈ one unit of expected value). Consumed by `SelfCostValuePolicy`.
+    #[serde(default = "default_self_cost_discard_per_card")]
+    pub self_cost_discard_per_card: f64,
+    /// CR 701.13a: Per-card cost of exiling a card from the AI's own graveyard
+    /// as an activation cost — cheap unless the deck is graveyard-committed.
+    /// Consumed by `SelfCostValuePolicy`.
+    #[serde(default = "default_self_cost_exile_graveyard_per_card")]
+    pub self_cost_exile_graveyard_per_card: f64,
 }
 
 impl Default for PolicyPenalties {
@@ -297,7 +441,6 @@ impl Default for PolicyPenalties {
             bounce_token_bonus: 3.0,
             bounce_cheap_discount: -2.0,
             bounce_expensive_bonus_per_mv: 0.3,
-            indestructible_destroy_penalty: -8.0,
             ward_cost_penalty_base: -2.0,
             pump_response_bonus: 2.5,
             lethal_burn_bonus: 15.0,
@@ -320,8 +463,55 @@ impl Default for PolicyPenalties {
             threat_wipe_overextend_penalty: default_threat_wipe_overextend_penalty(),
             combo_progress_this_turn_bonus: default_combo_progress_this_turn_bonus(),
             combo_progress_next_turn_bonus: default_combo_progress_next_turn_bonus(),
+            own_chalice_counter_penalty: default_own_chalice_counter_penalty(),
+            opponent_chalice_counter_penalty: default_opponent_chalice_counter_penalty(),
+            artifact_cost_payoff_bonus: default_artifact_cost_payoff_bonus(),
+            deploy_artifact_bonus: default_deploy_artifact_bonus(),
+            lifegain_source_bonus: default_lifegain_source_bonus(),
+            enchantment_cast_bonus: default_enchantment_cast_bonus(),
+            reanimation_cast_bonus: default_reanimation_cast_bonus(),
+            graveyard_enabler_bonus: default_graveyard_enabler_bonus(),
+            deploy_equipment_bonus: default_deploy_equipment_bonus(),
+            equipment_payoff_cast_bonus: default_equipment_payoff_cast_bonus(),
+            deploy_flicker_engine_bonus: default_deploy_flicker_engine_bonus(),
+            etb_payoff_cast_bonus: default_etb_payoff_cast_bonus(),
+            mill_cast_bonus: default_mill_cast_bonus(),
+            energy_cast_bonus: default_energy_cast_bonus(),
+            wasted_cast_penalty: default_wasted_cast_penalty(),
+            untap_own_tapped_bonus: default_untap_own_tapped_bonus(),
+            untap_opponent_tapped_penalty: default_untap_opponent_tapped_penalty(),
+            untap_untapped_penalty: default_untap_untapped_penalty(),
+            tapped_removal_no_urgency_penalty: default_tapped_removal_no_urgency_penalty(),
+            self_cost_pay_life_per_point: default_self_cost_pay_life_per_point(),
+            self_cost_discard_per_card: default_self_cost_discard_per_card(),
+            self_cost_exile_graveyard_per_card: default_self_cost_exile_graveyard_per_card(),
         }
     }
+}
+
+fn default_wasted_cast_penalty() -> f64 {
+    -8.0
+}
+fn default_untap_own_tapped_bonus() -> f64 {
+    8.0
+}
+fn default_untap_opponent_tapped_penalty() -> f64 {
+    -20.0
+}
+fn default_untap_untapped_penalty() -> f64 {
+    -6.0
+}
+fn default_tapped_removal_no_urgency_penalty() -> f64 {
+    -5.0
+}
+fn default_self_cost_pay_life_per_point() -> f64 {
+    0.15
+}
+fn default_self_cost_discard_per_card() -> f64 {
+    1.0
+}
+fn default_self_cost_exile_graveyard_per_card() -> f64 {
+    0.15
 }
 
 fn default_lethality_tapout_penalty() -> f64 {
@@ -378,6 +568,175 @@ fn default_combo_progress_this_turn_bonus() -> f64 {
 fn default_combo_progress_next_turn_bonus() -> f64 {
     5.0
 }
+fn default_own_chalice_counter_penalty() -> f64 {
+    -12.0
+}
+fn default_opponent_chalice_counter_penalty() -> f64 {
+    -4.0
+}
+fn default_artifact_cost_payoff_bonus() -> f64 {
+    0.5
+}
+fn default_deploy_artifact_bonus() -> f64 {
+    0.2
+}
+fn default_lifegain_source_bonus() -> f64 {
+    0.4
+}
+fn default_enchantment_cast_bonus() -> f64 {
+    0.4
+}
+fn default_reanimation_cast_bonus() -> f64 {
+    0.5
+}
+fn default_graveyard_enabler_bonus() -> f64 {
+    0.3
+}
+fn default_deploy_equipment_bonus() -> f64 {
+    0.3
+}
+fn default_equipment_payoff_cast_bonus() -> f64 {
+    0.4
+}
+fn default_deploy_flicker_engine_bonus() -> f64 {
+    0.4
+}
+fn default_etb_payoff_cast_bonus() -> f64 {
+    0.3
+}
+fn default_mill_cast_bonus() -> f64 {
+    0.5
+}
+fn default_energy_cast_bonus() -> f64 {
+    0.5
+}
+
+/// Policy penalty fields present in the active CMA-ES `--group penalties`
+/// vector. Adding a `PolicyPenalties` field requires listing it here or in
+/// `UNTUNED_POLICY_PENALTY_FIELDS` with a reason.
+pub const ACTIVE_POLICY_PENALTY_FIELDS: &[&str] = &[
+    "redundant_removal_penalty",
+    "redundant_damage_penalty",
+    "gift_card_penalty",
+    "gift_treasure_penalty",
+    "gift_food_penalty",
+    "gift_fish_penalty",
+    "worthy_target_threshold",
+    "overkill_base_penalty",
+    "removal_quality_mismatch",
+    "bounce_token_bonus",
+    "bounce_cheap_discount",
+    "bounce_expensive_bonus_per_mv",
+    "ward_cost_penalty_base",
+    "pump_response_bonus",
+    "lethal_burn_bonus",
+    "protect_spell_bonus_mult",
+    "lethality_tapout_penalty",
+    "sacrifice_land_penalty",
+    "sacrifice_token_cost",
+    "evasion_removal_bonus_mult",
+    "recursion_destroy_penalty",
+    "recursion_exile_bonus",
+    "death_trigger_destroy_penalty",
+    "wrath_overextend_penalty",
+    "low_life_defensive_bonus",
+    "low_life_aggro_penalty",
+    "card_advantage_behind_extra",
+    "counter_last_reservation_penalty",
+    "tempo_curve_bonus",
+    "synergy_casting_bonus",
+    "threat_counter_tapout_penalty",
+    "threat_wipe_overextend_penalty",
+    "combo_progress_this_turn_bonus",
+    "combo_progress_next_turn_bonus",
+    "own_chalice_counter_penalty",
+    "opponent_chalice_counter_penalty",
+];
+
+/// Policy penalties intentionally not present in an active CMA-ES parameter
+/// vector yet.
+pub const UNTUNED_POLICY_PENALTY_FIELDS: &[(&str, &str)] = &[
+    (
+        "artifact_cost_payoff_bonus",
+        "new ArtifactSynergyPolicy knob; awaiting a paired-seed ai-gate calibration before joining the CMA-ES vector",
+    ),
+    (
+        "deploy_artifact_bonus",
+        "new ArtifactSynergyPolicy knob; awaiting a paired-seed ai-gate calibration before joining the CMA-ES vector",
+    ),
+    (
+        "enchantment_cast_bonus",
+        "new EnchantmentsPayoffPolicy knob; awaiting a paired-seed ai-gate calibration before joining the CMA-ES vector",
+    ),
+    (
+        "lifegain_source_bonus",
+        "new LifegainPayoffPolicy knob; awaiting a paired-seed ai-gate calibration before joining the CMA-ES vector",
+    ),
+    (
+        "reanimation_cast_bonus",
+        "new ReanimatorPayoffPolicy knob; awaiting a paired-seed ai-gate calibration before joining the CMA-ES vector",
+    ),
+    (
+        "graveyard_enabler_bonus",
+        "new ReanimatorPayoffPolicy knob; awaiting a paired-seed ai-gate calibration before joining the CMA-ES vector",
+    ),
+    (
+        "deploy_equipment_bonus",
+        "new EquipmentPayoffPolicy knob; awaiting a paired-seed ai-gate calibration before joining the CMA-ES vector",
+    ),
+    (
+        "equipment_payoff_cast_bonus",
+        "new EquipmentPayoffPolicy knob; awaiting a paired-seed ai-gate calibration before joining the CMA-ES vector",
+    ),
+    (
+        "deploy_flicker_engine_bonus",
+        "new BlinkPayoffPolicy knob; awaiting a paired-seed ai-gate calibration before joining the CMA-ES vector",
+    ),
+    (
+        "etb_payoff_cast_bonus",
+        "new BlinkPayoffPolicy knob; awaiting a paired-seed ai-gate calibration before joining the CMA-ES vector",
+    ),
+    (
+        "mill_cast_bonus",
+        "new MillPayoffPolicy knob; awaiting a paired-seed ai-gate calibration before joining the CMA-ES vector",
+    ),
+    (
+        "energy_cast_bonus",
+        "new EnergyPayoffPolicy knob; awaiting a paired-seed ai-gate calibration before joining the CMA-ES vector",
+    ),
+    (
+        "wasted_cast_penalty",
+        "AntiSelfHarmPolicy magnitude lifted from a raw literal (value-preserving); awaiting a paired-seed ai-gate calibration before joining the CMA-ES vector",
+    ),
+    (
+        "untap_own_tapped_bonus",
+        "AntiSelfHarmPolicy magnitude lifted from a raw literal (value-preserving); awaiting a paired-seed ai-gate calibration before joining the CMA-ES vector",
+    ),
+    (
+        "untap_opponent_tapped_penalty",
+        "AntiSelfHarmPolicy magnitude lifted from a raw literal (value-preserving); awaiting a paired-seed ai-gate calibration before joining the CMA-ES vector",
+    ),
+    (
+        "untap_untapped_penalty",
+        "AntiSelfHarmPolicy magnitude lifted from a raw literal (value-preserving); awaiting a paired-seed ai-gate calibration before joining the CMA-ES vector",
+    ),
+    (
+        "tapped_removal_no_urgency_penalty",
+        "AntiSelfHarmPolicy magnitude lifted from a raw literal (value-preserving); awaiting a paired-seed ai-gate calibration before joining the CMA-ES vector",
+    ),
+    (
+        "self_cost_pay_life_per_point",
+        "new SelfCostValuePolicy knob; awaiting a paired-seed ai-gate calibration before joining the CMA-ES vector",
+    ),
+    (
+        "self_cost_discard_per_card",
+        "new SelfCostValuePolicy knob; awaiting a paired-seed ai-gate calibration before joining the CMA-ES vector",
+    ),
+    (
+        "self_cost_exile_graveyard_per_card",
+        "new SelfCostValuePolicy knob; awaiting a paired-seed ai-gate calibration before joining the CMA-ES vector",
+    ),
+];
 
 /// Full AI configuration combining difficulty, search, and evaluation settings.
 #[derive(Debug, Clone)]
@@ -392,6 +751,7 @@ pub struct AiConfig {
     pub keyword_bonuses: KeywordBonuses,
     pub archetype_multipliers: ArchetypeMultipliers,
     pub policy_penalties: PolicyPenalties,
+    pub execution_mode: ExecutionMode,
     /// Number of players in the game (used for search budget scaling).
     pub player_count: u8,
 }
@@ -427,9 +787,9 @@ pub fn create_config(difficulty: AiDifficulty, platform: Platform) -> AiConfig {
                 rollout_samples: 0,
                 opponent_model: OpponentModel::DeterministicBestReply,
                 time_budget_ms: AI_SEARCH_TIME_BUDGET_MS,
-                deterministic: false,
                 threat_awareness: ThreatAwareness::None,
                 projection_min_budget_ms: 0,
+                determinization_samples: 0,
             },
         ),
         AiDifficulty::Easy => (
@@ -451,9 +811,9 @@ pub fn create_config(difficulty: AiDifficulty, platform: Platform) -> AiConfig {
                 rollout_samples: 0,
                 opponent_model: OpponentModel::DeterministicBestReply,
                 time_budget_ms: AI_SEARCH_TIME_BUDGET_MS,
-                deterministic: false,
                 threat_awareness: ThreatAwareness::None,
                 projection_min_budget_ms: 0,
+                determinization_samples: 0,
             },
         ),
         AiDifficulty::Medium => (
@@ -475,9 +835,11 @@ pub fn create_config(difficulty: AiDifficulty, platform: Platform) -> AiConfig {
                 rollout_samples: 1,
                 opponent_model: OpponentModel::DeterministicBestReply,
                 time_budget_ms: AI_SEARCH_TIME_BUDGET_MS,
-                deterministic: false,
                 threat_awareness: ThreatAwareness::ArchetypeOnly,
                 projection_min_budget_ms: 2000,
+                // Medium keeps perfect-information search (K=0): the default
+                // tier's strength floor (§7c/F1) — determinization is Hard+.
+                determinization_samples: 0,
             },
         ),
         AiDifficulty::Hard => (
@@ -499,9 +861,11 @@ pub fn create_config(difficulty: AiDifficulty, platform: Platform) -> AiConfig {
                 rollout_samples: 1,
                 opponent_model: OpponentModel::ThreatWeightedReply,
                 time_budget_ms: AI_SEARCH_TIME_BUDGET_MS,
-                deterministic: false,
                 threat_awareness: ThreatAwareness::Full,
                 projection_min_budget_ms: 2000,
+                // K=2: halves single-sample variance at 2x base cost; node cap
+                // 48 keeps each search short. Exercised by the quick ai-gate.
+                determinization_samples: 2,
             },
         ),
         AiDifficulty::VeryHard => (
@@ -523,9 +887,10 @@ pub fn create_config(difficulty: AiDifficulty, platform: Platform) -> AiConfig {
                 rollout_samples: 2,
                 opponent_model: OpponentModel::ThreatWeightedReply,
                 time_budget_ms: AI_SEARCH_TIME_BUDGET_MS,
-                deterministic: false,
                 threat_awareness: ThreatAwareness::Full,
                 projection_min_budget_ms: 2000,
+                // K=3: materially de-biases without runaway cost; node cap 64.
+                determinization_samples: 3,
             },
         ),
         AiDifficulty::CEDH => (
@@ -547,11 +912,12 @@ pub fn create_config(difficulty: AiDifficulty, platform: Platform) -> AiConfig {
                 rollout_samples: 2,
                 opponent_model: OpponentModel::ThreatWeightedReply,
                 time_budget_ms: AI_SEARCH_TIME_BUDGET_MS,
-                deterministic: false,
                 threat_awareness: ThreatAwareness::Full,
                 // == AI_SEARCH_TIME_BUDGET_MS: projections only at turn start,
                 // before nodes consume the budget
                 projection_min_budget_ms: 1500,
+                // K=3: same as VeryHard; multiplayer + node cap 96 dominates cost.
+                determinization_samples: 3,
             },
         ),
     };
@@ -567,6 +933,7 @@ pub fn create_config(difficulty: AiDifficulty, platform: Platform) -> AiConfig {
         keyword_bonuses: KeywordBonuses::default(),
         archetype_multipliers: ArchetypeMultipliers::default(),
         policy_penalties: PolicyPenalties::default(),
+        execution_mode: ExecutionMode::Interactive,
         player_count: 2,
     };
 
@@ -580,18 +947,23 @@ pub fn create_config(difficulty: AiDifficulty, platform: Platform) -> AiConfig {
         config.search.max_depth = config.search.max_depth.min(2);
         config.search.max_nodes = config.search.max_nodes * 2 / 3;
         config.search.rollout_depth = config.search.rollout_depth.min(2);
+        // The frontend worker pool already provides cross-sample root
+        // parallelism (ai-worker-pool.ts merges N workers), so cap per-worker K
+        // at 2 — effective samples = N_workers x K without per-worker latency
+        // blow-up (§7c).
+        config.search.determinization_samples = config.search.determinization_samples.min(2);
     }
 
     config
 }
 
 impl AiConfig {
-    /// Return a copy of this config with deterministic mode enabled: wall-clock
+    /// Return a copy of this config with measurement mode enabled: wall-clock
     /// deadlines are disabled and search is bounded solely by `max_nodes` /
     /// `max_depth`. Used by integration tests and `ai-duel` regression runs to
     /// eliminate wall-clock flake. Production and benchmarks leave this off.
-    pub fn into_deterministic(mut self) -> Self {
-        self.search.deterministic = true;
+    pub fn into_measurement(mut self, seed: u64) -> Self {
+        self.execution_mode = ExecutionMode::Measurement { seed };
         self
     }
 }
@@ -620,6 +992,10 @@ pub fn create_config_for_players(
                 config.search.max_nodes = config.search.max_nodes * 2 / 3;
                 config.search.max_branching = config.search.max_branching.min(4);
                 config.search.rollout_depth = config.search.rollout_depth.min(1);
+                // Determinizing 3+ opponents per sample multiplies pool work;
+                // keep K modest beyond 2 players (§7c). cEDH keeps its tier K.
+                config.search.determinization_samples =
+                    config.search.determinization_samples.min(1);
             }
         }
         _ => {
@@ -631,6 +1007,10 @@ pub fn create_config_for_players(
                 config.search.max_nodes /= 3;
                 config.search.max_branching = config.search.max_branching.min(3);
                 config.search.rollout_depth = config.search.rollout_depth.min(1);
+                // 5-6+ players: one determinized sample at most (pool work scales
+                // with opponent count).
+                config.search.determinization_samples =
+                    config.search.determinization_samples.min(1);
             }
         }
     }
@@ -670,6 +1050,9 @@ mod tests {
         assert_eq!(config.search.max_depth, 2);
         assert_eq!(config.search.max_nodes, 24);
         assert_eq!(config.search.rollout_depth, 1);
+        // Medium stays at perfect-information search (K=0) — the default-tier
+        // strength floor (§7c/F1).
+        assert_eq!(config.search.determinization_samples, 0);
     }
 
     #[test]
@@ -680,6 +1063,9 @@ mod tests {
         assert_eq!(config.search.max_depth, 3);
         assert_eq!(config.search.max_nodes, 48);
         assert_eq!(config.search.rollout_depth, 2);
+        // Hard is the first tier to determinize opponent hidden zones (K=2) —
+        // the tier the quick ai-gate exercises (§7c/§11).
+        assert_eq!(config.search.determinization_samples, 2);
     }
 
     #[test]
@@ -691,6 +1077,7 @@ mod tests {
         assert_eq!(config.search.max_nodes, 64);
         assert_eq!(config.search.max_branching, 5);
         assert_eq!(config.search.rollout_samples, 2);
+        assert_eq!(config.search.determinization_samples, 3);
     }
 
     #[test]
@@ -701,6 +1088,28 @@ mod tests {
         assert!(wasm.search.max_depth <= 2);
         assert!(wasm.search.max_nodes < native.search.max_nodes);
         assert!(wasm.search.rollout_depth <= native.search.rollout_depth);
+        // WASM caps per-worker K at 2 (Hard native K=2 -> still 2 here).
+        assert!(wasm.search.determinization_samples <= 2);
+        assert_eq!(wasm.search.determinization_samples, 2);
+    }
+
+    #[test]
+    fn wasm_caps_determinization_samples_at_two() {
+        // VeryHard native K=3 must be capped to 2 on WASM (§7c min(2,tier)).
+        let native = create_config(AiDifficulty::VeryHard, Platform::Native);
+        let wasm = create_config(AiDifficulty::VeryHard, Platform::Wasm);
+        assert_eq!(native.search.determinization_samples, 3);
+        assert_eq!(wasm.search.determinization_samples, 2);
+    }
+
+    #[test]
+    fn multiplayer_caps_determinization_samples() {
+        // Hard at 4 players: paranoid scaling caps K at 1 (§7c).
+        let four = create_config_for_players(AiDifficulty::Hard, Platform::Native, 4);
+        assert_eq!(four.search.determinization_samples, 1);
+        // cEDH skips paranoid scaling entirely, so it keeps its tier K=3 at 4p.
+        let cedh4 = create_config_for_players(AiDifficulty::CEDH, Platform::Native, 4);
+        assert_eq!(cedh4.search.determinization_samples, 3);
     }
 
     #[test]
@@ -862,6 +1271,7 @@ mod tests {
         ));
         assert_eq!(config.search.projection_min_budget_ms, 1500);
         assert_eq!(config.search.time_budget_ms, AI_SEARCH_TIME_BUDGET_MS);
+        assert_eq!(config.search.determinization_samples, 3);
     }
 
     #[test]
@@ -914,5 +1324,47 @@ mod tests {
         let p = PolicyPenalties::default();
         assert_eq!(p.combo_progress_this_turn_bonus, 15.0);
         assert_eq!(p.combo_progress_next_turn_bonus, 5.0);
+    }
+
+    /// Value-identity guard for the `AntiSelfHarmPolicy` magnitudes migrated from
+    /// raw literals into config. Each default MUST equal the exact literal the
+    /// bespoke code used before the lift, so a mistyped port is caught here.
+    #[test]
+    fn policy_penalties_default_anti_self_harm_migrated_magnitudes() {
+        let p = PolicyPenalties::default();
+        assert_eq!(p.wasted_cast_penalty, -8.0);
+        assert_eq!(p.untap_own_tapped_bonus, 8.0);
+        assert_eq!(p.untap_opponent_tapped_penalty, -20.0);
+        assert_eq!(p.untap_untapped_penalty, -6.0);
+        assert_eq!(p.tapped_removal_no_urgency_penalty, -5.0);
+    }
+
+    #[test]
+    fn every_policy_penalty_is_tuning_registered_or_explicitly_untuned() {
+        let value = serde_json::to_value(PolicyPenalties::default()).unwrap();
+        let fields: std::collections::BTreeSet<_> = value
+            .as_object()
+            .expect("PolicyPenalties serializes as object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let untuned: std::collections::BTreeSet<_> = UNTUNED_POLICY_PENALTY_FIELDS
+            .iter()
+            .map(|(field, _reason)| *field)
+            .collect();
+        let active: std::collections::BTreeSet<_> =
+            ACTIVE_POLICY_PENALTY_FIELDS.iter().copied().collect();
+        let registered: std::collections::BTreeSet<_> = active.union(&untuned).copied().collect();
+
+        assert_eq!(
+            fields, registered,
+            "PolicyPenalties fields must be present in an active CMA-ES group or UNTUNED_POLICY_PENALTY_FIELDS"
+        );
+        assert!(
+            UNTUNED_POLICY_PENALTY_FIELDS
+                .iter()
+                .all(|(_field, reason)| !reason.trim().is_empty()),
+            "every untuned policy penalty entry needs a reason"
+        );
     }
 }

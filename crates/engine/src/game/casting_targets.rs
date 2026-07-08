@@ -1,24 +1,31 @@
 use crate::types::ability::{
-    AbilityCost, AbilityTag, AdditionalCost, Effect, ModalChoice, QuantityExpr, TargetRef,
-    TargetSelectionMode,
+    AbilityCost, AbilityTag, AdditionalCost, Effect, ModalChoice, QuantityExpr, ResolvedAbility,
+    TargetRef, TargetSelectionMode,
 };
 use crate::types::events::GameEvent;
-use crate::types::game_state::{GameState, PendingCast, StackEntry, StackEntryKind, WaitingFor};
+use crate::types::game_state::{
+    CostResume, GameState, PayCostKind, PendingCast, StackEntry, StackEntryKind, WaitingFor,
+};
 use crate::types::identifiers::ObjectId;
 use crate::types::keywords::Keyword;
 use crate::types::mana::ManaCost;
 use crate::types::player::PlayerId;
+use crate::types::zones::ExileCostSourceZone;
 
 use super::ability_utils::{
     ability_target_legality_needs_chosen_x, assign_selected_slots_in_chain,
     assign_targets_in_chain, auto_select_targets_for_ability, begin_target_selection_for_ability,
-    build_chained_resolved, build_target_slots, choose_target_for_ability,
-    flatten_targets_in_chain, random_select_targets_for_ability, validate_modal_indices,
-    validate_selected_targets_for_ability, TargetSelectionAdvance,
+    build_chained_resolved, build_target_slots_labelled, choose_target_for_ability,
+    distribution_targets, flatten_targets_in_chain, random_select_targets_for_ability,
+    validate_modal_indices, validate_selected_targets_for_ability, TargetSelectionAdvance,
 };
-use super::casting::{emit_targeting_events, pay_ability_cost};
-use super::casting_costs::{cost_has_x, enter_payment_step, finish_pending_cast_cost_or_pay};
+use super::casting::{emit_targeting_events, pay_ability_cost_for_activation};
+use super::casting_costs::{
+    cost_has_x, drain_deferred_triggers_after_stack_object_announcement, enter_payment_step,
+    finish_pending_cast_cost_or_pay,
+};
 use super::engine::EngineError;
+use super::priority;
 use super::restrictions;
 use super::stack;
 
@@ -36,12 +43,17 @@ pub(crate) fn handle_select_modes(
     indices: Vec<usize>,
     events: &mut Vec<GameEvent>,
 ) -> Result<WaitingFor, EngineError> {
-    let (modal, pending) = match &state.waiting_for {
+    let (modal, pending, unavailable_modes) = match &state.waiting_for {
         WaitingFor::ModeChoice {
             modal,
             pending_cast,
+            unavailable_modes,
             ..
-        } => (modal.clone(), *pending_cast.clone()),
+        } => (
+            modal.clone(),
+            *pending_cast.clone(),
+            unavailable_modes.clone(),
+        ),
         _ => {
             return Err(EngineError::InvalidAction(
                 "Not waiting for mode selection".to_string(),
@@ -49,8 +61,19 @@ pub(crate) fn handle_select_modes(
         }
     };
 
-    // Spells resolve once — no cross-resolution mode constraints apply.
-    validate_modal_indices(&modal, &indices, &[])?;
+    // CR 700.2a-b: Reject unavailable modes (repeat constraints or no legal targets).
+    validate_modal_indices(&modal, &indices, &unavailable_modes)?;
+
+    // CR 700.2 + CR 601.2c: Sorted ascending to match the slot order produced by
+    // `build_chained_resolved` and `build_target_slots_labelled`. Persisted on
+    // every `PendingCast` produced below so a later deferred target-selection
+    // step (e.g. after `ChooseX`) can re-derive per-slot mode labels for the
+    // targeting UI without re-running the mode-choice flow.
+    let sorted_indices: Vec<usize> = {
+        let mut s = indices.clone();
+        s.sort_unstable();
+        s
+    };
 
     // CR 700.2e + CR 115.1: The `player` parameter is the mode *chooser* (the
     // controller for standard modals; the opponent for "an opponent chooses
@@ -64,8 +87,24 @@ pub(crate) fn handle_select_modes(
     // costs layered on top of the base cost. `restrictions::add_mana_cost` treats `NoCost`/
     // zero as identity, so a cast-without-paying path (`pending.cost == zero`) yields exactly
     // the additional costs — alternative-cost permissions never waive them.
-    let total_cost = compute_modal_total_cost(&pending.cost, &modal, &indices);
+    let mut total_cost = compute_modal_total_cost(&pending.cost, &modal, &indices);
     let mut pending = pending;
+    // CR 601.2b + CR 601.2f: Fold the chosen modal mode costs (Spree / Entwine
+    // cost increases, computed against a zero base) into the declared mana
+    // additions so any later pending recompute includes them without rewriting
+    // the tax-inclusive base.
+    if pending.base_cost.is_some() {
+        let modal_only = compute_modal_total_cost(&ManaCost::zero(), &modal, &indices);
+        if !modal_only.is_without_paying_mana() {
+            pending.declared_mana_additions.push(modal_only);
+            total_cost = super::casting::recompute_pending_mana_total(
+                state,
+                controller,
+                &pending,
+                pending.ability.chosen_x,
+            );
+        }
+    }
     if let Some(cost) = escalate_cost_for_selected_modes(state, controller, &pending, indices.len())
     {
         pending.additional_cost_flow = Some(AdditionalCost::Required(cost));
@@ -85,10 +124,12 @@ pub(crate) fn handle_select_modes(
     if pending.activation_ability_index.is_none()
         && pending.additional_cost_flow.is_none()
         && cost_has_x(&total_cost)
-        && ability_target_legality_needs_chosen_x(&resolved)
+        && ability_target_legality_needs_chosen_x(&resolved, pending.distribute.as_ref())
     {
         let mut pending_x =
             PendingCast::new(pending.object_id, pending.card_id, resolved, total_cost);
+        pending_x.base_cost = pending.base_cost.clone();
+        pending_x.declared_mana_additions = pending.declared_mana_additions.clone();
         pending_x.target_constraints = pending.target_constraints;
         pending_x.casting_variant = pending.casting_variant;
         pending_x.cast_timing_permission = pending.cast_timing_permission;
@@ -96,6 +137,7 @@ pub(crate) fn handle_select_modes(
         pending_x.origin_zone = pending.origin_zone;
         pending_x.payment_mode = pending.payment_mode;
         pending_x.deferred_target_selection = true;
+        pending_x.chosen_modes = sorted_indices.clone();
         pending_x.additional_cost_decided = pending.additional_cost_decided;
         pending_x.declared_kickers_to_pay = pending.declared_kickers_to_pay;
         pending_x.declined_kickers = pending.declined_kickers;
@@ -104,11 +146,23 @@ pub(crate) fn handle_select_modes(
     }
 
     // Check for targeting on the combined ability
-    if state.layers_dirty {
-        super::layers::evaluate_layers(state);
-    }
+    super::layers::flush_layers(state);
 
-    let target_slots = build_target_slots(state, &resolved)?;
+    // CR 700.2 / CR 601.2b: Build slots and their per-mode display labels
+    // together against the SAME post-flush state, so `mode_labels.len()` can
+    // never diverge from `target_slots.len()` (slot count is state-dependent).
+    let (target_slots, mode_labels) = build_target_slots_labelled(
+        state,
+        &abilities,
+        &indices,
+        &modal.mode_descriptions,
+        pending.object_id,
+        controller,
+        &pending.ability.context,
+        // CR 107.1b: X is announced during the cost-payment step (after target
+        // selection on this non-deferred path), so it is not yet known here.
+        None,
+    )?;
     if !target_slots.is_empty() {
         // CR 115.1 + CR 701.9b: For abilities marked `Random`, the game (not the
         // controller) selects targets uniformly from each slot's legal-target set.
@@ -150,11 +204,14 @@ pub(crate) fn handle_select_modes(
         )?;
         let mut pending_sel =
             PendingCast::new(pending.object_id, pending.card_id, resolved, total_cost);
+        pending_sel.base_cost = pending.base_cost.clone();
+        pending_sel.declared_mana_additions = pending.declared_mana_additions.clone();
         pending_sel.target_constraints = pending.target_constraints;
         pending_sel.casting_variant = pending.casting_variant;
         pending_sel.origin_zone = pending.origin_zone;
         pending_sel.additional_cost_flow = pending.additional_cost_flow;
         pending_sel.deferred_target_selection = pending.deferred_target_selection;
+        pending_sel.chosen_modes = sorted_indices.clone();
         pending_sel.additional_cost_decided = pending.additional_cost_decided;
         pending_sel.declared_kickers_to_pay = pending.declared_kickers_to_pay;
         pending_sel.declined_kickers = pending.declined_kickers;
@@ -163,12 +220,42 @@ pub(crate) fn handle_select_modes(
             player: controller,
             pending_cast: Box::new(pending_sel),
             target_slots,
+            mode_labels,
             selection,
         });
     }
 
     // No targets needed -- check additional cost, then pay
     finish_pending_cast_cost_or_pay(state, controller, pending, resolved, total_cost, events)
+}
+
+/// CR 601.2d: After targets are committed on a pending cast, pause for
+/// `WaitingFor::DistributeAmong` when the spell divides a fixed pool among
+/// those targets. Shared by bulk `SelectTargets` and slot-by-slot
+/// `ChooseTarget` completion paths — the client drives the latter.
+fn maybe_pause_for_cast_distribution(
+    state: &mut GameState,
+    player: PlayerId,
+    pending: &PendingCast,
+    ability: &ResolvedAbility,
+) -> Result<Option<WaitingFor>, EngineError> {
+    let Some(unit) = &pending.distribute else {
+        return Ok(None);
+    };
+    let Some(total) = extract_distribution_total(state, ability, &ability.effect) else {
+        // X-spell: distribution deferred to after mana payment.
+        return Ok(None);
+    };
+    let assigned_targets = distribution_targets(ability);
+    let mut pending_dist = pending.clone();
+    pending_dist.ability = ability.clone();
+    state.pending_cast = Some(Box::new(pending_dist));
+    Ok(Some(WaitingFor::DistributeAmong {
+        player,
+        total,
+        targets: assigned_targets,
+        unit: unit.clone(),
+    }))
 }
 
 /// Handle target selection for a pending cast.
@@ -204,53 +291,21 @@ pub(crate) fn handle_select_targets(
     let mut ability = pending.ability.clone();
     assign_targets_in_chain(state, &mut ability, &targets)?;
 
-    // CR 601.2d: If this spell requires distribution among targets, trigger
-    // WaitingFor::DistributeAmong. For non-X spells, extract the fixed total now.
-    // For X-spells, distribution is deferred to after mana payment (engine.rs).
-    if let Some(ref unit) = pending.distribute {
-        if let Some(total) = extract_fixed_distribution_total(&ability.effect) {
-            let assigned_targets = flatten_targets_in_chain(&ability);
-            // Store ability + targets on pending_cast for post-distribution resumption.
-            let mut pending_dist = PendingCast::new(
-                pending.object_id,
-                pending.card_id,
-                ability,
-                pending.cost.clone(),
-            );
-            pending_dist.casting_variant = pending.casting_variant;
-            pending_dist.distribute = Some(unit.clone());
-            pending_dist.origin_zone = pending.origin_zone;
-            pending_dist.additional_cost_flow = pending.additional_cost_flow.clone();
-            pending_dist.deferred_target_selection = pending.deferred_target_selection;
-            pending_dist.additional_cost_decided = pending.additional_cost_decided;
-            pending_dist.declared_kickers_to_pay = pending.declared_kickers_to_pay.clone();
-            pending_dist.declined_kickers = pending.declined_kickers.clone();
-            state.pending_cast = Some(Box::new(pending_dist));
-            return Ok(WaitingFor::DistributeAmong {
-                player,
-                total,
-                targets: assigned_targets,
-                unit: unit.clone(),
-            });
-        }
-        // X-spell: distribution deferred to after mana payment.
-        // Propagate distribute flag through to pending_cast for the
-        // (ManaPayment, PassPriority) handler.
+    if let Some(waiting_for) = maybe_pause_for_cast_distribution(state, player, &pending, &ability)?
+    {
+        return Ok(waiting_for);
     }
 
     if let Some(ability_index) = pending.activation_ability_index {
-        if let Some(ref activation_cost) = pending.activation_cost {
-            let should_record_loyalty = matches!(activation_cost, AbilityCost::Loyalty { .. })
-                && super::planeswalker::can_activate_loyalty_ability(
-                    state,
-                    pending.object_id,
-                    player,
-                    ability_index,
-                );
-            pay_ability_cost(state, player, pending.object_id, activation_cost, events)?;
-            if should_record_loyalty {
-                super::planeswalker::record_loyalty_activation(state, pending.object_id, player);
-            }
+        if let Some(waiting_for) = pay_activation_costs_after_target_selection(
+            state,
+            player,
+            &pending,
+            ability.clone(),
+            ability_index,
+            events,
+        )? {
+            return Ok(waiting_for);
         }
 
         let assigned_targets = flatten_targets_in_chain(&ability);
@@ -284,6 +339,13 @@ pub(crate) fn handle_select_targets(
         events.push(GameEvent::AbilityActivated {
             player_id: player,
             source_id: pending.object_id,
+            // CR 606.2: Compute from the source ability's cost; this path covers
+            // boast and other non-targeted activations, so it is normally `Normal`.
+            kind: super::planeswalker::activated_ability_kind(
+                state,
+                pending.object_id,
+                ability_index,
+            ),
         });
         // CR 702.142b: Emit additional event when a boast ability is activated.
         emit_keyword_ability_event_if_tagged(
@@ -293,8 +355,7 @@ pub(crate) fn handle_select_targets(
             player,
             events,
         );
-        state.priority_passes.clear();
-        state.priority_pass_count = 0;
+        priority::clear_priority_passes(state);
         return Ok(WaitingFor::Priority { player });
     }
 
@@ -308,15 +369,17 @@ pub(crate) fn handle_choose_target(
     target: Option<TargetRef>,
     events: &mut Vec<GameEvent>,
 ) -> Result<WaitingFor, EngineError> {
-    let (pending, target_slots, selection) = match &state.waiting_for {
+    let (pending, target_slots, mode_labels, selection) = match &state.waiting_for {
         WaitingFor::TargetSelection {
             pending_cast,
             target_slots,
+            mode_labels,
             selection,
             ..
         } => (
             *pending_cast.clone(),
             target_slots.clone(),
+            mode_labels.clone(),
             selection.clone(),
         ),
         _ => {
@@ -334,34 +397,35 @@ pub(crate) fn handle_choose_target(
         &selection,
         target,
     )? {
+        // CR 700.2: preserve the inbound mode labels unchanged — walking the
+        // slots one at a time does not change the slot→mode mapping.
         TargetSelectionAdvance::InProgress(selection) => Ok(WaitingFor::TargetSelection {
             player,
             pending_cast: Box::new(pending),
             target_slots,
+            mode_labels,
             selection,
         }),
         TargetSelectionAdvance::Complete(selected_slots) => {
             let mut ability = pending.ability.clone();
             assign_selected_slots_in_chain(state, &mut ability, &selected_slots)?;
 
+            if let Some(waiting_for) =
+                maybe_pause_for_cast_distribution(state, player, &pending, &ability)?
+            {
+                return Ok(waiting_for);
+            }
+
             if let Some(ability_index) = pending.activation_ability_index {
-                if let Some(ref activation_cost) = pending.activation_cost {
-                    let should_record_loyalty =
-                        matches!(activation_cost, AbilityCost::Loyalty { .. })
-                            && super::planeswalker::can_activate_loyalty_ability(
-                                state,
-                                pending.object_id,
-                                player,
-                                ability_index,
-                            );
-                    pay_ability_cost(state, player, pending.object_id, activation_cost, events)?;
-                    if should_record_loyalty {
-                        super::planeswalker::record_loyalty_activation(
-                            state,
-                            pending.object_id,
-                            player,
-                        );
-                    }
+                if let Some(waiting_for) = pay_activation_costs_after_target_selection(
+                    state,
+                    player,
+                    &pending,
+                    ability.clone(),
+                    ability_index,
+                    events,
+                )? {
+                    return Ok(waiting_for);
                 }
 
                 let assigned_targets = flatten_targets_in_chain(&ability);
@@ -396,6 +460,18 @@ pub(crate) fn handle_choose_target(
                 events.push(GameEvent::AbilityActivated {
                     player_id: player,
                     source_id: pending.object_id,
+                    // CR 606.2: Targeted activations (most loyalty abilities) finalize
+                    // here. Classify from the source ability's printed cost via
+                    // `activated_ability_kind` rather than `pending.activation_cost`:
+                    // the X-cost path clears `pending.activation_cost` before target
+                    // selection (casting_costs.rs), so a targeted `[-X]` loyalty
+                    // ability would otherwise lose its loyalty kind. The printed cost
+                    // is stable, mirroring the non-targeted path in `planeswalker.rs`.
+                    kind: super::planeswalker::activated_ability_kind(
+                        state,
+                        pending.object_id,
+                        ability_index,
+                    ),
                 });
                 // CR 702.142b: Emit additional event when a boast ability is activated.
                 emit_keyword_ability_event_if_tagged(
@@ -405,15 +481,129 @@ pub(crate) fn handle_choose_target(
                     player,
                     events,
                 );
-                state.priority_passes.clear();
-                state.priority_pass_count = 0;
-                return Ok(WaitingFor::Priority { player });
+                priority::clear_priority_passes(state);
+                return Ok(drain_deferred_triggers_after_stack_object_announcement(
+                    state,
+                    events,
+                    WaitingFor::Priority { player },
+                ));
             }
 
             let cost = pending.cost.clone();
             finish_pending_cast_cost_or_pay(state, player, pending, ability, cost, events)
         }
     }
+}
+
+fn pay_activation_costs_after_target_selection(
+    state: &mut GameState,
+    player: PlayerId,
+    pending: &PendingCast,
+    mut assigned_ability: ResolvedAbility,
+    ability_index: usize,
+    events: &mut Vec<GameEvent>,
+) -> Result<Option<WaitingFor>, EngineError> {
+    if !matches!(pending.cost, ManaCost::NoCost) {
+        let excluded_sources = pending
+            .activation_cost
+            .as_ref()
+            .map(|cost| {
+                super::casting::ability_mana_payment_excluded_sources(cost, pending.object_id)
+            })
+            .unwrap_or_default();
+        super::casting::pay_ability_mana_cost_excluding(
+            state,
+            player,
+            pending.object_id,
+            &pending.cost,
+            super::casting::activation_ability_tag(state, pending.object_id, ability_index),
+            events,
+            &excluded_sources,
+            // Top-level ability activation: no outer cost on the stack.
+            None,
+        )?;
+    }
+
+    if let Some(ref activation_cost) = pending.activation_cost {
+        // CR 107.4f + GH #600: Target-first activations store the full cost in
+        // `activation_cost` with `pending.cost = NoCost`; route through the same
+        // Phyrexian pause helper as the no-target activation path.
+        if let Some(waiting) = super::casting::try_pause_activation_phyrexian_payment(
+            state,
+            player,
+            pending.object_id,
+            ability_index,
+            &assigned_ability,
+            activation_cost,
+            events,
+        ) {
+            return Ok(Some(waiting));
+        }
+
+        if let Some((count, zone, filter)) = super::casting::find_non_self_exile(activation_cost) {
+            let narrow_zone = ExileCostSourceZone::try_from_zone(zone)
+                .expect("find_non_self_exile restricts zone to Hand or Graveyard");
+            let eligible = super::casting::find_eligible_exile_for_cost_targets(
+                state,
+                player,
+                pending.object_id,
+                narrow_zone,
+                filter,
+            );
+            if eligible.len() < count as usize {
+                return Err(EngineError::ActionNotAllowed(
+                    "Not enough eligible cards to exile".into(),
+                ));
+            }
+            let mut pending = pending.clone();
+            pending.ability = assigned_ability;
+            return Ok(Some(WaitingFor::PayCost {
+                player,
+                kind: PayCostKind::ExileFromZone { zone: narrow_zone },
+                choices: eligible,
+                count: count as usize,
+                min_count: 0,
+                resume: CostResume::Spell {
+                    spell: Box::new(pending),
+                },
+            }));
+        }
+
+        let should_record_loyalty = crate::types::ability::is_loyalty_ability_cost(activation_cost)
+            && super::planeswalker::can_activate_loyalty_ability(
+                state,
+                pending.object_id,
+                player,
+                ability_index,
+            );
+        super::casting::stamp_self_ref_discard_cost_paid_object(
+            state,
+            pending.object_id,
+            &mut assigned_ability,
+            activation_cost,
+        );
+        if let super::casting::PaymentOutcome::Paused { remaining_cost } =
+            pay_ability_cost_for_activation(
+                state,
+                player,
+                pending.object_id,
+                activation_cost,
+                super::casting::activation_ability_tag(state, pending.object_id, ability_index),
+                events,
+            )?
+        {
+            let mut pending = pending.clone();
+            pending.ability = assigned_ability;
+            pending.activation_cost = remaining_cost;
+            state.pending_cast = Some(Box::new(pending));
+            return Ok(Some(state.waiting_for.clone()));
+        }
+        if should_record_loyalty {
+            super::planeswalker::record_loyalty_activation(state, pending.object_id, player);
+        }
+    }
+
+    Ok(None)
 }
 
 /// CR 702.172a + CR 601.2f + CR 702.42a: Compose a modal spell's total cost.
@@ -457,6 +647,12 @@ fn escalate_cost_for_selected_modes(
         return None;
     }
 
+    // CR 702.120a + CR 702.102b: Reads the spell's own Escalate keyword. Left on the
+    // marker-default (non-fuse-aware) `effective_spell_keywords` deliberately: no
+    // real split card carries Escalate, and the only fuse-sensitive input is a
+    // `CastWithKeyword` `affected` filter keyed on the combined mana value / colors
+    // — a class that does not arise for Escalate. If a fused split spell were ever
+    // granted Escalate by a value-keyed static, this would need the `_for` variant.
     let cost = super::casting::effective_spell_keywords(state, player, pending.object_id)
         .into_iter()
         .find_map(|keyword| match keyword {
@@ -488,13 +684,28 @@ pub(super) fn extract_fixed_distribution_total(effect: &Effect) -> Option<u32> {
         Effect::PutCounter {
             count: QuantityExpr::Fixed { value },
             ..
-        }
-        | Effect::AddCounter {
-            count: QuantityExpr::Fixed { value },
-            ..
         } => Some(*value as u32),
         _ => None,
     }
+}
+
+/// CR 601.2d + CR 603.3d: Resolve the distribution pool for damage/counter division.
+pub(super) fn extract_distribution_total(
+    state: &GameState,
+    ability: &ResolvedAbility,
+    effect: &Effect,
+) -> Option<u32> {
+    if let Some(fixed) = extract_fixed_distribution_total(effect) {
+        return Some(fixed);
+    }
+    let count_expr = match effect {
+        Effect::DealDamage { amount, .. } => amount,
+        Effect::PutCounter { count, .. } => count,
+        _ => return None,
+    };
+    let (inner, _) = count_expr.peel_up_to();
+    let total = super::quantity::resolve_quantity_with_targets(state, inner, ability).max(0) as u32;
+    (total > 0).then_some(total)
 }
 
 /// CR 702.142b + CR 702.177a: If the activated ability at `ability_index` on
@@ -515,6 +726,20 @@ pub(crate) fn emit_keyword_ability_event_if_tagged(
         return;
     };
     if let Some(ability_tag) = def.ability_tag {
+        // CR 702.29c: Cycling does not use the generic `KeywordAbilityActivated`
+        // path — activating it emits a dedicated `GameEvent::Cycled` so "When you
+        // cycle this card" triggers fire. The card has already been discarded to
+        // the graveyard as the cycling cost (the zone the trigger fires from).
+        // The cost also emitted a `Discarded` event, so "whenever you discard"
+        // and "cycle or discard" (CR 702.29d, matched on `Discarded`) still fire
+        // exactly once.
+        if ability_tag == AbilityTag::Cycling {
+            events.push(GameEvent::Cycled {
+                player_id: player,
+                object_id: source_id,
+            });
+            return;
+        }
         let is_mana_ability =
             ability_tag == AbilityTag::Exhaust && super::mana_abilities::is_mana_ability(def);
         events.push(GameEvent::KeywordAbilityActivated {

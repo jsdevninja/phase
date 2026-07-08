@@ -21,15 +21,15 @@ use std::sync::{Arc, Mutex};
 use engine::ai_support::{ActionMetadata, AiDecisionContext, CandidateAction, TacticalClass};
 use engine::game::zones::create_object;
 use engine::types::ability::{
-    AbilityCost, AbilityDefinition, AbilityKind, ControllerRef, Effect, QuantityExpr, TargetFilter,
-    TypedFilter,
+    AbilityCost, AbilityDefinition, AbilityKind, ControllerRef, Effect, QuantityExpr,
+    SacrificeCost, TargetFilter, TypedFilter,
 };
 use engine::types::actions::GameAction;
 use engine::types::card_type::CoreType;
 use engine::types::game_state::{GameState, WaitingFor};
 use engine::types::identifiers::{CardId, ObjectId};
 use engine::types::player::PlayerId;
-use engine::types::zones::Zone;
+use engine::types::zones::{EtbTapState, Zone};
 use phase_ai::config::AiConfig;
 use phase_ai::context::AiContext;
 use phase_ai::features::{DeckFeatures, LandfallFeature};
@@ -92,15 +92,13 @@ fn make_fetch_ability() -> AbilityDefinition {
             target_player: None,
             selection_constraint: engine::types::ability::SearchSelectionConstraint::None,
             split: None,
+            source_zones: vec![engine::types::zones::Zone::Library],
         },
     );
     ability.cost = Some(AbilityCost::Composite {
         costs: vec![
             AbilityCost::Tap,
-            AbilityCost::Sacrifice {
-                target: TargetFilter::SelfRef,
-                count: 1,
-            },
+            AbilityCost::Sacrifice(SacrificeCost::count(TargetFilter::SelfRef, 1)),
         ],
     });
     ability.sub_ability = Some(Box::new(AbilityDefinition::new(
@@ -112,10 +110,13 @@ fn make_fetch_ability() -> AbilityDefinition {
             owner_library: false,
             enter_transformed: false,
             enters_under: Some(ControllerRef::You),
-            enter_tapped: false,
+            enter_tapped: EtbTapState::Unspecified,
             enters_attacking: false,
             up_to: false,
             enter_with_counters: vec![],
+            conditional_enter_with_counters: vec![],
+            face_down_profile: None,
+            enters_modified_if: None,
         },
     )));
     ability

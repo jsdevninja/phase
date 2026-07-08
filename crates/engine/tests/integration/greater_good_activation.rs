@@ -26,10 +26,11 @@
 use engine::game::scenario::{GameScenario, P0};
 use engine::types::ability::{
     AbilityCost, AbilityDefinition, AbilityKind, Effect, ObjectScope, QuantityExpr, QuantityRef,
-    TargetFilter, TypeFilter, TypedFilter,
+    SacrificeCost, TargetFilter, TargetRef, TypeFilter, TypedFilter,
 };
 use engine::types::actions::GameAction;
 use engine::types::card_type::CoreType;
+use engine::types::counter::CounterType;
 use engine::types::mana::ManaCost;
 use engine::types::phase::Phase;
 use engine::types::Zone;
@@ -102,10 +103,16 @@ fn greater_good_draws_equal_to_sacrificed_power_then_discards_three() {
             ability_index: 0,
         })
         .expect("activating Greater Good must succeed");
-    assert_eq!(
-        runner.waiting_for_kind(),
-        "SacrificeForCost",
-        "activating a Sacrifice-cost ability must prompt for the sacrifice",
+    assert!(
+        matches!(
+            &runner.state().waiting_for,
+            engine::types::WaitingFor::PayCost {
+                kind: engine::types::PayCostKind::Sacrifice,
+                ..
+            }
+        ),
+        "activating a Sacrifice-cost ability must prompt for the sacrifice, got {:?}",
+        runner.state().waiting_for,
     );
 
     runner
@@ -245,10 +252,16 @@ fn discard_cost_populates_cost_paid_object() {
             ability_index: 0,
         })
         .expect("activating the discard-cost ability must succeed");
-    assert_eq!(
-        runner.waiting_for_kind(),
-        "DiscardForCost",
-        "activating a Discard-cost ability must prompt for the discard",
+    assert!(
+        matches!(
+            &runner.state().waiting_for,
+            engine::types::WaitingFor::PayCost {
+                kind: engine::types::PayCostKind::Discard,
+                ..
+            }
+        ),
+        "activating a Discard-cost ability must prompt for the discard, got {:?}",
+        runner.state().waiting_for,
     );
 
     runner
@@ -407,10 +420,10 @@ fn multi_sacrifice_cost_count_is_honored() {
             target: TargetFilter::Controller,
         },
     )
-    .cost(AbilityCost::Sacrifice {
-        target: TargetFilter::Typed(TypedFilter::new(TypeFilter::Creature)),
-        count: 2,
-    });
+    .cost(AbilityCost::Sacrifice(SacrificeCost::count(
+        TargetFilter::Typed(TypedFilter::new(TypeFilter::Creature)),
+        2,
+    )));
 
     let host_id = scenario
         .add_creature(P0, "Twin Sacrifice", 0, 0)
@@ -427,7 +440,10 @@ fn multi_sacrifice_cost_count_is_honored() {
     {
         let ability = &runner.state().objects[&host_id].abilities[0];
         assert!(
-            matches!(ability.cost, Some(AbilityCost::Sacrifice { count: 2, .. })),
+            matches!(
+                ability.cost,
+                Some(AbilityCost::Sacrifice(ref c)) if c.requirement.fixed_count() == Some(2)
+            ),
             "the synthetic ability must carry a count: 2 Sacrifice cost",
         );
     }
@@ -444,10 +460,16 @@ fn multi_sacrifice_cost_count_is_honored() {
     // Creature core type stripped by `.as_enchantment()`, so it does not match
     // the `TypeFilter::Creature` sacrifice filter.
     match &runner.state().waiting_for {
-        engine::types::WaitingFor::SacrificeForCost {
-            count, permanents, ..
+        engine::types::WaitingFor::PayCost {
+            kind: engine::types::PayCostKind::Sacrifice,
+            count,
+            choices: permanents,
+            ..
         } => {
-            assert_eq!(*count, 2, "SacrificeForCost must honor the cost's count: 2",);
+            assert_eq!(
+                *count, 2,
+                "PayCost Sacrifice must honor the cost's count: 2",
+            );
             assert_eq!(
                 permanents.len(),
                 2,
@@ -486,10 +508,10 @@ fn multi_sacrifice_cost_resolves_through_pipeline() {
                 target: TargetFilter::Controller,
             },
         )
-        .cost(AbilityCost::Sacrifice {
-            target: TargetFilter::Typed(TypedFilter::new(TypeFilter::Creature)),
-            count: 2,
-        })
+        .cost(AbilityCost::Sacrifice(SacrificeCost::count(
+            TargetFilter::Typed(TypedFilter::new(TypeFilter::Creature)),
+            2,
+        )))
     };
 
     // Positive case: select exactly two victims → both sacrificed, cost cleared.
@@ -515,7 +537,11 @@ fn multi_sacrifice_cost_resolves_through_pipeline() {
         assert!(
             matches!(
                 &runner.state().waiting_for,
-                engine::types::WaitingFor::SacrificeForCost { count: 2, .. }
+                engine::types::WaitingFor::PayCost {
+                    kind: engine::types::PayCostKind::Sacrifice,
+                    count: 2,
+                    ..
+                }
             ),
             "the prompt must carry count: 2",
         );
@@ -536,9 +562,14 @@ fn multi_sacrifice_cost_resolves_through_pipeline() {
             Zone::Graveyard,
             "the second victim must be sacrificed to the graveyard",
         );
-        assert_ne!(
-            runner.waiting_for_kind(),
-            "SacrificeForCost",
+        assert!(
+            !matches!(
+                &runner.state().waiting_for,
+                engine::types::WaitingFor::PayCost {
+                    kind: engine::types::PayCostKind::Sacrifice,
+                    ..
+                }
+            ),
             "the ability must advance past the sacrifice cost",
         );
     }
@@ -574,4 +605,105 @@ fn multi_sacrifice_cost_resolves_through_pipeline() {
             "the handler must reject a short selection citing the required count; got {err:?}",
         );
     }
+}
+
+/// CR 601.2c + CR 701.21a — non-modal activated abilities with sacrifice
+/// costs must pay that cost before choosing targets when target legality or
+/// effect quantities depend on the sacrificed object. This mirrors Dina-style
+/// abilities that sacrifice one creature, then target another creature with an
+/// effect sized by `CostPaidObject`.
+#[test]
+fn sacrifice_cost_defers_target_selection_until_cost_paid_object_exists() {
+    let ability = AbilityDefinition::new(
+        AbilityKind::Activated,
+        Effect::PutCounter {
+            counter_type: CounterType::Plus1Plus1,
+            count: QuantityExpr::Ref {
+                qty: QuantityRef::Power {
+                    scope: ObjectScope::CostPaidObject,
+                },
+            },
+            target: TargetFilter::Typed(TypedFilter::new(TypeFilter::Creature)),
+        },
+    )
+    .cost(AbilityCost::Sacrifice(SacrificeCost::count(
+        TargetFilter::Typed(TypedFilter::new(TypeFilter::Creature)),
+        1,
+    )));
+
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let host_id = scenario
+        .add_creature(P0, "Dina-like Host", 1, 1)
+        .with_ability_definition(ability)
+        .as_enchantment()
+        .id();
+    let victim_id = scenario.add_creature(P0, "Victim", 3, 3).id();
+    let target_id = scenario.add_creature(P0, "Counter Target", 1, 1).id();
+    // A second legal creature target so auto-select does not skip the post-sacrifice
+    // target prompt when only one creature remains after the victim leaves play.
+    scenario.add_creature(P0, "Alternate Target", 2, 2);
+
+    let mut runner = scenario.build();
+    runner
+        .act(GameAction::ActivateAbility {
+            source_id: host_id,
+            ability_index: 0,
+        })
+        .expect("activating the sacrifice-cost ability must succeed");
+    assert!(
+        matches!(
+            &runner.state().waiting_for,
+            engine::types::WaitingFor::PayCost {
+                kind: engine::types::PayCostKind::Sacrifice,
+                ..
+            }
+        ),
+        "activating must prompt for sacrifice before target selection, got {:?}",
+        runner.state().waiting_for,
+    );
+
+    runner
+        .act(GameAction::SelectCards {
+            cards: vec![victim_id],
+        })
+        .expect("selecting the sacrifice victim must succeed");
+
+    match &runner.state().waiting_for {
+        engine::types::WaitingFor::TargetSelection { target_slots, .. } => {
+            assert_eq!(target_slots.len(), 1, "the effect has one target slot");
+            let legal_targets = &target_slots[0].legal_targets;
+            assert!(
+                legal_targets.contains(&TargetRef::Object(target_id)),
+                "the post-sacrifice target creature must be legal",
+            );
+            assert!(
+                !legal_targets.contains(&TargetRef::Object(victim_id)),
+                "the sacrificed creature must not remain targetable after cost payment",
+            );
+        }
+        other => panic!("expected target selection after sacrifice cost, got {other:?}"),
+    }
+
+    runner
+        .act(GameAction::SelectTargets {
+            targets: vec![TargetRef::Object(target_id)],
+        })
+        .expect("selecting the remaining creature target must succeed");
+    runner.advance_until_stack_empty();
+
+    assert_eq!(
+        runner.state().objects[&victim_id].zone,
+        Zone::Graveyard,
+        "the victim must be sacrificed before target selection",
+    );
+    assert_eq!(
+        runner.state().objects[&target_id]
+            .counters
+            .get(&CounterType::Plus1Plus1)
+            .copied()
+            .unwrap_or(0),
+        3,
+        "the effect must use the sacrificed creature's power as the counter count",
+    );
 }

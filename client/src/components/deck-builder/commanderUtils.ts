@@ -1,22 +1,12 @@
 import type { ScryfallCard } from "../../services/scryfall";
 import type { DeckEntry } from "../../services/deckParser";
-import { BASIC_LAND_NAMES, hasUnlimitedCopies } from "../../constants/game";
+import { BASIC_LAND_NAMES } from "../../constants/game";
 
 const WUBRG_COLORS = ["W", "U", "B", "R", "G"] as const;
 
-/** CR 702.124: All partner-family keywords that allow co-commander pairing. */
-const PARTNER_KEYWORDS = new Set([
-  "Partner", "Partner with", "Friends forever",
-  "Choose a Background", "Doctor's companion",
-]);
-
-function hasPartner(card: ScryfallCard): boolean {
-  if (card.keywords) {
-    return card.keywords.some((kw) => PARTNER_KEYWORDS.has(kw));
-  }
-  // Fallback for cards without keywords array
-  return card.oracle_text?.toLowerCase().includes("partner") ?? false;
-}
+// CR 702.124: Partner-pairing legality (including Doctor's Companion / Choose a
+// Background) is owned by the engine (`can_pair_commanders`) and consumed via
+// `commanderPartnerCandidates` in engineRuntime — never re-derived here.
 
 export function getCombinedColorIdentity(
   commanders: string[],
@@ -57,22 +47,18 @@ export function getColorIdentityViolations(
   return violations;
 }
 
+/**
+ * CR 903.5b: Names appearing above their effective copy cap in a singleton
+ * (Commander) deck, excluding basic lands. The cap comes from the engine-backed
+ * `getEffectiveCap` resolver (1 by default; raised for "up to N" override cards
+ * like Nazgûl → 9) — never inferred from Oracle text client-side.
+ */
 export function getSingletonViolations(
   deck: DeckEntry[],
-  cardDataCache: Map<string, ScryfallCard>,
+  _cardDataCache: Map<string, ScryfallCard>,
+  getEffectiveCap: (name: string) => number,
 ): string[] {
   return deck
-    .filter((e) => e.count > 1 && !BASIC_LAND_NAMES.has(e.name) && !hasUnlimitedCopies(cardDataCache.get(e.name)?.oracle_text))
+    .filter((e) => e.count > getEffectiveCap(e.name) && !BASIC_LAND_NAMES.has(e.name))
     .map((e) => e.name);
-}
-
-export function canAddPartner(
-  commanders: string[],
-  card: ScryfallCard,
-  cardDataCache: Map<string, ScryfallCard>,
-): boolean {
-  if (commanders.length === 0) return true;
-  if (commanders.length >= 2) return false;
-  const firstCard = cardDataCache.get(commanders[0]);
-  return (firstCard ? hasPartner(firstCard) : false) && hasPartner(card);
 }

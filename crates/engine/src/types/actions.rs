@@ -3,12 +3,12 @@ use serde::{Deserialize, Serialize};
 use super::ability::{LibraryPosition, TargetRef};
 use super::counter::CounterType;
 use super::game_state::{
-    AutoMayChoice, AutoPassRequest, CastPaymentMode, CombatDamageAssignmentMode, CounterMoveChoice,
-    ShardChoice,
+    AutoMayChoice, AutoPassRequest, CastPaymentMode, CombatDamageAssignmentMode, CounterCostChoice,
+    CounterMoveChoice, CounterRemoveChoice, ShardChoice, YieldScope, YieldTarget,
 };
 use super::identifiers::{CardId, ObjectId};
 use super::keywords::Keyword;
-use super::mana::ManaType;
+use super::mana::{ManaPipId, ManaType};
 use super::match_config::DeckCardCount;
 use super::phase::Phase;
 use super::player::{PlayerCounterKind, PlayerId};
@@ -25,9 +25,10 @@ use crate::game::game_object::AttachTarget;
 #[serde(tag = "type")]
 pub enum CastChoice {
     /// CR 701.57a + CR 702.85a: Cast the offered card without paying its mana
-    /// cost. The cast pipeline still enforces target legality, alternative
-    /// constraints (e.g., `CascadeResultingMvBelow`), and other CR 601.2
-    /// checks.
+    /// cost. The cast pipeline still enforces target legality, the
+    /// cast-during-resolution resulting-MV constraint (`ManaValue` carried on
+    /// the `ExileWithAltCost` permission with `resolution_cleanup`), and other
+    /// CR 601.2 checks.
     Cast,
     /// CR 701.57a + CR 702.85a: Decline the offer. For Discover the card goes
     /// to hand; for Cascade the card joins the misses on the bottom of the
@@ -116,11 +117,7 @@ pub enum GameAction {
         object_id: ObjectId,
         card_id: CardId,
         targets: Vec<ObjectId>,
-    },
-    CastSpellWithPaymentMode {
-        object_id: ObjectId,
-        card_id: CardId,
-        targets: Vec<ObjectId>,
+        #[serde(default)]
         payment_mode: CastPaymentMode,
     },
     /// CR 702.143a-b: Foretell special action — during your turn while you
@@ -137,6 +134,12 @@ pub enum GameAction {
     },
     DeclareAttackers {
         attacks: Vec<(ObjectId, AttackTarget)>,
+        /// CR 702.22c: As a player declares attackers, they may declare that one
+        /// or more attacking creatures with banding (or one with banding and any
+        /// number of others) form an attacking band. Each inner `Vec` is one band
+        /// of attacker `ObjectId`s. Empty (the default) means no bands declared.
+        #[serde(default)]
+        bands: Vec<Vec<ObjectId>>,
     },
     DeclareBlockers {
         assignments: Vec<(ObjectId, ObjectId)>,
@@ -146,6 +149,36 @@ pub enum GameAction {
     ChooseUntap {
         object_id: ObjectId,
         untap: bool,
+    },
+    /// CR 508.1g + CR 701.43d: The active player's decision whether to pay the
+    /// optional "exert this creature as it attacks" cost for the attacker named
+    /// in the pending `WaitingFor::ExertChoice`. `exert: false` declines.
+    ChooseExert {
+        exert: bool,
+    },
+    /// CR 508.1g + CR 702.154a: The active player's decision whether to pay
+    /// the pending Enlist optional attack cost by tapping one eligible
+    /// creature. `None` declines because Enlist allows tapping "up to one."
+    ChooseEnlist {
+        target: Option<ObjectId>,
+    },
+    /// CR 701.30b: The clashing player's choice of which opponent to clash with,
+    /// answering a pending `WaitingFor::ClashChooseOpponent`. `opponent` must be
+    /// one of that prompt's `candidates`.
+    ChooseClashOpponent {
+        opponent: PlayerId,
+    },
+    /// CR 702.132a: Assist — the caster's answer to `WaitingFor::AssistChoosePlayer`.
+    /// `Some(p)` chooses player `p` (one of the prompt's `candidates`) to help pay
+    /// the generic mana; `None` declines and proceeds to normal payment.
+    ChooseAssistPlayer {
+        player: Option<PlayerId>,
+    },
+    /// CR 702.132a: Assist — the chosen player's answer to `WaitingFor::AssistPayment`.
+    /// `generic` is how much of the spell's generic mana they pay (0 = nothing),
+    /// capped at the prompt's `max_generic`.
+    CommitAssistPayment {
+        generic: u32,
     },
     /// CR 103.5 + 103.5b: A player's decision at a `WaitingFor::MulliganDecision`
     /// prompt. See [`MulliganChoice`] for the three branches.
@@ -172,8 +205,29 @@ pub enum GameAction {
     UntapLandForMana {
         object_id: ObjectId,
     },
+    /// CR 118.3a: Pin a specific pool `ManaUnit` (by id) so the finalize spend
+    /// prefers it. The unit stays in the pool — this records a priority hint on
+    /// `PendingCast.pinned_pool_units`, it does not remove mana.
+    SpendPoolMana {
+        pip_id: ManaPipId,
+    },
+    /// CR 118.3a: Remove a previously-recorded pin. Always legal (no-op if the
+    /// pin is absent).
+    UnspendPoolMana {
+        pip_id: ManaPipId,
+    },
     SelectCards {
         cards: Vec<ObjectId>,
+    },
+    /// CR 118.3 + CR 122.1: Choose exactly how many counters each selected
+    /// object contributes to a remove-counter cost that says "from among".
+    ChooseRemoveCounterCostDistribution {
+        distribution: Vec<CounterCostChoice>,
+    },
+    /// CR 705.1: Krark's Thumb keep-choice — indices into `results` the player
+    /// keeps (ignoring the rest, CR 614.1a). Length must equal `keep_count`.
+    SelectCoinFlips {
+        keep_indices: Vec<usize>,
     },
     /// CR 400.11 + CR 406.3: Player commits one or more selections from the
     /// offered outside-game pool. Each selection is a discriminated source —
@@ -246,6 +300,22 @@ pub enum GameAction {
     ChooseOption {
         choice: String,
     },
+    /// CR 701.38b: Cast a vote for one object candidate in an object-pool vote
+    /// (`VoteSubject::Objects` — Council's Judgment, Prime Minister's Cabinet
+    /// Room). `candidate_index` indexes `WaitingFor::VoteChoice.candidate_objects`
+    /// (and the parallel `option_labels`). Index-based — not name-based — so
+    /// two candidates with the same printed name are disambiguated. Named votes
+    /// continue to use `ChooseOption { choice }`; object votes reject the string
+    /// path because their candidates are not canonical option words.
+    SubmitVoteCandidate {
+        candidate_index: u32,
+    },
+    /// Alchemy spellbook draft: the player's chosen card name in response to
+    /// `WaitingFor::SpellbookDraft`. The named card is conjured into the
+    /// pending destination.
+    SubmitSpellbookDraft {
+        card: String,
+    },
     /// CR 700.3 + CR 700.3a: Submit one pile (pile A) of a
     /// `SeparateIntoPiles` partition. Pile B is derived by the engine as
     /// `eligible \ pile_a` — CR 700.3a requires the partition to be
@@ -265,6 +335,11 @@ pub enum GameAction {
     /// CR 701.55a: Choose one branch of a resolution-time "A or B" instruction.
     ChooseBranch {
         index: usize,
+    },
+    /// CR 119.7 + CR 119.8: Submit one of the engine-enumerated life-total redistribution
+    /// options. `option_index` indexes `WaitingFor::RedistributeLifeTotals.options`.
+    SubmitLifeRedistribution {
+        option_index: usize,
     },
     /// CR 609.7a: Choose a source of damage for a prevention or replacement effect.
     ChooseDamageSource {
@@ -331,11 +406,7 @@ pub enum GameAction {
         hand_object: ObjectId,
         card_id: CardId,
         creature_to_return: ObjectId,
-    },
-    CastSpellAsSneakWithPaymentMode {
-        hand_object: ObjectId,
-        card_id: CardId,
-        creature_to_return: ObjectId,
+        #[serde(default)]
         payment_mode: CastPaymentMode,
     },
     /// CR 702.188a: Cast a spell from HAND via the Web-slinging alternative cost.
@@ -344,11 +415,7 @@ pub enum GameAction {
         hand_object: ObjectId,
         card_id: CardId,
         creature_to_return: ObjectId,
-    },
-    CastSpellAsWebSlingingWithPaymentMode {
-        hand_object: ObjectId,
-        card_id: CardId,
-        creature_to_return: ObjectId,
+        #[serde(default)]
         payment_mode: CastPaymentMode,
     },
     /// CR 601.2b + CR 118.9a: Cast a spell from hand for free via a
@@ -365,11 +432,7 @@ pub enum GameAction {
         object_id: ObjectId,
         card_id: CardId,
         source_id: ObjectId,
-    },
-    CastSpellForFreeWithPaymentMode {
-        object_id: ObjectId,
-        card_id: CardId,
-        source_id: ObjectId,
+        #[serde(default)]
         payment_mode: CastPaymentMode,
     },
     /// CR 702.94a + CR 603.11: Accept a pending `WaitingFor::MiracleReveal`
@@ -380,27 +443,28 @@ pub enum GameAction {
     CastSpellAsMiracle {
         object_id: ObjectId,
         card_id: CardId,
-    },
-    CastSpellAsMiracleWithPaymentMode {
-        object_id: ObjectId,
-        card_id: CardId,
+        #[serde(default)]
         payment_mode: CastPaymentMode,
     },
-    /// CR 702.35a: Accept a pending `WaitingFor::MadnessCastOffer` and cast
+    /// CR 702.35a: Accept a pending `WaitingFor::CastOffer` (Madness) and cast
     /// `object_id` from exile for its madness cost. Decline is via the shared
     /// `DecideOptionalEffect { accept: false }`.
     CastSpellAsMadness {
         object_id: ObjectId,
         card_id: CardId,
-    },
-    CastSpellAsMadnessWithPaymentMode {
-        object_id: ObjectId,
-        card_id: CardId,
+        #[serde(default)]
         payment_mode: CastPaymentMode,
     },
     /// CR 609.3: Accept or decline an optional effect ("You may X").
     DecideOptionalEffect {
         accept: bool,
+    },
+    /// CR 702.47a–e: Respond to a `WaitingFor::SpliceOffer`. `Some(card)` splices
+    /// that card from hand onto the spell being cast (re-presenting the offer for
+    /// any remaining eligible cards, CR 702.47e); `None` declines/finishes
+    /// splicing and proceeds to target selection.
+    RespondToSpliceOffer {
+        card: Option<ObjectId>,
     },
     DecideOptionalEffectAndRemember {
         choice: AutoMayChoice,
@@ -451,6 +515,17 @@ pub enum GameAction {
         object_id: ObjectId,
         door: crate::game::game_object::RoomDoor,
     },
+    /// CR 901.9 / CR 116.2i: Active-player special action to roll the planar
+    /// die during a main phase while the stack is empty.
+    RollPlanarDie,
+    /// CR 709.5f-g: Response to `WaitingFor::ChooseRoomDoor` — the player picked
+    /// which door (half) of the targeted Room to act on, and the operation to
+    /// apply to it. The `(op, door)` pair must be one of the prompt's `options`.
+    ChooseRoomDoor {
+        object_id: ObjectId,
+        op: crate::types::ability::DoorLockOp,
+        door: crate::game::game_object::RoomDoor,
+    },
     /// CR 702.51a: Tap creature/artifact for convoke or waterbend mana.
     /// CR 302.6: Summoning sickness does not apply (convoke doesn't use the tap ability mechanism).
     TapForConvoke {
@@ -473,13 +548,48 @@ pub enum GameAction {
     DiscoverChoice {
         choice: CastChoice,
     },
+    /// CR 608.2g + CR 609.4b: Accept/decline a during-resolution PAID cast of a
+    /// graveyard card (Quistis Trepe, Tinybones the Pickpocket). On accept the
+    /// caster pays the card's real printed cost with any-type mana; on decline
+    /// the card stays in the graveyard.
+    GraveyardPaidCastChoice {
+        choice: CastChoice,
+    },
     /// CR 702.85a: Choose to cast the cascaded card without paying its mana cost.
     CascadeChoice {
         choice: CastChoice,
     },
+    /// CR 702.60a: Choose to cast a revealed same-named ripple card for free.
+    RippleChoice {
+        choice: CastChoice,
+    },
+    /// CR 608.2g + CR 601.2: Pick one candidate to cast for free from an open
+    /// `WaitingFor::CastOffer { FreeCastWindow }` (Invoke Calamity), or `None`
+    /// to finish the window without casting (further) spells. Distinct from the
+    /// binary `CastChoice` used by Cascade/Discover/Ripple because the player
+    /// chooses *which* of several offered cards to cast, not merely whether to
+    /// cast a single pre-selected one.
+    FreeCastWindowChoice {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selection: Option<crate::types::identifiers::ObjectId>,
+    },
     /// CR 401.4: Choose top or bottom of library.
     ChooseTopOrBottom {
         top: bool,
+    },
+    /// CR 702.140c + CR 730.2a: As a mutating creature spell resolves with a
+    /// legal target, the spell's controller chooses whether the spell is placed
+    /// on top of or under the target creature. Resolved by
+    /// `merge::handle_mutate_merge_choice`.
+    ChooseMutateMergeSide {
+        side: crate::game::merge::MergeSide,
+    },
+    /// CR 702.99a: As a Cipher spell resolves, the controller chooses a creature
+    /// to encode the card on (`Some`) or declines (`None`, card → graveyard).
+    /// Resolved by `cipher::handle_encode_choice`.
+    CipherEncode {
+        #[serde(default)]
+        creature: Option<ObjectId>,
     },
     /// CR 704.5j: Choose which legendary permanent to keep.
     ChooseLegend {
@@ -497,11 +607,19 @@ pub enum GameAction {
     /// Cancel any active auto-pass for the acting player.
     CancelAutoPass,
     /// Replace the acting player's phase-stop preference list. Phase stops
-    /// interrupt an `UntilEndOfTurn` auto-pass session and prevent the engine
+    /// interrupt an `UntilTurnBoundary` auto-pass session and prevent the engine
     /// from auto-submitting empty blocker declarations during the named phases.
     /// Legal in any WaitingFor state — pure preference propagation.
     SetPhaseStops {
-        stops: Vec<super::phase::Phase>,
+        stops: Vec<super::phase::PhaseStop>,
+    },
+    /// CR 117.3d: Update the acting player's standing priority-yield preferences —
+    /// a pre-committed decision to pass priority while a class of triggered
+    /// ability is on the stack. Legal in any WaitingFor state and routed to the
+    /// acting player (not necessarily the priority-holder), mirroring
+    /// `SetPhaseStops`. Pure preference propagation.
+    SetPriorityYield {
+        op: PriorityYieldOp,
     },
     /// CR 510.1c/d: Assign damage from an attacker to its blockers (and optionally
     /// the defending player/PW with trample, plus PW controller with trample-over-PW).
@@ -514,6 +632,16 @@ pub enum GameAction {
         #[serde(default)]
         controller_damage: u32,
     },
+    /// CR 510.1d + CR 702.22k: Assign a blocking creature's combat damage,
+    /// divided as the active player chooses, among the creatures it is blocking.
+    /// Answers a `WaitingFor::AssignBlockerDamage` prompt. Each `(ObjectId, u32)`
+    /// is `(attacker_being_blocked, damage)`; the amounts must sum to the
+    /// blocker's combat power. Unlike `AssignCombatDamage`, there is no lethal,
+    /// trample, or planeswalker dimension — a blocker only ever assigns to the
+    /// attackers it blocks.
+    AssignBlockerDamage {
+        assignments: Vec<(ObjectId, u32)>,
+    },
     /// CR 601.2d: Distribute N among targets at casting time.
     DistributeAmong {
         distribution: Vec<(TargetRef, u32)>,
@@ -521,6 +649,13 @@ pub enum GameAction {
     /// CR 122.5 + CR 608.2d: Submit resolution-time counter-move distribution.
     ChooseCounterMoveDistribution {
         selections: Vec<CounterMoveChoice>,
+    },
+    /// CR 107.1c + CR 608.2d: Submit the resolution-time "remove any number of
+    /// counters" selection (Rhys, the Evermore; Tetravus). Answers a
+    /// `WaitingFor::RemoveCountersChoice`. An empty `selections` vector removes
+    /// nothing (CR 107.1c: choosing zero is always legal).
+    ChooseCountersToRemove {
+        selections: Vec<CounterRemoveChoice>,
     },
     /// CR 107.1c + CR 107.14: Submit the chosen amount for a
     /// `WaitingFor::PayAmountChoice` prompt ("pay any amount of {E}" and
@@ -541,6 +676,13 @@ pub enum GameAction {
     /// `WaitingFor::CategoryChoice::categories`. `None` = no permanent of that type.
     SelectCategoryPermanents {
         choices: Vec<Option<ObjectId>>,
+    },
+    /// CR 107.1c + CR 701.21a: Answer to `WaitingFor::KeepWithinTotalPowerChoice`
+    /// (Slaughter the Strong) — the subset of eligible creatures to keep. Every id
+    /// must be in the prompt's `eligible` set and their combined power must not
+    /// exceed `cap`; the rest are sacrificed.
+    ChooseKeptCreatures {
+        kept: Vec<ObjectId>,
     },
     /// CR 107.1b + CR 601.2f: Choose the value of X for a spell or activated
     /// ability whose cost contains X. Chosen as part of determining total cost,
@@ -587,15 +729,19 @@ pub enum GameAction {
     CastPreparedCopy {
         source: ObjectId,
     },
+    /// Digital-only Specialize: pick the color specialization to apply.
+    ChooseSpecializeColor {
+        color: super::mana::ManaColor,
+    },
     /// CR 702.xxx: Paradigm (Strixhaven) — accept the turn-based offer during
-    /// `WaitingFor::ParadigmCastOffer`, casting a token copy of the exiled
+    /// `WaitingFor::CastOffer` (Paradigm), casting a token copy of the exiled
     /// source spell without paying its mana cost. The exiled source stays in
     /// exile. Assign when WotC publishes SOS CR update.
     CastParadigmCopy {
         source: ObjectId,
     },
     /// CR 702.xxx: Paradigm (Strixhaven) — decline the turn-based offer during
-    /// `WaitingFor::ParadigmCastOffer`. The exiled source stays in exile and
+    /// `WaitingFor::CastOffer` (Paradigm). The exiled source stays in exile and
     /// may be offered again next turn. Assign when WotC publishes SOS CR
     /// update.
     PassParadigmOffer,
@@ -630,6 +776,25 @@ pub enum GameAction {
     },
 }
 
+/// CR 117.3d: The mutation a `GameAction::SetPriorityYield` performs on the
+/// acting player's standing priority-yield preferences. `Add` names a stack
+/// source and scope; the engine resolves it into a concrete `YieldTarget` by
+/// reading the identity latched on that source's trigger (CR 400.7), so the
+/// frontend never constructs an incarnation or card id. `Remove` echoes a
+/// stored `YieldTarget` verbatim; `ClearAll` drops every yield for the actor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data")]
+pub enum PriorityYieldOp {
+    Add {
+        source_id: ObjectId,
+        scope: YieldScope,
+    },
+    Remove {
+        target: YieldTarget,
+    },
+    ClearAll,
+}
+
 /// CR 701.48a: Learn choice — rummage a specific card, or skip entirely.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
@@ -638,6 +803,13 @@ pub enum LearnOption {
     Rummage { card_id: ObjectId },
     /// Decline to learn (skip).
     Skip,
+}
+
+/// Serde default for debug spawn `run_etb` flags: omitting the field means
+/// "run the ETB pipeline", preserving the historical always-ETB behavior for
+/// any payload that predates the toggle.
+fn default_true() -> bool {
+    true
 }
 
 /// Direct game-state manipulation actions for debugging, testing, and remediation.
@@ -671,14 +843,30 @@ pub enum DebugAction {
         zone: Zone,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         attach_to: Option<AttachTarget>,
+        /// When `true`, route a `Battlefield` spawn through the real ETB pipeline
+        /// (replacements → ETB triggers → SBAs). When `false`, place the card raw
+        /// with no entry effects — mirrors `MoveToZone { simulate: false }`. Only
+        /// consulted for `zone == Battlefield`; ignored for other destinations.
+        #[serde(default = "default_true")]
+        run_etb: bool,
     },
     /// Remove an object from the game entirely.
     RemoveObject { object_id: ObjectId },
+    /// CR 701.21: Sacrifice a permanent — route through the single sacrifice
+    /// authority so the replacement pipeline and dies/leaves-the-battlefield
+    /// triggers fire. Distinct from `RemoveObject`, which deletes the object
+    /// outright with no triggers. The sacrificing player is the permanent's
+    /// controller.
+    Sacrifice { object_id: ObjectId },
     /// Draw N cards using the real draw pipeline (CR 121.1).
     /// Routes through replacement effects and emits CardDrawn events.
     DrawCards { player_id: PlayerId, count: u32 },
     /// Mill N cards from library to graveyard.
     Mill { player_id: PlayerId, count: u32 },
+    /// CR 701.20a: Reveal the top N card(s) of a player's library using the real
+    /// `Effect::RevealTop` resolver — marks them revealed and emits
+    /// `CardsRevealed` without moving the cards (CR 701.20b).
+    Reveal { player_id: PlayerId, count: u32 },
     /// Shuffle a player's library.
     ShuffleLibrary { player_id: PlayerId },
     /// Start a proliferate choice for a player using the real proliferate
@@ -701,6 +889,12 @@ pub enum DebugAction {
     },
     /// Tap or untap an object.
     SetTapped { object_id: ObjectId, tapped: bool },
+    /// CR 722.3a: Give or remove the "prepared" designation on an object so a
+    /// preparation card's prepare spell can be cast for testing. Routes through
+    /// the `game::effects::prepare` single authority, so setting `prepared`
+    /// no-ops on objects without a prepare-spell face and emits the
+    /// `BecamePrepared` / `BecameUnprepared` events.
+    SetPrepared { object_id: ObjectId, prepared: bool },
     /// Change an object's controller. Marks layers dirty.
     SetController {
         object_id: ObjectId,
@@ -752,6 +946,12 @@ pub enum DebugAction {
         player_id: PlayerId,
         mana: Vec<ManaType>,
     },
+    /// Toggle "infinite mana" for a player (debug-only). While `enabled`, the
+    /// engine keeps the player's mana pool topped up after every action and
+    /// suppresses the end-of-step empty (CR 500.5) for that player, so any cost
+    /// is payable. Setting `enabled = false` clears the toggle; the pool then
+    /// empties normally on the next step transition. Off by default.
+    SetInfiniteMana { player_id: PlayerId, enabled: bool },
 
     // ── Game Flow ─────────────────────────────────────────────────────────
     /// Advance or rewind to a specific phase/step.
@@ -773,7 +973,16 @@ pub enum DebugAction {
     /// `TokenSpec::enter_with_counters` — same semantics, real pipeline.
     /// CR 122.6a (counters placed at ETB), CR 614.1 (replacement window),
     /// CR 704.5f (0-toughness SBA — why this field exists).
-    CreateToken { request: DebugTokenRequest },
+    ///
+    /// When `run_etb` is `true`, the created token's ETB triggers are placed on
+    /// the stack and SBAs run; when `false`, the token is still created (with its
+    /// replacement-window counters) but its "when ~ enters" triggers and the SBA
+    /// pass are skipped — mirrors `MoveToZone { simulate: false }`.
+    CreateToken {
+        request: DebugTokenRequest,
+        #[serde(default = "default_true")]
+        run_etb: bool,
+    },
     /// Create a token copy of an existing object using the real copy-token
     /// resolver (CR 707.2).
     CreateTokenCopy {
@@ -788,6 +997,10 @@ pub enum DebugTokenRequest {
     Preset {
         preset_id: String,
         owner: PlayerId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        power_override: Option<i32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        toughness_override: Option<i32>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         enter_with_counters: Vec<(CounterType, u32)>,
     },
@@ -868,6 +1081,7 @@ impl DebugAction {
                 owner,
                 zone,
                 attach_to,
+                run_etb,
             } => {
                 let attach_suffix = match attach_to {
                     Some(AttachTarget::Object(id)) => format!(" attached to {}", obj(*id)),
@@ -876,16 +1090,24 @@ impl DebugAction {
                     }
                     None => String::new(),
                 };
+                let etb_suffix = if *run_etb { "" } else { " (no ETB)" };
                 format!(
-                    "CreateCard ({} for {} in {:?}{})",
+                    "CreateCard ({} for {} in {:?}{}{})",
                     card_name,
                     player_label(*owner),
                     zone,
                     attach_suffix,
+                    etb_suffix,
                 )
             }
             DebugAction::RemoveObject { object_id } => {
                 format!("RemoveObject ({})", obj(*object_id))
+            }
+            DebugAction::Sacrifice { object_id } => {
+                format!("Sacrifice ({})", obj(*object_id))
+            }
+            DebugAction::Reveal { player_id, count } => {
+                format!("Reveal (top {} of {})", count, player_label(*player_id))
             }
             DebugAction::DrawCards { player_id, count } => {
                 format!("DrawCards ({} draws {})", player_label(*player_id), count)
@@ -939,6 +1161,14 @@ impl DebugAction {
                 obj(*object_id),
                 if *tapped { "tapped" } else { "untapped" }
             ),
+            DebugAction::SetPrepared {
+                object_id,
+                prepared,
+            } => format!(
+                "SetPrepared ({} → {})",
+                obj(*object_id),
+                if *prepared { "prepared" } else { "unprepared" }
+            ),
             DebugAction::SetController {
                 object_id,
                 controller,
@@ -984,6 +1214,11 @@ impl DebugAction {
             DebugAction::AddMana { player_id, mana } => {
                 format!("AddMana ({} gains {:?})", player_label(*player_id), mana)
             }
+            DebugAction::SetInfiniteMana { player_id, enabled } => format!(
+                "SetInfiniteMana ({} {})",
+                player_label(*player_id),
+                if *enabled { "on" } else { "off" }
+            ),
             DebugAction::SetPhase {
                 phase,
                 active_player,
@@ -993,7 +1228,7 @@ impl DebugAction {
                 player_label(*active_player)
             ),
             DebugAction::RunStateBasedActions => "RunStateBasedActions".to_string(),
-            DebugAction::CreateToken { request } => {
+            DebugAction::CreateToken { request, run_etb } => {
                 let counters = if request.enter_with_counters().is_empty() {
                     String::new()
                 } else {
@@ -1004,17 +1239,31 @@ impl DebugAction {
                         .collect();
                     format!(" with {}", parts.join(", "))
                 };
+                let etb_suffix = if *run_etb { "" } else { " (no ETB)" };
                 let token_label = match request {
-                    DebugTokenRequest::Preset { preset_id, .. } => preset_id.as_str(),
+                    DebugTokenRequest::Preset {
+                        preset_id,
+                        power_override,
+                        toughness_override,
+                        ..
+                    } => {
+                        if let (Some(power), Some(toughness)) = (power_override, toughness_override)
+                        {
+                            format!("{preset_id} {power}/{toughness}")
+                        } else {
+                            preset_id.clone()
+                        }
+                    }
                     DebugTokenRequest::Custom {
                         characteristics, ..
-                    } => characteristics.display_name.as_str(),
+                    } => characteristics.display_name.clone(),
                 };
                 format!(
-                    "CreateToken ({} for {}{})",
+                    "CreateToken ({} for {}{}{})",
                     token_label,
                     player_label(request.owner()),
-                    counters
+                    counters,
+                    etb_suffix
                 )
             }
             DebugAction::CreateTokenCopy { source_id, owner } => format!(
@@ -1048,7 +1297,13 @@ impl GameAction {
     pub fn is_mana_ability(&self) -> bool {
         matches!(
             self,
-            GameAction::TapLandForMana { .. } | GameAction::UntapLandForMana { .. }
+            GameAction::TapLandForMana { .. }
+                | GameAction::UntapLandForMana { .. }
+                // CR 118.3a: pinning/unpinning a pool unit is a mana-payment-window
+                // action; classifying it here grants MP skip_legality acceptance and
+                // AI-exclusion via the single !is_mana_ability authority.
+                | GameAction::SpendPoolMana { .. }
+                | GameAction::UnspendPoolMana { .. }
         )
     }
 
@@ -1069,50 +1324,49 @@ impl GameAction {
     pub fn source_object(&self) -> Option<ObjectId> {
         match self {
             GameAction::PlayLand { object_id, .. } => Some(*object_id),
-            GameAction::CastSpell { object_id, .. }
-            | GameAction::CastSpellWithPaymentMode { object_id, .. } => Some(*object_id),
+            GameAction::CastSpell { object_id, .. } => Some(*object_id),
             GameAction::Foretell { object_id, .. } => Some(*object_id),
-            GameAction::CastSpellAsSneak { hand_object, .. }
-            | GameAction::CastSpellAsSneakWithPaymentMode { hand_object, .. } => Some(*hand_object),
-            GameAction::CastSpellAsWebSlinging { hand_object, .. }
-            | GameAction::CastSpellAsWebSlingingWithPaymentMode { hand_object, .. } => {
-                Some(*hand_object)
-            }
+            GameAction::CastSpellAsSneak { hand_object, .. } => Some(*hand_object),
+            GameAction::CastSpellAsWebSlinging { hand_object, .. } => Some(*hand_object),
             GameAction::ActivateNinjutsu {
                 ninjutsu_object_id, ..
             } => Some(*ninjutsu_object_id),
             GameAction::CastSpellForFree { object_id, .. }
-            | GameAction::CastSpellForFreeWithPaymentMode { object_id, .. }
             | GameAction::CastSpellAsMiracle { object_id, .. }
-            | GameAction::CastSpellAsMiracleWithPaymentMode { object_id, .. }
-            | GameAction::CastSpellAsMadness { object_id, .. }
-            | GameAction::CastSpellAsMadnessWithPaymentMode { object_id, .. } => Some(*object_id),
+            | GameAction::CastSpellAsMadness { object_id, .. } => Some(*object_id),
             GameAction::ActivateAbility { source_id, .. } => Some(*source_id),
             GameAction::TapLandForMana { object_id } => Some(*object_id),
             GameAction::UntapLandForMana { object_id } => Some(*object_id),
+            // CR 118.3a: act on a pool pip, not a battlefield object.
+            GameAction::SpendPoolMana { .. } | GameAction::UnspendPoolMana { .. } => None,
             GameAction::Equip { equipment_id, .. } => Some(*equipment_id),
             GameAction::CrewVehicle { vehicle_id, .. } => Some(*vehicle_id),
             GameAction::ActivateStation { spacecraft_id, .. } => Some(*spacecraft_id),
             GameAction::SaddleMount { mount_id, .. } => Some(*mount_id),
             GameAction::Transform { object_id } => Some(*object_id),
             GameAction::UnlockRoomDoor { object_id, .. } => Some(*object_id),
+            GameAction::ChooseRoomDoor { object_id, .. } => Some(*object_id),
             GameAction::PlayFaceDown { object_id, .. } => Some(*object_id),
             GameAction::TurnFaceUp { object_id } => Some(*object_id),
             GameAction::ChooseRingBearer { target } => Some(*target),
             GameAction::ChoosePair { partner } => *partner,
             GameAction::ChooseDamageSource { source } => Some(*source),
             GameAction::ChooseUntap { object_id, .. } => Some(*object_id),
+            GameAction::ChooseEnlist { target } => *target,
             GameAction::TapForConvoke { object_id, .. } => Some(*object_id),
             GameAction::ChooseLegend { keep } => Some(*keep),
             GameAction::CastPreparedCopy { source } => Some(*source),
             GameAction::CastParadigmCopy { source } => Some(*source),
             // Actions with no per-permanent anchor.
             GameAction::PassPriority
+            | GameAction::ChooseExert { .. }
             | GameAction::DeclareAttackers { .. }
             | GameAction::DeclareBlockers { .. }
             | GameAction::MulliganDecision { .. }
             | GameAction::ReorderHand { .. }
             | GameAction::SelectCards { .. }
+            | GameAction::ChooseRemoveCounterCostDistribution { .. }
+            | GameAction::SelectCoinFlips { .. }
             | GameAction::ChooseOutsideGameCards { .. }
             | GameAction::SelectTargets { .. }
             | GameAction::ChooseTarget { .. }
@@ -1122,11 +1376,15 @@ impl GameAction {
             | GameAction::SubmitSideboard { .. }
             | GameAction::ChoosePlayDraw { .. }
             | GameAction::ChooseOption { .. }
+            | GameAction::SubmitVoteCandidate { .. }
+            | GameAction::SubmitSpellbookDraft { .. }
             | GameAction::SubmitPilePartition { .. }
             | GameAction::ChoosePile { .. }
             | GameAction::ChooseBranch { .. }
+            | GameAction::SubmitLifeRedistribution { .. }
             | GameAction::SelectModes { .. }
             | GameAction::DecideOptionalCost { .. }
+            | GameAction::RespondToSpliceOffer { .. }
             | GameAction::ChooseAdventureFace { .. }
             | GameAction::ChooseModalFace { .. }
             | GameAction::ChooseAlternativeCast { .. }
@@ -1140,23 +1398,37 @@ impl GameAction {
             | GameAction::PayCombatTax { .. }
             | GameAction::ChooseDungeon { .. }
             | GameAction::ChooseDungeonRoom { .. }
+            | GameAction::RollPlanarDie
+            | GameAction::ChooseSpecializeColor { .. }
             | GameAction::HarmonizeTap { .. }
             | GameAction::DeclareCompanion { .. }
             | GameAction::CompanionToHand
             | GameAction::DiscoverChoice { .. }
+            | GameAction::GraveyardPaidCastChoice { .. }
             | GameAction::CascadeChoice { .. }
+            | GameAction::RippleChoice { .. }
+            | GameAction::FreeCastWindowChoice { .. }
             | GameAction::ChooseTopOrBottom { .. }
+            | GameAction::ChooseMutateMergeSide { .. }
+            | GameAction::CipherEncode { .. }
+            | GameAction::ChooseClashOpponent { .. }
+            | GameAction::ChooseAssistPlayer { .. }
+            | GameAction::CommitAssistPayment { .. }
             | GameAction::ChooseBattleProtector { .. }
             | GameAction::SetAutoPass { .. }
             | GameAction::CancelAutoPass
             | GameAction::SetPhaseStops { .. }
+            | GameAction::SetPriorityYield { .. }
             | GameAction::AssignCombatDamage { .. }
+            | GameAction::AssignBlockerDamage { .. }
             | GameAction::DistributeAmong { .. }
             | GameAction::ChooseCounterMoveDistribution { .. }
+            | GameAction::ChooseCountersToRemove { .. }
             | GameAction::SubmitPayAmount { .. }
             | GameAction::RetargetSpell { .. }
             | GameAction::LearnDecision { .. }
             | GameAction::SelectCategoryPermanents { .. }
+            | GameAction::ChooseKeptCreatures { .. }
             | GameAction::ChooseX { .. }
             | GameAction::SubmitPhyrexianChoices { .. }
             | GameAction::ChooseManaColor { .. }
@@ -1200,6 +1472,8 @@ mod tests {
             object_id: ObjectId(5),
             card_id: CardId(1),
             targets: vec![ObjectId(10), ObjectId(20)],
+
+            payment_mode: crate::types::game_state::CastPaymentMode::Auto,
         };
         let json = serde_json::to_value(&action).unwrap();
         assert_eq!(json["type"], "CastSpell");
@@ -1234,6 +1508,7 @@ mod tests {
                 (ObjectId(1), AttackTarget::Player(PlayerId(1))),
                 (ObjectId(2), AttackTarget::Planeswalker(ObjectId(99))),
             ],
+            bands: vec![],
         };
         let serialized = serde_json::to_string(&action).unwrap();
         let deserialized: GameAction = serde_json::from_str(&serialized).unwrap();
@@ -1260,6 +1535,7 @@ mod tests {
     fn declare_attackers_empty_attacks_roundtrips() {
         let action = GameAction::DeclareAttackers {
             attacks: Vec::new(),
+            bands: vec![],
         };
         let serialized = serde_json::to_string(&action).unwrap();
         let deserialized: GameAction = serde_json::from_str(&serialized).unwrap();
@@ -1283,6 +1559,8 @@ mod tests {
                     object_id: oid,
                     card_id: cid,
                     targets: vec![],
+
+                    payment_mode: crate::types::game_state::CastPaymentMode::Auto,
                 },
                 Some(oid),
             ),
@@ -1312,6 +1590,8 @@ mod tests {
                     hand_object: oid,
                     card_id: cid,
                     creature_to_return: ObjectId(99),
+
+                    payment_mode: crate::types::game_state::CastPaymentMode::Auto,
                 },
                 Some(oid),
             ),

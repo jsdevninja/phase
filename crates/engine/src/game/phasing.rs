@@ -48,13 +48,20 @@ pub fn phase_out_object(
         let Some(obj) = state.objects.get_mut(&id) else {
             continue;
         };
-        // Already phased out: CR 702.26h — direct-over-indirect preference
-        // handled by not downgrading an existing direct phase-out to indirect.
+        // CR 702.26h: if an object would phase out directly and indirectly at
+        // the same time, it phases out indirectly — never promote indirect to
+        // direct when a later pass reaches the same object.
         if obj.is_phased_out() {
-            if matches!(this_cause, PhaseOutCause::Directly) {
-                // Upgrade indirect → direct per CR 702.26h.
+            if matches!(this_cause, PhaseOutCause::Indirectly)
+                && matches!(
+                    obj.phase_status,
+                    PhaseStatus::PhasedOut {
+                        cause: PhaseOutCause::Directly
+                    }
+                )
+            {
                 obj.phase_status = PhaseStatus::PhasedOut {
-                    cause: PhaseOutCause::Directly,
+                    cause: PhaseOutCause::Indirectly,
                 };
             }
             continue;
@@ -104,6 +111,14 @@ pub fn phase_out_object(
             object_id: id,
             indirect,
         });
+    }
+
+    if !phased.is_empty() {
+        // CR 613.1 + CR 702.26b/e: Phasing out changes which continuous
+        // effects apply and which affected sets may include these permanents.
+        // Mark dirty so the next SBA/public-state flush re-derives layers with
+        // phased-out objects excluded.
+        crate::game::layers::mark_layers_full(state);
     }
 
     phased
@@ -156,6 +171,13 @@ pub fn phase_in_object(
                 }
             }
         }
+    }
+
+    if !phased.is_empty() {
+        // CR 613.1 + CR 702.26c: Phasing in changes which continuous effects
+        // apply (aura sources re-enter the layer system). Mark dirty so the
+        // next SBA/public-state flush re-derives affected permanents.
+        crate::game::layers::mark_layers_full(state);
     }
 
     for &id in &phased {
@@ -245,6 +267,10 @@ pub fn execute_untap_step_phasing(state: &mut GameState, events: &mut Vec<GameEv
                     }
                 ) && obj.controller == active
             })
+            // CR 702.26a + CR 101.2: a permanent held by an active "can't phase
+            // in" restriction (The Pandorica) is excluded from this turn-based
+            // action — it stays phased out until the restriction lapses.
+            && !crate::game::static_abilities::object_has_active_cant_phase_in(state, *id)
         })
         .collect();
 
@@ -403,6 +429,100 @@ mod tests {
         )));
     }
 
+    /// CR 702.26a + CR 101.2 + CR 611.2b + CR 110.5d: `object_has_active_cant_phase_in`
+    /// reports a `SpecificObject`-pinned `CantPhaseIn` transient grant as active
+    /// only while its `ForAsLongAs { SourceIsTapped }` condition holds — true
+    /// while the source is tapped on the battlefield, false the instant it untaps.
+    #[test]
+    fn cant_phase_in_lock_tracks_source_tap_state() {
+        use crate::game::static_abilities::object_has_active_cant_phase_in;
+        use crate::types::ability::{
+            ContinuousModification, Duration, StaticCondition, TargetFilter,
+        };
+        use crate::types::statics::StaticMode;
+
+        let mut state = GameState::new_two_player(42);
+        let source = setup_creature(&mut state, "The Pandorica", PlayerId(0));
+        let target = setup_creature(&mut state, "Locked", PlayerId(0));
+        state.objects.get_mut(&source).unwrap().tapped = true;
+
+        state.add_transient_continuous_effect(
+            source,
+            PlayerId(0),
+            Duration::ForAsLongAs {
+                condition: StaticCondition::SourceIsTapped,
+            },
+            TargetFilter::SpecificObject { id: target },
+            vec![ContinuousModification::AddStaticMode {
+                mode: StaticMode::CantPhaseIn,
+            }],
+            None,
+        );
+
+        assert!(
+            object_has_active_cant_phase_in(&state, target),
+            "lock must be active while the source is tapped"
+        );
+
+        // CR 611.2b + CR 110.5d: untapping the source ends the duration.
+        state.objects.get_mut(&source).unwrap().tapped = false;
+        assert!(
+            !object_has_active_cant_phase_in(&state, target),
+            "lock must lapse once the source untaps"
+        );
+    }
+
+    /// CR 702.26a + CR 101.2: the untap-step phase-in turn-based action skips a
+    /// permanent held by an active `CantPhaseIn` lock, but phases it in once the
+    /// lock lapses (positive control — the source untaps).
+    #[test]
+    fn execute_untap_step_phasing_respects_cant_phase_in_lock() {
+        use crate::types::ability::{
+            ContinuousModification, Duration, StaticCondition, TargetFilter,
+        };
+        use crate::types::statics::StaticMode;
+
+        let mut state = GameState::new_two_player(42);
+        state.active_player = PlayerId(0);
+        let source = setup_creature(&mut state, "The Pandorica", PlayerId(0));
+        let target = setup_creature(&mut state, "Held", PlayerId(0));
+        state.objects.get_mut(&source).unwrap().tapped = true;
+
+        let mut events = Vec::new();
+        phase_out_object(&mut state, target, PhaseOutCause::Directly, &mut events);
+        assert!(state.objects[&target].is_phased_out());
+
+        state.add_transient_continuous_effect(
+            source,
+            PlayerId(0),
+            Duration::ForAsLongAs {
+                condition: StaticCondition::SourceIsTapped,
+            },
+            TargetFilter::SpecificObject { id: target },
+            vec![ContinuousModification::AddStaticMode {
+                mode: StaticMode::CantPhaseIn,
+            }],
+            None,
+        );
+
+        // Lock active: the TBA must NOT phase the target in.
+        events.clear();
+        execute_untap_step_phasing(&mut state, &mut events);
+        assert!(
+            state.objects[&target].is_phased_out(),
+            "held permanent must stay phased out while the lock is active"
+        );
+
+        // Lock lapses (source untaps): the TBA phases the target in.
+        state.objects.get_mut(&source).unwrap().tapped = false;
+        events.clear();
+        execute_untap_step_phasing(&mut state, &mut events);
+        assert!(
+            state.objects[&target].is_phased_in(),
+            "permanent must phase in once the lock lapses"
+        );
+    }
+
     #[test]
     fn phase_out_cascades_to_attached_aura() {
         let mut state = GameState::new_two_player(42);
@@ -436,6 +556,46 @@ mod tests {
 
         assert!(state.objects[&creature].is_phased_in());
         assert!(state.objects[&aura].is_phased_in());
+    }
+
+    /// CR 613.1 + CR 702.26c: Attached aura continuous effects must re-apply
+    /// after the host phases back in (issue #2373).
+    #[test]
+    fn issue_2373_attached_aura_effect_reapplies_after_phase_in() {
+        use crate::game::layers::flush_layers;
+        use crate::types::ability::{FilterProp, StaticDefinition, TargetFilter, TypedFilter};
+        use crate::types::ContinuousModification;
+
+        let mut state = GameState::new_two_player(42);
+        let creature = setup_creature(&mut state, "Bear", PlayerId(0));
+        let aura = setup_aura(&mut state, "Boon", PlayerId(0), creature);
+        if let Some(aura_obj) = state.objects.get_mut(&aura) {
+            aura_obj.static_definitions.push(
+                StaticDefinition::continuous()
+                    .affected(TargetFilter::Typed(
+                        TypedFilter::creature().properties(vec![FilterProp::EnchantedBy]),
+                    ))
+                    .modifications(vec![
+                        ContinuousModification::AddPower { value: 2 },
+                        ContinuousModification::AddToughness { value: 2 },
+                    ]),
+            );
+        }
+        flush_layers(&mut state);
+        assert_eq!(state.objects[&creature].power, Some(4));
+
+        let mut events = Vec::new();
+        phase_out_object(&mut state, creature, PhaseOutCause::Directly, &mut events);
+        assert!(state.layers_dirty.is_dirty());
+
+        events.clear();
+        phase_in_object(&mut state, creature, &mut events);
+        flush_layers(&mut state);
+        assert_eq!(
+            state.objects[&creature].power,
+            Some(4),
+            "aura +2/+2 must re-apply after phase-in"
+        );
     }
 
     #[test]
@@ -537,6 +697,7 @@ mod tests {
                 defending_player: PlayerId(1),
                 attack_target: AttackTarget::Player(PlayerId(1)),
                 blocked: false,
+                band_id: None,
             }],
             ..Default::default()
         });

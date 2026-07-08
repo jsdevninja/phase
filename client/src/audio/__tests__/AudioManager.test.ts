@@ -37,15 +37,17 @@ const mockClose = vi.fn();
 
 vi.stubGlobal(
   "AudioContext",
-  vi.fn().mockImplementation(() => ({
-    createGain: mockCreateGain,
-    createBufferSource: mockCreateBufferSource,
-    createMediaElementSource: mockCreateMediaElementSource,
-    decodeAudioData: mockDecodeAudioData,
-    close: mockClose,
-    destination: {},
-    currentTime: 0,
-  })),
+  vi.fn().mockImplementation(function () {
+    return {
+      createGain: mockCreateGain,
+      createBufferSource: mockCreateBufferSource,
+      createMediaElementSource: mockCreateMediaElementSource,
+      decodeAudioData: mockDecodeAudioData,
+      close: mockClose,
+      destination: {},
+      currentTime: 0,
+    };
+  }),
 );
 
 // Mock audioCache to avoid IndexedDB
@@ -74,13 +76,15 @@ const mockAudioPause = vi.fn();
 
 vi.stubGlobal(
   "Audio",
-  vi.fn().mockImplementation(() => ({
-    play: mockAudioPlay,
-    pause: mockAudioPause,
-    addEventListener: vi.fn(),
-    removeEventListener: vi.fn(),
-    crossOrigin: null,
-  })),
+  vi.fn().mockImplementation(function () {
+    return {
+      play: mockAudioPlay,
+      pause: mockAudioPause,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      crossOrigin: null,
+    };
+  }),
 );
 
 // Import after mocks are set up
@@ -247,6 +251,29 @@ describe("AudioManager", () => {
 
     // Two different SFX types -> two sounds
     expect(mockCreateBufferSource).toHaveBeenCalledTimes(2);
+  });
+
+  it("playSfxForStep maps grouped flurry to DamageDealt and ignores displayOnly LifeChanged", async () => {
+    audioManager.warmUp();
+    await audioManager.preloadSfx();
+    mockCreateBufferSource.mockClear();
+
+    audioManager.playSfxForStep([
+      {
+        event: {
+          type: "GroupedDamageFlurry",
+          data: { player_id: 0, source_ids: [1, 2], total_damage: 2, hit_count: 2 },
+        },
+        duration: 900,
+      },
+      {
+        event: { type: "LifeChanged", data: { player_id: 0, amount: -2 } },
+        duration: 300,
+        displayOnly: true,
+      },
+    ]);
+
+    expect(mockCreateBufferSource).toHaveBeenCalledTimes(1);
   });
 
   // --- startMusic / setContext ---

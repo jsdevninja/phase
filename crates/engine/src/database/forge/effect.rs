@@ -1,6 +1,6 @@
 use crate::types::ability::{
-    ControllerRef, Effect, GainLifePlayer, ManaProduction, PtValue, QuantityExpr, TargetFilter,
-    TypedFilter,
+    ControllerRef, Effect, EffectScope, ManaProduction, PtValue, QuantityExpr, TapStateChange,
+    TargetFilter, TypedFilter,
 };
 use crate::types::mana::ManaColor;
 use crate::types::Zone;
@@ -143,12 +143,17 @@ fn resolve_defined(params: &ForgeParams) -> TargetFilter {
     }
 }
 
-/// Check if `Defined$` targets an opponent rather than the controller.
-fn defined_is_opponent(params: &ForgeParams) -> bool {
-    matches!(
-        params.get("Defined"),
-        Some("Opponent") | Some("OpponentOfTriggered")
-    )
+fn resolve_defined_life_player(params: &ForgeParams) -> TargetFilter {
+    match params.get("Defined") {
+        Some("Targeted") | Some("TargetedPlayer") => TargetFilter::Player,
+        Some("TriggeredCardController") | Some("TriggeredPlayer") => TargetFilter::TriggeringPlayer,
+        Some("ParentTarget") => TargetFilter::ParentTarget,
+        // There is no single implicit opponent player in multiplayer. Preserve
+        // the historical fallback until Forge import can express player scopes.
+        Some("Opponent") | Some("OpponentOfTriggered") => TargetFilter::Controller,
+        Some("You") | Some("Self") | None => TargetFilter::Controller,
+        Some(_) => TargetFilter::Controller,
+    }
 }
 
 // CR 120.2b: Deal damage as an effect of a spell or ability.
@@ -162,6 +167,7 @@ fn translate_deal_damage(
         amount,
         target,
         damage_source: None,
+        excess: None,
     })
 }
 
@@ -180,16 +186,9 @@ fn translate_gain_life(
     resolver: &mut SvarResolver,
 ) -> Result<Effect, ForgeTranslateError> {
     let amount = resolve_quantity(params, "LifeAmount", resolver);
-    // Forge Defined$ determines who gains life. GainLifePlayer only has
-    // Controller and TargetedController — opponent gains aren't expressible
-    // in the current type, so we stay with Controller for non-opponent cases.
-    let player = if defined_is_opponent(params) {
-        // TODO: GainLifePlayer doesn't have an Opponent variant; this stays
-        // as Controller until the engine type is extended.
-        GainLifePlayer::Controller
-    } else {
-        GainLifePlayer::Controller
-    };
+    // CR 119.3: `GainLife.player` is a player-resolved TargetFilter. Reuse only
+    // the `Defined$` cases that resolve to a player, not object filters.
+    let player = resolve_defined_life_player(params);
     Ok(Effect::GainLife { amount, player })
 }
 
@@ -261,7 +260,7 @@ fn translate_put_counter(
         .to_lowercase();
     let count = resolve_quantity(params, "CounterNum", resolver);
     let target = resolve_target(params, "ValidTgts");
-    Ok(Effect::AddCounter {
+    Ok(Effect::PutCounter {
         counter_type,
         count,
         target,
@@ -344,13 +343,21 @@ fn translate_destroy_all(params: &ForgeParams) -> Result<Effect, ForgeTranslateE
 // CR 701.26a: Tap target permanent.
 fn translate_tap(params: &ForgeParams) -> Result<Effect, ForgeTranslateError> {
     let target = resolve_target(params, "ValidTgts");
-    Ok(Effect::Tap { target })
+    Ok(Effect::SetTapState {
+        target,
+        scope: EffectScope::Single,
+        state: TapStateChange::Tap,
+    })
 }
 
-// CR 701.26a: Untap target permanent.
+// CR 701.26b: Untap target permanent.
 fn translate_untap(params: &ForgeParams) -> Result<Effect, ForgeTranslateError> {
     let target = resolve_target(params, "ValidTgts");
-    Ok(Effect::Untap { target })
+    Ok(Effect::SetTapState {
+        target,
+        scope: EffectScope::Single,
+        state: TapStateChange::Untap,
+    })
 }
 
 // CR 400.7: Move objects between zones.
@@ -370,7 +377,7 @@ fn translate_change_zone(params: &ForgeParams) -> Result<Effect, ForgeTranslateE
         owner_library: false,
         enter_transformed: false,
         enters_under: None,
-        enter_tapped: false,
+        enter_tapped: crate::types::zones::EtbTapState::Unspecified,
         enters_attacking: false,
     })
 }
@@ -503,6 +510,8 @@ fn translate_counter(params: &ForgeParams) -> Result<Effect, ForgeTranslateError
     Ok(Effect::Counter {
         target,
         source_rider: None,
+        // CR 701.6a: Forge import uses the default graveyard destination.
+        countered_spell_zone: None,
     })
 }
 
@@ -516,7 +525,7 @@ fn translate_bounce(params: &ForgeParams) -> Result<Effect, ForgeTranslateError>
         owner_library: false,
         enter_transformed: false,
         enters_under: None,
-        enter_tapped: false,
+        enter_tapped: crate::types::zones::EtbTapState::Unspecified,
         enters_attacking: false,
     })
 }
@@ -609,9 +618,32 @@ mod tests {
         let mut resolver = make_resolver();
         let effect = translate_effect(&params, &mut resolver).unwrap();
         match effect {
-            Effect::GainLife { amount, .. } => {
+            Effect::GainLife { amount, player } => {
                 assert_eq!(amount, QuantityExpr::Fixed { value: 2 });
+                assert_eq!(player, TargetFilter::Controller);
             }
+            other => panic!("expected GainLife, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_gain_life_defined_targeted_player() {
+        let params = parse_params("DB$ GainLife | Defined$ TargetedPlayer | LifeAmount$ 2");
+        let mut resolver = make_resolver();
+        let effect = translate_effect(&params, &mut resolver).unwrap();
+        match effect {
+            Effect::GainLife { player, .. } => assert_eq!(player, TargetFilter::Player),
+            other => panic!("expected GainLife, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_gain_life_defined_opponent_does_not_emit_object_filter() {
+        let params = parse_params("DB$ GainLife | Defined$ Opponent | LifeAmount$ 2");
+        let mut resolver = make_resolver();
+        let effect = translate_effect(&params, &mut resolver).unwrap();
+        match effect {
+            Effect::GainLife { player, .. } => assert_eq!(player, TargetFilter::Controller),
             other => panic!("expected GainLife, got {other:?}"),
         }
     }

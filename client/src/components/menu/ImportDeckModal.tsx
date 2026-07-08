@@ -5,8 +5,9 @@ import { useTranslation } from "react-i18next";
 
 import { menuButtonClass } from "./buttonStyles";
 import { STORAGE_KEY_PREFIX, listSavedDeckNames, stampDeckMeta } from "../../constants/storage";
-import { deriveImportedDeckName, detectAndParseDeck, resolveCommander } from "../../services/deckParser";
+import { deriveImportedDeckName, detectAndParseDeck, parsedDeckHasCards, resolveCommander } from "../../services/deckParser";
 import { fetchDeckFromUrl } from "../../services/deckUrlImport";
+import { useAppNotificationStore } from "../../stores/appToastStore";
 
 // Frontend-authored error messages from deckUrlImport.ts arrive as translation
 // keys prefixed `importDeck.`. Worker-authored messages flow through as-is
@@ -52,23 +53,44 @@ function resolveImportDeckName(
 
 export function ImportDeckModal({ open, onClose, onImported }: ImportDeckModalProps) {
   const { t } = useTranslation("menu");
+  const showNotification = useAppNotificationStore((s) => s.showNotification);
   const [tab, setTab] = useState<ImportTab>("paste");
   const [pasteText, setPasteText] = useState("");
   const [urlText, setUrlText] = useState("");
   const [urlError, setUrlError] = useState<string | null>(null);
   const [urlLoading, setUrlLoading] = useState(false);
+  const [pasteError, setPasteError] = useState<string | null>(null);
+  const [pasteLoading, setPasteLoading] = useState(false);
+  const [fileError, setFileError] = useState<string | null>(null);
   const [deckName, setDeckName] = useState("");
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  const handlePasteImport = async () => {
-    if (!pasteText.trim()) return;
-    const deck = await resolveCommander(detectAndParseDeck(pasteText));
-    const name = resolveImportDeckName(deckName, pasteText, deck);
-    localStorage.setItem(STORAGE_KEY_PREFIX + name, JSON.stringify(deck));
-    stampDeckMeta(name);
-    const names = listSavedDeckNames();
-    onImported(name, names);
+  const finishImport = (name: string) => {
+    onImported(name, listSavedDeckNames());
     resetAndClose();
+    showNotification({
+      title: t("importDeck.importedSuccessTitle"),
+      description: t("importDeck.importedSuccessDescription", { name }),
+    });
+  };
+
+  const handlePasteImport = async () => {
+    if (!pasteText.trim() || pasteLoading) return;
+    setPasteError(null);
+    setPasteLoading(true);
+    try {
+      const deck = await resolveCommander(detectAndParseDeck(pasteText));
+      if (!parsedDeckHasCards(deck)) {
+        setPasteError(t("importDeck.errorNoCards"));
+        return;
+      }
+      const name = resolveImportDeckName(deckName, pasteText, deck);
+      localStorage.setItem(STORAGE_KEY_PREFIX + name, JSON.stringify(deck));
+      stampDeckMeta(name);
+      finishImport(name);
+    } finally {
+      setPasteLoading(false);
+    }
   };
 
   const handleUrlImport = async () => {
@@ -82,8 +104,7 @@ export function ImportDeckModal({ open, onClose, onImported }: ImportDeckModalPr
       const name = resolveImportDeckName(deckName, content, deck);
       localStorage.setItem(STORAGE_KEY_PREFIX + name, JSON.stringify(deck));
       stampDeckMeta(name);
-      onImported(name, listSavedDeckNames());
-      resetAndClose();
+      finishImport(name);
     } catch (err) {
       const raw = err instanceof Error ? err.message : t("importDeck.errorGeneric");
       setUrlError(raw.startsWith(I18N_KEY_PREFIX) ? t(raw) : raw);
@@ -97,15 +118,18 @@ export function ImportDeckModal({ open, onClose, onImported }: ImportDeckModalPr
     if (!file) return;
     const reader = new FileReader();
     reader.onload = async () => {
+      setFileError(null);
       const content = reader.result as string;
       const deck = await resolveCommander(detectAndParseDeck(content));
+      if (!parsedDeckHasCards(deck)) {
+        setFileError(t("importDeck.errorNoCards"));
+        return;
+      }
       const fallbackName = file.name.replace(/\.(dck|dec|txt)$/i, "");
       const name = resolveImportDeckName("", content, deck, fallbackName);
       localStorage.setItem(STORAGE_KEY_PREFIX + name, JSON.stringify(deck));
       stampDeckMeta(name);
-      const names = listSavedDeckNames();
-      onImported(name, names);
-      resetAndClose();
+      finishImport(name);
     };
     reader.readAsText(file);
     e.target.value = "";
@@ -116,6 +140,9 @@ export function ImportDeckModal({ open, onClose, onImported }: ImportDeckModalPr
     setUrlText("");
     setUrlError(null);
     setUrlLoading(false);
+    setPasteError(null);
+    setPasteLoading(false);
+    setFileError(null);
     setDeckName("");
     setTab("paste");
     onClose();
@@ -152,13 +179,13 @@ export function ImportDeckModal({ open, onClose, onImported }: ImportDeckModalPr
 
             {/* Tabs */}
             <div className="flex">
-              <button className={TAB_CLASS(tab === "paste")} onClick={() => setTab("paste")}>
+              <button className={TAB_CLASS(tab === "paste")} onClick={() => { setTab("paste"); setFileError(null); }}>
                 {t("importDeck.tabPaste")}
               </button>
               <button className={TAB_CLASS(tab === "url")} onClick={() => setTab("url")}>
                 {t("importDeck.tabUrl")}
               </button>
-              <button className={TAB_CLASS(tab === "file")} onClick={() => setTab("file")}>
+              <button className={TAB_CLASS(tab === "file")} onClick={() => { setTab("file"); setPasteError(null); }}>
                 {t("importDeck.tabFile")}
               </button>
             </div>
@@ -174,22 +201,26 @@ export function ImportDeckModal({ open, onClose, onImported }: ImportDeckModalPr
                 />
                 <textarea
                   value={pasteText}
-                  onChange={(e) => setPasteText(e.target.value)}
+                  onChange={(e) => {
+                    setPasteText(e.target.value);
+                    if (pasteError) setPasteError(null);
+                  }}
                   placeholder={"Paste deck list here...\n\nSupports .dck, .dec, and MTGA format:\n4 Thoughtseize (THS) 107\n2 Fatal Push (KLR) 84"}
                   rows={10}
                   className="resize-none rounded-xl border border-white/25 bg-white/8 px-3 py-2 font-mono text-xs leading-relaxed text-white placeholder-white/20 outline-none backdrop-blur-sm focus:border-amber-300/70"
                 />
+                {pasteError && <p className="text-xs text-red-400">{pasteError}</p>}
                 <button
                   onClick={handlePasteImport}
-                  disabled={!pasteText.trim()}
+                  disabled={!pasteText.trim() || pasteLoading}
                   className={menuButtonClass({
                     tone: "amber",
                     size: "md",
-                    disabled: !pasteText.trim(),
+                    disabled: !pasteText.trim() || pasteLoading,
                     className: "w-full font-bold",
                   })}
                 >
-                  {t("importDeck.import")}
+                  {pasteLoading ? t("importDeck.importing") : t("importDeck.import")}
                 </button>
               </div>
             )}
@@ -240,6 +271,7 @@ export function ImportDeckModal({ open, onClose, onImported }: ImportDeckModalPr
                 <p className="text-sm text-white/50">
                   {t("importDeck.fileSupports")}
                 </p>
+                {fileError && <p className="text-xs text-red-400">{fileError}</p>}
                 <button
                   onClick={() => fileInputRef.current?.click()}
                   className={menuButtonClass({

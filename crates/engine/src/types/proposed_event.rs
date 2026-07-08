@@ -2,18 +2,23 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
-use crate::game::game_object::AttachTarget;
+use crate::game::game_object::{AttachTarget, DisplaySource};
 
 use super::counter::CounterType;
 
-use super::ability::{Duration, StaticDefinition, TargetRef};
+use super::ability::{
+    ContinuousModification, CopiableValues, Duration, FaceDownProfile, StaticDefinition, TargetRef,
+};
+use super::card::{PrintedCardRef, TokenImageRef};
 use super::card_type::{CoreType, Supertype};
 use super::identifiers::ObjectId;
 use super::keywords::Keyword;
 use super::mana::{ManaColor, ManaType, UnitDecision};
 use super::phase::Phase;
-use super::player::PlayerId;
+use super::player::{PlayerCounterKind, PlayerId};
 use super::zones::Zone;
+
+pub use super::zones::EtbTapState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ReplacementId {
@@ -27,32 +32,47 @@ pub enum CounterMoveStage {
     Add,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
-pub enum EtbTapState {
-    #[default]
-    Unspecified,
-    Tapped,
-    Untapped,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CounterPlacement {
+    Object {
+        #[serde(default)]
+        actor: PlayerId,
+        object_id: ObjectId,
+        counter_type: CounterType,
+    },
+    Player {
+        actor: PlayerId,
+        player_id: PlayerId,
+        counter_kind: PlayerCounterKind,
+    },
+    Energy {
+        actor: PlayerId,
+        player_id: PlayerId,
+    },
 }
 
-impl EtbTapState {
-    pub fn from_seeded_tapped(tapped: bool) -> Self {
-        if tapped {
-            Self::Tapped
-        } else {
-            Self::Unspecified
+impl CounterPlacement {
+    pub fn object_id(&self) -> Option<ObjectId> {
+        match self {
+            CounterPlacement::Object { object_id, .. } => Some(*object_id),
+            CounterPlacement::Player { .. } | CounterPlacement::Energy { .. } => None,
         }
     }
 
-    /// Resolve to a concrete tapped state. `fallback` is used only when no
-    /// replacement has set an explicit tap-state (`Unspecified`). For
-    /// `ZoneChange` events pass `false`; for `CreateToken` pass
-    /// `spec.tapped` (the token spec's authored default).
-    pub fn resolve(self, fallback: bool) -> bool {
+    pub fn player_id(&self) -> Option<PlayerId> {
         match self {
-            Self::Unspecified => fallback,
-            Self::Tapped => true,
-            Self::Untapped => false,
+            CounterPlacement::Player { player_id, .. }
+            | CounterPlacement::Energy { player_id, .. } => Some(*player_id),
+            CounterPlacement::Object { .. } => None,
+        }
+    }
+
+    pub fn actor(&self) -> PlayerId {
+        match self {
+            CounterPlacement::Object { actor, .. }
+            | CounterPlacement::Player { actor, .. }
+            | CounterPlacement::Energy { actor, .. } => *actor,
         }
     }
 }
@@ -126,6 +146,35 @@ pub struct TokenSpec {
     pub attach_to: Option<AttachTarget>,
 }
 
+/// CR 707.2 + CR 707.5: Copy-token creation payload carried by the same
+/// `CreateToken` proposed event that ordinary token creation uses for
+/// replacement effects. `TokenSpec` remains the replacement-visible probe
+/// characteristics; this payload carries the full copiable values needed once
+/// the event is accepted, including display metadata that is not copiable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CopyTokenSpec {
+    pub values: Box<CopiableValues>,
+    pub display_source: DisplaySource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub printed_ref: Option<PrintedCardRef>,
+    /// CR 111.1 + CR 707.2: exact token-art pointer of the copy source when it
+    /// is itself a true token (`display_source == Token`). Carried so a
+    /// token-copy of a token resolves the source token's art instead of falling
+    /// back to a name+filter Scryfall search. `None` for printed-card sources.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_image_ref: Option<TokenImageRef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_keywords: Vec<Keyword>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub additional_modifications: Vec<ContinuousModification>,
+    pub tapped: bool,
+    pub enters_attacking: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sacrifice_at: Option<Duration>,
+    pub source_id: ObjectId,
+    pub controller: PlayerId,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ProposedEvent {
     ZoneChange {
@@ -133,6 +182,14 @@ pub enum ProposedEvent {
         from: Zone,
         to: Zone,
         cause: Option<ObjectId>,
+        /// CR 303.4f: When an Aura enters the battlefield by a non-spell
+        /// effect and the effect does not specify what it enchants, the
+        /// controller chooses a legal object or player as it enters. The
+        /// ChangeZone pipeline resolves that choice before delivery and carries
+        /// the chosen host here so the battlefield entry and attachment are one
+        /// event.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attach_to: Option<AttachTarget>,
         /// Explicit ETB tap-state override carried through the replacement pipeline.
         /// `Unspecified` preserves any non-replacement tapped seed from the originating effect.
         #[serde(default)]
@@ -149,6 +206,14 @@ pub enum ProposedEvent {
         /// Set by "return ... transformed" effects.
         #[serde(default)]
         enter_transformed: bool,
+        /// CR 708.2a + CR 708.3: When `Some`, the object is turned face down
+        /// (before entering, CR 708.3) with these characteristics as it enters
+        /// the battlefield. Carried through the replacement pipeline so the
+        /// face-down state is established before ETB triggers would fire.
+        /// Boxed so this rarely-set field doesn't inflate the size of every
+        /// `ProposedEvent` (and the `Result<_, ProposedEvent>` pipeline).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        face_down_profile: Option<Box<FaceDownProfile>>,
         applied: HashSet<ReplacementId>,
     },
     Damage {
@@ -179,6 +244,40 @@ pub enum ProposedEvent {
         destination: Zone,
         applied: HashSet<ReplacementId>,
     },
+    /// CR 705.1 + CR 614.1a: A player is about to flip a single coin. Carried
+    /// through the replacement pipeline so per-flip "instead flip two and ignore
+    /// one" effects (Krark's Thumb) double the count before the RNG runs. Per the
+    /// card's 2019-01-25 ruling, each individual flip is replaced separately.
+    CoinFlip {
+        player_id: PlayerId,
+        count: u32,
+        applied: HashSet<ReplacementId>,
+    },
+    /// CR 701.37a + CR 614.1a: A creature is about to explore. Replacement
+    /// effects can modify the explore action (e.g., add a scry prelude).
+    Explore {
+        object_id: ObjectId,
+        applied: HashSet<ReplacementId>,
+    },
+    /// CR 701.50a + CR 614.1a: A creature is about to connive (draw N, discard N,
+    /// +1/+1 per nonland discarded). Carried through the replacement pipeline so
+    /// effects that intercept the connive keyword action (Leader, Super-Genius —
+    /// "instead you draw a card, then that creature connives") see the event
+    /// before the draw/discard/counter steps run. `count` is the connive N value,
+    /// already resolved from `QuantityExpr` at propose time.
+    Connive {
+        object_id: ObjectId,
+        count: u32,
+        applied: HashSet<ReplacementId>,
+    },
+    /// CR 701.34a + CR 614.1a: A player is about to proliferate. Replacement
+    /// effects can modify how many times the proliferate action is performed
+    /// (Tekuthal, Inquiry Dominus — "proliferate twice instead").
+    Proliferate {
+        player_id: PlayerId,
+        count: u32,
+        applied: HashSet<ReplacementId>,
+    },
     LifeGain {
         player_id: PlayerId,
         amount: u32,
@@ -190,10 +289,11 @@ pub enum ProposedEvent {
         applied: HashSet<ReplacementId>,
     },
     AddCounter {
-        #[serde(default)]
-        actor: PlayerId,
-        object_id: ObjectId,
-        counter_type: CounterType,
+        /// CR 122.1 + CR 107.14: Counter placement may affect an object or a
+        /// player. Energy is represented as a dedicated player field at runtime
+        /// but is still a counter-placement event for replacement purposes.
+        #[serde(flatten)]
+        placement: CounterPlacement,
         count: u32,
         applied: HashSet<ReplacementId>,
     },
@@ -231,6 +331,12 @@ pub enum ProposedEvent {
         /// Resolved token characteristics, keyed by replacement pipeline
         /// matchers on the apply path to reproduce the token faithfully.
         spec: Box<TokenSpec>,
+        /// CR 707.2: When present, the event creates tokens that are copies of
+        /// a permanent. Replacement matching still reads `spec`; the apply path
+        /// reads this payload so replacement-choice resume does not degrade to a
+        /// generic token.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        copy: Option<Box<CopyTokenSpec>>,
         /// Explicit ETB tap-state override carried through the replacement pipeline.
         /// `Unspecified` preserves the token spec's authored `tapped` bit.
         #[serde(default)]
@@ -244,6 +350,11 @@ pub enum ProposedEvent {
         object_id: ObjectId,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source_id: Option<ObjectId>,
+        /// CR 614.1a + CR 701.9a: `true` when the discard is caused by resolving
+        /// a spell or ability effect; `false` for cost payment or turn-based
+        /// actions (cleanup hand-size discard).
+        #[serde(default)]
+        caused_by_effect: bool,
         applied: HashSet<ReplacementId>,
     },
     Tap {
@@ -251,6 +362,12 @@ pub enum ProposedEvent {
         applied: HashSet<ReplacementId>,
     },
     Untap {
+        object_id: ObjectId,
+        applied: HashSet<ReplacementId>,
+    },
+    /// CR 614.1e + CR 708.11: a permanent is being turned face up. "As ~ is turned
+    /// face up" replacement effects apply here (megamorph/disguise).
+    TurnFaceUp {
         object_id: ObjectId,
         applied: HashSet<ReplacementId>,
     },
@@ -325,6 +442,17 @@ pub enum ProposedEvent {
         units: Vec<UnitDecision>,
         applied: HashSet<ReplacementId>,
     },
+    /// CR 701.31 + CR 901.9c + CR 614.1a: A player is about to planeswalk as a
+    /// result of rolling the Planeswalker symbol on the planar die (the
+    /// CR 901.8 "planeswalking ability" resolving). This is the ONLY planeswalk
+    /// cause routed through the replacement pipeline — encounter / SBA /
+    /// leave-game planeswalks (CR 701.31c) call `planechase::planeswalk`
+    /// directly and are never replaced. "Chaos ensues instead" (Fixed Point in
+    /// Time) replaces this event.
+    Planeswalk {
+        player_id: PlayerId,
+        applied: HashSet<ReplacementId>,
+    },
 }
 
 fn default_produce_mana_count() -> u32 {
@@ -339,10 +467,12 @@ impl ProposedEvent {
             from,
             to,
             cause,
+            attach_to: None,
             enter_tapped: EtbTapState::Unspecified,
             enter_with_counters: Vec::new(),
             controller_override: None,
             enter_transformed: false,
+            face_down_profile: None,
             applied: HashSet::new(),
         }
     }
@@ -361,6 +491,24 @@ impl ProposedEvent {
         Self::BeginPhase {
             player_id,
             phase,
+            applied: HashSet::new(),
+        }
+    }
+
+    /// CR 701.31 + CR 901.9c + CR 614.1a: Construct a `Planeswalk` proposed
+    /// event for the planar-die planeswalking ability (CR 901.8).
+    pub fn planeswalk(player_id: PlayerId) -> Self {
+        Self::Planeswalk {
+            player_id,
+            applied: HashSet::new(),
+        }
+    }
+
+    /// CR 701.34a + CR 614.1a: Construct a `Proliferate` proposed event.
+    pub fn proliferate(player_id: PlayerId, count: u32) -> Self {
+        Self::Proliferate {
+            player_id,
+            count,
             applied: HashSet::new(),
         }
     }
@@ -412,6 +560,10 @@ impl ProposedEvent {
             | ProposedEvent::Draw { applied, .. }
             | ProposedEvent::Scry { applied, .. }
             | ProposedEvent::Mill { applied, .. }
+            | ProposedEvent::CoinFlip { applied, .. }
+            | ProposedEvent::Explore { applied, .. }
+            | ProposedEvent::Connive { applied, .. }
+            | ProposedEvent::Proliferate { applied, .. }
             | ProposedEvent::LifeGain { applied, .. }
             | ProposedEvent::LifeLoss { applied, .. }
             | ProposedEvent::AddCounter { applied, .. }
@@ -421,12 +573,14 @@ impl ProposedEvent {
             | ProposedEvent::Discard { applied, .. }
             | ProposedEvent::Tap { applied, .. }
             | ProposedEvent::Untap { applied, .. }
+            | ProposedEvent::TurnFaceUp { applied, .. }
             | ProposedEvent::Destroy { applied, .. }
             | ProposedEvent::Sacrifice { applied, .. }
             | ProposedEvent::BeginTurn { applied, .. }
             | ProposedEvent::BeginPhase { applied, .. }
             | ProposedEvent::ProduceMana { applied, .. }
-            | ProposedEvent::EmptyManaPool { applied, .. } => applied,
+            | ProposedEvent::EmptyManaPool { applied, .. }
+            | ProposedEvent::Planeswalk { applied, .. } => applied,
         }
     }
 
@@ -437,6 +591,10 @@ impl ProposedEvent {
             | ProposedEvent::Draw { applied, .. }
             | ProposedEvent::Scry { applied, .. }
             | ProposedEvent::Mill { applied, .. }
+            | ProposedEvent::CoinFlip { applied, .. }
+            | ProposedEvent::Explore { applied, .. }
+            | ProposedEvent::Connive { applied, .. }
+            | ProposedEvent::Proliferate { applied, .. }
             | ProposedEvent::LifeGain { applied, .. }
             | ProposedEvent::LifeLoss { applied, .. }
             | ProposedEvent::AddCounter { applied, .. }
@@ -446,12 +604,14 @@ impl ProposedEvent {
             | ProposedEvent::Discard { applied, .. }
             | ProposedEvent::Tap { applied, .. }
             | ProposedEvent::Untap { applied, .. }
+            | ProposedEvent::TurnFaceUp { applied, .. }
             | ProposedEvent::Destroy { applied, .. }
             | ProposedEvent::Sacrifice { applied, .. }
             | ProposedEvent::BeginTurn { applied, .. }
             | ProposedEvent::BeginPhase { applied, .. }
             | ProposedEvent::ProduceMana { applied, .. }
-            | ProposedEvent::EmptyManaPool { applied, .. } => applied,
+            | ProposedEvent::EmptyManaPool { applied, .. }
+            | ProposedEvent::Planeswalk { applied, .. } => applied,
         }
     }
 
@@ -465,16 +625,44 @@ impl ProposedEvent {
 
     pub fn affected_player(&self, state: &crate::types::game_state::GameState) -> PlayerId {
         match self {
-            ProposedEvent::ZoneChange { object_id, .. }
-            | ProposedEvent::Tap { object_id, .. }
+            // CR 614.12 + CR 109.4: A permanent entering under another player's
+            // control (Tergrid's "onto the battlefield under your control",
+            // reanimation "under your control", etc.) carries a
+            // `controller_override`. The object itself is still in its origin
+            // zone — typically a graveyard, where CR 109.4 gives it no controller
+            // so `o.controller` defaults to the owner. "As-it-enters" replacement
+            // effects (Mirrormade's "enter as a copy", CR 707.9) must be offered
+            // to the controller the permanent WOULD have on the battlefield, so
+            // honor the override before falling back to the object's controller.
+            ProposedEvent::ZoneChange {
+                object_id,
+                controller_override,
+                ..
+            } => controller_override
+                .or_else(|| state.objects.get(object_id).map(|o| o.controller))
+                .unwrap_or(PlayerId(0)),
+            ProposedEvent::Tap { object_id, .. }
             | ProposedEvent::Untap { object_id, .. }
+            | ProposedEvent::TurnFaceUp { object_id, .. }
             | ProposedEvent::Destroy { object_id, .. }
-            | ProposedEvent::AddCounter { object_id, .. }
-            | ProposedEvent::RemoveCounter { object_id, .. } => state
+            | ProposedEvent::RemoveCounter { object_id, .. }
+            | ProposedEvent::Explore { object_id, .. }
+            // CR 701.50a: The conniving permanent's controller is the affected
+            // player — they draw/discard and choose the connive replacement order.
+            | ProposedEvent::Connive { object_id, .. } => state
                 .objects
                 .get(object_id)
                 .map(|o| o.controller)
                 .unwrap_or(PlayerId(0)),
+            ProposedEvent::AddCounter { placement, .. } => match placement {
+                CounterPlacement::Object { object_id, .. } => state
+                    .objects
+                    .get(object_id)
+                    .map(|o| o.controller)
+                    .unwrap_or(PlayerId(0)),
+                CounterPlacement::Player { player_id, .. }
+                | CounterPlacement::Energy { player_id, .. } => *player_id,
+            },
             ProposedEvent::MoveCounter {
                 source_id,
                 destination_id,
@@ -502,6 +690,8 @@ impl ProposedEvent {
             ProposedEvent::Draw { player_id, .. }
             | ProposedEvent::Scry { player_id, .. }
             | ProposedEvent::Mill { player_id, .. }
+            | ProposedEvent::Proliferate { player_id, .. }
+            | ProposedEvent::CoinFlip { player_id, .. }
             | ProposedEvent::LifeGain { player_id, .. }
             | ProposedEvent::LifeLoss { player_id, .. }
             | ProposedEvent::Discard { player_id, .. }
@@ -509,7 +699,8 @@ impl ProposedEvent {
             | ProposedEvent::BeginTurn { player_id, .. }
             | ProposedEvent::BeginPhase { player_id, .. }
             | ProposedEvent::ProduceMana { player_id, .. }
-            | ProposedEvent::EmptyManaPool { player_id, .. } => *player_id,
+            | ProposedEvent::EmptyManaPool { player_id, .. }
+            | ProposedEvent::Planeswalk { player_id, .. } => *player_id,
             ProposedEvent::CreateToken { owner, .. } => *owner,
         }
     }
@@ -520,11 +711,16 @@ impl ProposedEvent {
             ProposedEvent::ZoneChange { object_id, .. }
             | ProposedEvent::Tap { object_id, .. }
             | ProposedEvent::Untap { object_id, .. }
+            | ProposedEvent::TurnFaceUp { object_id, .. }
             | ProposedEvent::Destroy { object_id, .. }
-            | ProposedEvent::AddCounter { object_id, .. }
             | ProposedEvent::RemoveCounter { object_id, .. }
             | ProposedEvent::Discard { object_id, .. }
-            | ProposedEvent::Sacrifice { object_id, .. } => Some(*object_id),
+            | ProposedEvent::Sacrifice { object_id, .. }
+            | ProposedEvent::Explore { object_id, .. }
+            // CR 614.1a: the conniving permanent is the affected object the
+            // `valid_card` filter ("a creature you control") is matched against.
+            | ProposedEvent::Connive { object_id, .. } => Some(*object_id),
+            ProposedEvent::AddCounter { placement, .. } => placement.object_id(),
             ProposedEvent::MoveCounter {
                 source_id,
                 destination_id,
@@ -544,12 +740,17 @@ impl ProposedEvent {
             ProposedEvent::Draw { .. }
             | ProposedEvent::Scry { .. }
             | ProposedEvent::Mill { .. }
+            | ProposedEvent::Proliferate { .. }
+            | ProposedEvent::CoinFlip { .. }
             | ProposedEvent::LifeGain { .. }
             | ProposedEvent::LifeLoss { .. }
             | ProposedEvent::CreateToken { .. }
             | ProposedEvent::BeginTurn { .. }
             | ProposedEvent::BeginPhase { .. }
-            | ProposedEvent::EmptyManaPool { .. } => None,
+            | ProposedEvent::EmptyManaPool { .. }
+            // CR 701.31: a planeswalk has no affected object — the planar deck
+            // rotation is not an object-scoped event.
+            | ProposedEvent::Planeswalk { .. } => None,
         }
     }
 }
@@ -559,8 +760,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn proposed_event_has_19_variants() {
-        // Verify all 19 variants compile
+    fn proposed_event_variants_compile() {
+        // Verify all variants compile, including the parameterized counter
+        // placement recipients.
         let events: Vec<ProposedEvent> = vec![
             ProposedEvent::zone_change(ObjectId(1), Zone::Battlefield, Zone::Graveyard, None),
             ProposedEvent::Damage {
@@ -586,6 +788,11 @@ mod tests {
                 destination: Zone::Graveyard,
                 applied: HashSet::new(),
             },
+            ProposedEvent::CoinFlip {
+                player_id: PlayerId(0),
+                count: 1,
+                applied: HashSet::new(),
+            },
             ProposedEvent::LifeGain {
                 player_id: PlayerId(0),
                 amount: 3,
@@ -597,9 +804,28 @@ mod tests {
                 applied: HashSet::new(),
             },
             ProposedEvent::AddCounter {
-                actor: PlayerId(0),
-                object_id: ObjectId(1),
-                counter_type: CounterType::Plus1Plus1,
+                placement: CounterPlacement::Object {
+                    actor: PlayerId(0),
+                    object_id: ObjectId(1),
+                    counter_type: CounterType::Plus1Plus1,
+                },
+                count: 1,
+                applied: HashSet::new(),
+            },
+            ProposedEvent::AddCounter {
+                placement: CounterPlacement::Player {
+                    actor: PlayerId(0),
+                    player_id: PlayerId(0),
+                    counter_kind: PlayerCounterKind::Poison,
+                },
+                count: 1,
+                applied: HashSet::new(),
+            },
+            ProposedEvent::AddCounter {
+                placement: CounterPlacement::Energy {
+                    actor: PlayerId(0),
+                    player_id: PlayerId(0),
+                },
                 count: 1,
                 applied: HashSet::new(),
             },
@@ -642,6 +868,7 @@ mod tests {
                     controller: PlayerId(0),
                     attach_to: None,
                 }),
+                copy: None,
                 enter_tapped: EtbTapState::Unspecified,
                 count: 1,
                 applied: HashSet::new(),
@@ -650,6 +877,7 @@ mod tests {
                 player_id: PlayerId(0),
                 object_id: ObjectId(2),
                 source_id: None,
+                caused_by_effect: false,
                 applied: HashSet::new(),
             },
             ProposedEvent::Tap {
@@ -680,7 +908,7 @@ mod tests {
                 applied: HashSet::new(),
             },
         ];
-        assert_eq!(events.len(), 20);
+        assert_eq!(events.len(), 23);
     }
 
     #[test]
@@ -704,6 +932,77 @@ mod tests {
         set.insert(id1);
         assert!(set.contains(&id2));
         assert!(!set.contains(&id3));
+    }
+
+    #[test]
+    fn add_counter_object_serde_keeps_legacy_flat_shape() {
+        let event = ProposedEvent::AddCounter {
+            placement: CounterPlacement::Object {
+                actor: PlayerId(0),
+                object_id: ObjectId(1),
+                counter_type: CounterType::Plus1Plus1,
+            },
+            count: 1,
+            applied: HashSet::new(),
+        };
+
+        let value = serde_json::to_value(&event).unwrap();
+        let add_counter = value
+            .get("AddCounter")
+            .expect("externally tagged AddCounter variant")
+            .as_object()
+            .expect("AddCounter payload object");
+        assert!(add_counter.get("placement").is_none());
+        assert!(add_counter.get("actor").is_some());
+        assert!(add_counter.get("object_id").is_some());
+        assert!(add_counter.get("counter_type").is_some());
+
+        let roundtrip: ProposedEvent = serde_json::from_value(value).unwrap();
+        assert!(matches!(
+            roundtrip,
+            ProposedEvent::AddCounter {
+                placement: CounterPlacement::Object {
+                    actor: PlayerId(0),
+                    object_id: ObjectId(1),
+                    counter_type: CounterType::Plus1Plus1,
+                },
+                count: 1,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn add_counter_object_serde_accepts_legacy_missing_actor() {
+        let event = ProposedEvent::AddCounter {
+            placement: CounterPlacement::Object {
+                actor: PlayerId(0),
+                object_id: ObjectId(1),
+                counter_type: CounterType::Plus1Plus1,
+            },
+            count: 1,
+            applied: HashSet::new(),
+        };
+        let mut value = serde_json::to_value(&event).unwrap();
+        value
+            .get_mut("AddCounter")
+            .and_then(|payload| payload.as_object_mut())
+            .expect("AddCounter payload object")
+            .remove("actor");
+
+        let roundtrip: ProposedEvent = serde_json::from_value(value).unwrap();
+        assert!(matches!(
+            roundtrip,
+            ProposedEvent::AddCounter {
+                placement: CounterPlacement::Object {
+                    actor: PlayerId(0),
+                    object_id: ObjectId(1),
+                    counter_type: CounterType::Plus1Plus1,
+                },
+                count: 1,
+                ..
+            }
+        ));
     }
 
     #[test]

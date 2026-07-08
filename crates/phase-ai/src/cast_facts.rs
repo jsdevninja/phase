@@ -1,7 +1,9 @@
 use engine::game::game_object::GameObject;
+#[cfg(test)]
+use engine::types::ability::TapStateChange;
 use engine::types::ability::{
-    AbilityDefinition, AbilityKind, BounceSelection, Effect, ReplacementDefinition, TargetFilter,
-    TriggerDefinition,
+    AbilityDefinition, AbilityKind, BounceSelection, Effect, EffectScope, ReplacementDefinition,
+    TargetFilter, TriggerDefinition,
 };
 use engine::types::actions::GameAction;
 use engine::types::card::CardFace;
@@ -353,15 +355,12 @@ fn effect_requires_targets(effect: &Effect) -> bool {
         | Effect::DealDamage { target, .. }
         | Effect::Pump { target, .. }
         | Effect::Counter { target, .. }
-        | Effect::Tap { target }
-        | Effect::Untap { target }
         | Effect::GainControl { target, .. }
         | Effect::PhaseOut { target }
         | Effect::Fight { target, .. }
         | Effect::Goad { target }
         | Effect::ChangeZone { target, .. }
         | Effect::Connive { target, .. }
-        | Effect::Suspect { target, .. }
         | Effect::ForceBlock { target, .. }
         | Effect::Exploit { target, .. }
         | Effect::Attach { target, .. }
@@ -370,11 +369,38 @@ fn effect_requires_targets(effect: &Effect) -> bool {
         | Effect::ExtraTurn { target, .. }
         | Effect::SkipNextStep { target, .. }
         | Effect::Regenerate { target, .. }
+        | Effect::RemoveAllDamage { target, .. }
         | Effect::DoublePT { target, .. }
         | Effect::PreventDamage { target, .. }
         | Effect::Animate { target, .. }
-        | Effect::AddCounter { target, .. } => !matches!(target, TargetFilter::None),
+        // CR 113.1a + CR 611.2: the donor whose activated abilities are gained
+        // (Quicksilver Elemental) is a real declared target.
+        | Effect::GainActivatedAbilitiesOfTarget { target, .. }
+        | Effect::PutCounter { target, .. } => !matches!(target, TargetFilter::None),
         Effect::RevealHand { target, .. } => !matches!(target, TargetFilter::None),
+        // CR 701.26a/b: only single-permanent tap/untap declares a target. The
+        // mass (`All`) scope falls through to `false`, matching the legacy
+        // `TapAll`/`UntapAll`.
+        Effect::SetTapState {
+            scope: EffectScope::Single,
+            target,
+            ..
+        } => !matches!(target, TargetFilter::None),
+        // CR 701.60a: only single-permanent suspect/unsuspect declares a target.
+        // The mass (`All`) scope (e.g. Absolving Lammasu, "all suspected
+        // creatures are no longer suspected") is a non-targeting population
+        // effect — its filter is not a selectable target, so it falls through to
+        // `false` (mirrors `SetTapState`'s `Single`/`All` split).
+        Effect::Suspect {
+            scope: EffectScope::Single,
+            target,
+            ..
+        }
+        | Effect::Unsuspect {
+            scope: EffectScope::Single,
+            target,
+            ..
+        } => !matches!(target, TargetFilter::None),
         _ => false,
     }
 }
@@ -417,9 +443,7 @@ mod tests {
 
     use super::*;
     use engine::game::game_object::GameObject;
-    use engine::types::ability::{
-        AbilityDefinition, AbilityKind, ManaReplacementScope, QuantityExpr, TargetFilter,
-    };
+    use engine::types::ability::{AbilityDefinition, AbilityKind, QuantityExpr, TargetFilter};
     use engine::types::identifiers::{CardId, ObjectId};
     use engine::types::mana::ManaCost;
 
@@ -474,38 +498,19 @@ mod tests {
     #[test]
     fn includes_only_qualifying_replacements() {
         let mut object = make_object();
-        object.replacement_definitions.push(ReplacementDefinition {
-            event: ReplacementEvent::ChangeZone,
-            execute: Some(Box::new(AbilityDefinition::new(
-                AbilityKind::Spell,
-                Effect::Tap {
-                    target: TargetFilter::SelfRef,
-                },
-            ))),
-            runtime_execute: None,
-            mode: engine::types::ability::ReplacementMode::Mandatory,
-            valid_card: Some(TargetFilter::SelfRef),
-            description: None,
-            condition: None,
-            destination_zone: Some(Zone::Battlefield),
-            damage_modification: None,
-            damage_source_filter: None,
-            damage_target_filter: None,
-            combat_scope: None,
-            shield_kind: Default::default(),
-            quantity_modification: None,
-            token_owner_scope: None,
-            token_owner_redirect: None,
-            valid_player: None,
-            is_consumed: false,
-            expiry: None,
-            redirect_target: None,
-            mana_modification: None,
-            mana_replacement_scope: ManaReplacementScope::Any,
-            additional_token_spec: None,
-            ensure_token_specs: None,
-            counter_match: None,
-        });
+        object.replacement_definitions.push(
+            ReplacementDefinition::new(ReplacementEvent::ChangeZone)
+                .execute(AbilityDefinition::new(
+                    AbilityKind::Spell,
+                    Effect::SetTapState {
+                        target: TargetFilter::SelfRef,
+                        scope: EffectScope::Single,
+                        state: TapStateChange::Tap,
+                    },
+                ))
+                .valid_card(TargetFilter::SelfRef)
+                .destination_zone(Zone::Battlefield),
+        );
         object.replacement_definitions.push(ReplacementDefinition {
             destination_zone: None,
             ..object.replacement_definitions[0].clone()
@@ -560,6 +565,7 @@ mod tests {
                 amount: QuantityExpr::Fixed { value: 2 },
                 target: TargetFilter::Any,
                 damage_source: None,
+                excess: None,
             },
         ));
 
@@ -610,5 +616,54 @@ mod tests {
             .filter(|effect| matches!(effect, Effect::Draw { .. }))
             .count();
         assert_eq!(draw_count, 3);
+    }
+
+    // CR 701.60a: mass un-designation ("all suspected creatures are no longer
+    // suspected", Absolving Lammasu) is a non-targeting population effect, so it
+    // must NOT be scored as target-requiring. Only `EffectScope::Single`
+    // (targeted/anaphoric "suspect target creature" / "it's no longer
+    // suspected") declares a target, mirroring the engine's `target_filter()`
+    // and the `SetTapState` `Single`/`All` split.
+    #[test]
+    fn mass_unsuspect_is_not_target_requiring() {
+        // The non-None filter is identical across scopes (the mass clause still
+        // carries its population filter); only `scope` distinguishes them, so a
+        // pass proves the scope gate — not the filter — drives the decision.
+        let single = Effect::Unsuspect {
+            target: TargetFilter::Any,
+            scope: EffectScope::Single,
+        };
+        let mass = Effect::Unsuspect {
+            target: TargetFilter::Any,
+            scope: EffectScope::All,
+        };
+        assert!(
+            effect_requires_targets(&single),
+            "single-scope Unsuspect must be target-requiring"
+        );
+        assert!(
+            !effect_requires_targets(&mass),
+            "mass Unsuspect{{All}} (Absolving Lammasu) must not be target-requiring"
+        );
+    }
+
+    #[test]
+    fn mass_suspect_is_not_target_requiring() {
+        let single = Effect::Suspect {
+            target: TargetFilter::Any,
+            scope: EffectScope::Single,
+        };
+        let mass = Effect::Suspect {
+            target: TargetFilter::Any,
+            scope: EffectScope::All,
+        };
+        assert!(
+            effect_requires_targets(&single),
+            "single-scope Suspect must be target-requiring"
+        );
+        assert!(
+            !effect_requires_targets(&mass),
+            "mass Suspect{{All}} must not be target-requiring"
+        );
     }
 }

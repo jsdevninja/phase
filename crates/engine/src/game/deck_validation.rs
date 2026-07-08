@@ -4,10 +4,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::database::legality::{LegalityFormat, LegalityStatus};
 use crate::database::CardDatabase;
-use crate::parser::oracle::oracle_text_allows_commander;
+use crate::parser::oracle::{compute_deck_copy_limit_from_text, oracle_text_allows_commander};
 use crate::types::card::{CardFace, CardRules, PrintedCardRef};
 use crate::types::card_type::{CoreType, Supertype};
-use crate::types::format::{GameFormat, SideboardPolicy};
+use crate::types::format::{DeckCopyLimit, GameFormat, SideboardPolicy};
 use crate::types::keywords::Keyword;
 use crate::types::mana::{ManaColor, ManaCost};
 use crate::types::match_config::MatchType;
@@ -21,11 +21,26 @@ pub struct DeckCompatibilityRequest {
     #[serde(default)]
     pub commander: Vec<String>,
     #[serde(default)]
+    pub planar_deck: Vec<String>,
+    #[serde(default)]
+    pub scheme_deck: Vec<String>,
+    /// Oathbreaker RC: the signature spell card name. Empty for all non-Oathbreaker
+    /// formats. Included in `all_deck_cards` so copy-count and identity checks are
+    /// accurate regardless of which validation path is active.
+    #[serde(default)]
+    pub signature_spell: Vec<String>,
+    #[serde(default)]
     pub selected_format: Option<GameFormat>,
     #[serde(default)]
     pub selected_match_type: Option<MatchType>,
+    #[serde(default = "default_player_count")]
+    pub player_count: usize,
     #[serde(default)]
     pub summary_only: bool,
+}
+
+fn default_player_count() -> usize {
+    2
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -219,12 +234,66 @@ pub fn validate_name_deck_for_format(
     selected_format: GameFormat,
     selected_match_type: Option<MatchType>,
 ) -> Result<(), Vec<String>> {
+    validate_name_deck_for_format_with_sig(
+        db,
+        main_deck,
+        sideboard,
+        commander,
+        &[],
+        selected_format,
+        selected_match_type,
+    )
+}
+
+/// Extended variant of `validate_name_deck_for_format` that accepts a
+/// signature spell slot for Oathbreaker validation. All other callers
+/// continue to use `validate_name_deck_for_format` with an implicit empty slice.
+pub fn validate_name_deck_for_format_with_sig(
+    db: &CardDatabase,
+    main_deck: &[String],
+    sideboard: &[String],
+    commander: &[String],
+    signature_spell: &[String],
+    selected_format: GameFormat,
+    selected_match_type: Option<MatchType>,
+) -> Result<(), Vec<String>> {
+    validate_name_deck_for_format_full(
+        db,
+        main_deck,
+        sideboard,
+        commander,
+        &[],
+        &[],
+        signature_spell,
+        selected_format,
+        selected_match_type,
+        default_player_count(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn validate_name_deck_for_format_full(
+    db: &CardDatabase,
+    main_deck: &[String],
+    sideboard: &[String],
+    commander: &[String],
+    planar_deck: &[String],
+    scheme_deck: &[String],
+    signature_spell: &[String],
+    selected_format: GameFormat,
+    selected_match_type: Option<MatchType>,
+    player_count: usize,
+) -> Result<(), Vec<String>> {
     let request = DeckCompatibilityRequest {
         main_deck: main_deck.to_vec(),
         sideboard: sideboard.to_vec(),
         commander: commander.to_vec(),
+        planar_deck: planar_deck.to_vec(),
+        scheme_deck: scheme_deck.to_vec(),
+        signature_spell: signature_spell.to_vec(),
         selected_format: Some(selected_format),
         selected_match_type,
+        player_count,
         summary_only: false,
     };
     validate_deck_for_format(db, &request)
@@ -317,7 +386,7 @@ fn evaluate_constructed(
             // "illegal" — that was the bug that flagged Power 9 as banned
             // in Vintage.
             Some(LegalityStatus::Restricted) => {
-                restricted_canonical.insert(resolved.to_ascii_lowercase());
+                restricted_canonical.insert(canonical_deck_count_key(db, name));
             }
             Some(status) => {
                 illegal_cards.insert(format!("{name} ({})", status_label(status)));
@@ -349,6 +418,213 @@ fn evaluate_constructed(
     CompatibilityCheck {
         compatible: reasons.is_empty(),
         reasons,
+    }
+}
+
+fn evaluate_planechase(
+    db: &CardDatabase,
+    request: &DeckCompatibilityRequest,
+    unknown_cards: &BTreeSet<String>,
+) -> CompatibilityCheck {
+    let mut reasons = Vec::new();
+
+    if !unknown_cards.is_empty() {
+        reasons.push(summarize_cards("Unknown cards", unknown_cards, 6));
+    }
+    if !(2..=4).contains(&request.player_count) {
+        reasons.push(format!(
+            "Planechase requires 2 to 4 players (found {})",
+            request.player_count
+        ));
+    }
+    if !request.commander.is_empty() {
+        reasons.push("Planechase decks do not use a commander slot".to_string());
+    }
+    if request.main_deck.len() < 60 {
+        reasons.push(format!(
+            "Main deck has {} cards (minimum 60)",
+            request.main_deck.len()
+        ));
+    }
+
+    let counts = combined_copy_counts(db, request);
+    let over_limit = copy_limit_violations(db, &counts, 4);
+    if !over_limit.is_empty() {
+        reasons.push(summarize_cards(
+            "More than 4 copies (main + sideboard combined)",
+            &over_limit,
+            6,
+        ));
+    }
+
+    if request.planar_deck.is_empty() {
+        return CompatibilityCheck {
+            compatible: reasons.is_empty(),
+            reasons,
+        };
+    }
+
+    // CR 901.15a: a shared planar deck must contain at least 40 cards, or at
+    // least ten cards per player if there are fewer than four players.
+    let min_planar_cards = 40usize.min(request.player_count.saturating_mul(10));
+    if request.planar_deck.len() < min_planar_cards {
+        reasons.push(format!(
+            "Planar deck has {} cards (minimum {min_planar_cards})",
+            request.planar_deck.len()
+        ));
+    }
+
+    let mut seen_names = HashSet::new();
+    let mut duplicates = BTreeSet::new();
+    let mut non_planar = BTreeSet::new();
+    let mut planes = 0usize;
+    let mut phenomena = 0usize;
+    for name in &request.planar_deck {
+        let Some(face) = db.get_face_by_name(resolve_card_name(db, name)) else {
+            continue;
+        };
+        let canonical = face.name.to_lowercase();
+        if !seen_names.insert(canonical) {
+            duplicates.insert(face.name.clone());
+        }
+        let is_plane = face.card_type.core_types.contains(&CoreType::Plane);
+        let is_phenomenon = face.card_type.core_types.contains(&CoreType::Phenomenon);
+        if is_plane {
+            planes += 1;
+        }
+        if is_phenomenon {
+            phenomena += 1;
+        }
+        if !is_plane && !is_phenomenon {
+            non_planar.insert(face.name.clone());
+        }
+    }
+    if !duplicates.is_empty() {
+        reasons.push(summarize_cards(
+            "Planar deck singleton violations",
+            &duplicates,
+            6,
+        ));
+    }
+    if !non_planar.is_empty() {
+        reasons.push(summarize_cards(
+            "Planar deck cards must be Plane or Phenomenon",
+            &non_planar,
+            6,
+        ));
+    }
+    if planes == 0 {
+        reasons.push("Planar deck must contain at least one Plane".to_string());
+    }
+    let max_phenomena = request.player_count.saturating_mul(2);
+    if phenomena > max_phenomena {
+        reasons.push(format!(
+            "Planar deck has {phenomena} phenomena (maximum {max_phenomena})"
+        ));
+    }
+
+    CompatibilityCheck {
+        compatible: reasons.is_empty(),
+        reasons,
+    }
+}
+
+fn evaluate_archenemy(
+    db: &CardDatabase,
+    request: &DeckCompatibilityRequest,
+    unknown_cards: &BTreeSet<String>,
+) -> CompatibilityCheck {
+    let mut reasons = Vec::new();
+
+    if !unknown_cards.is_empty() {
+        reasons.push(summarize_cards("Unknown cards", unknown_cards, 6));
+    }
+    if !(2..=6).contains(&request.player_count) {
+        reasons.push(format!(
+            "Archenemy requires 2 to 6 players (found {})",
+            request.player_count
+        ));
+    }
+    if !request.commander.is_empty() {
+        reasons.push("Archenemy decks do not use a commander slot".to_string());
+    }
+    if request.main_deck.len() < 60 {
+        reasons.push(format!(
+            "Main deck has {} cards (minimum 60)",
+            request.main_deck.len()
+        ));
+    }
+
+    let counts = combined_copy_counts(db, request);
+    let over_limit = copy_limit_violations(db, &counts, 4);
+    if !over_limit.is_empty() {
+        reasons.push(summarize_cards(
+            "More than 4 copies (main + sideboard combined)",
+            &over_limit,
+            6,
+        ));
+    }
+
+    if !request.scheme_deck.is_empty() {
+        validate_scheme_deck(db, &request.scheme_deck, &mut reasons);
+    }
+
+    CompatibilityCheck {
+        compatible: reasons.is_empty(),
+        reasons,
+    }
+}
+
+fn validate_scheme_deck(db: &CardDatabase, scheme_deck: &[String], reasons: &mut Vec<String>) {
+    // CR 904.3: A scheme deck must contain at least twenty scheme cards and
+    // can't contain more than two copies of any card by English name.
+    if scheme_deck.len() < 20 {
+        reasons.push(format!(
+            "Scheme deck has {} cards (minimum 20)",
+            scheme_deck.len()
+        ));
+    }
+
+    let mut counts: HashMap<String, u32> = HashMap::new();
+    let mut non_scheme = BTreeSet::new();
+    let mut unsupported = BTreeSet::new();
+    for name in scheme_deck {
+        let Some(face) = db.get_face_by_name(resolve_card_name(db, name)) else {
+            continue;
+        };
+        *counts.entry(face.name.to_lowercase()).or_insert(0) += 1;
+        if !face.card_type.core_types.contains(&CoreType::Scheme) {
+            non_scheme.insert(face.name.clone());
+        }
+        if !crate::game::coverage::card_face_gaps(face).is_empty() {
+            unsupported.insert(face.name.clone());
+        }
+    }
+
+    let over_limit: BTreeSet<String> = counts
+        .into_iter()
+        .filter(|(_, count)| *count > 2)
+        .filter_map(|(name, count)| {
+            db.get_face_by_name(&name)
+                .map(|face| format!("{} ({count} copies)", face.name))
+        })
+        .collect();
+    if !over_limit.is_empty() {
+        reasons.push(summarize_cards(
+            "Scheme deck copy-limit violations",
+            &over_limit,
+            6,
+        ));
+    }
+    if !non_scheme.is_empty() {
+        reasons.push(summarize_cards(
+            "Scheme deck cards must be Scheme cards",
+            &non_scheme,
+            6,
+        ));
+    }
+    if !unsupported.is_empty() {
+        reasons.push(summarize_cards("Unsupported scheme cards", &unsupported, 6));
     }
 }
 
@@ -557,28 +833,18 @@ fn evaluate_commander_with_format(
             commander_identity.extend(card_color_identity(face));
         }
     }
-    let mut identity_violations = BTreeSet::new();
-    for name in &request.main_deck {
-        if request
-            .commander
-            .iter()
-            .any(|c| c.eq_ignore_ascii_case(name))
-        {
-            continue;
-        }
-        if unknown_cards.contains(name.as_str()) {
-            continue;
-        }
-        if let Some(face) = db.get_face_by_name(resolve_card_name(db, name)) {
-            let card_colors = card_color_identity(face);
-            for color in &card_colors {
-                if !commander_identity.contains(color) {
-                    identity_violations.insert(name.clone());
-                    break;
-                }
-            }
-        }
-    }
+    let identity_violations = color_identity_violations(
+        db,
+        &request.main_deck,
+        &commander_identity,
+        unknown_cards,
+        |name| {
+            request
+                .commander
+                .iter()
+                .any(|c| c.eq_ignore_ascii_case(name))
+        },
+    );
     if !identity_violations.is_empty() {
         reasons.push(summarize_cards(
             "Cards outside commander's color identity",
@@ -1074,13 +1340,18 @@ fn basic_land_type_colors(face: &CardFace) -> Vec<ManaColor> {
 fn tiny_leaders_cost_identity_ok(db: &CardDatabase, name: &str) -> bool {
     tiny_leaders_cost_faces(db, name)
         .into_iter()
-        .all(tiny_leaders_face_cost_identity_ok)
+        .all(|face| tiny_leaders_face_cost_identity_ok(db, face))
 }
 
-fn tiny_leaders_face_cost_identity_ok(face: &CardFace) -> bool {
-    face.mana_cost.mana_value() <= 3
+fn tiny_leaders_face_cost_identity_ok(db: &CardDatabase, face: &CardFace) -> bool {
+    // CR 202.3d + CR 709.4b: off the stack a split card's mana value is the COMBINED
+    // value of both halves, so the Tiny Leaders MV <= 3 cap must use the combined
+    // value (a Fire // Ice-style card is MV 4, not 2). `off_stack_mana_value_for_face`
+    // combines for split cards and is the face's own value for every other layout,
+    // preserving the per-face check for DFC/MDFC/Adventure cards.
+    db.off_stack_mana_value_for_face(face) <= 3
         && face.keywords.iter().all(|keyword| match keyword {
-            Keyword::Prototype(cost) => cost.mana_value() <= 3,
+            Keyword::Prototype { cost, .. } => cost.mana_value() <= 3,
             _ => true,
         })
 }
@@ -1140,6 +1411,315 @@ fn names_match(a: &str, b: &str) -> bool {
     normalize(a) == normalize(b)
 }
 
+/// Oathbreaker RC: returns `true` if `face` is an instant or sorcery.
+fn is_instant_or_sorcery(face: &CardFace) -> bool {
+    face.card_type.core_types.contains(&CoreType::Instant)
+        || face.card_type.core_types.contains(&CoreType::Sorcery)
+}
+
+/// Oathbreaker RC: full deck compatibility check.
+fn evaluate_oathbreaker(
+    db: &CardDatabase,
+    request: &DeckCompatibilityRequest,
+    unknown_cards: &BTreeSet<String>,
+) -> CompatibilityCheck {
+    let mut reasons = Vec::new();
+
+    if !unknown_cards.is_empty() {
+        reasons.push(summarize_cards("Unknown cards", unknown_cards, 6));
+    }
+
+    // Oathbreaker RC: exactly one Oathbreaker (legendary Planeswalker).
+    if request.commander.len() != 1 {
+        reasons.push(format!(
+            "Oathbreaker decks require exactly 1 Oathbreaker (found {})",
+            request.commander.len()
+        ));
+    } else {
+        let name = &request.commander[0];
+        if let Some(face) = db.get_face_by_name(resolve_card_name(db, name)) {
+            if !face.is_oathbreaker {
+                reasons.push(format!(
+                    "{name}: Oathbreaker must be a legendary Planeswalker"
+                ));
+            }
+        }
+    }
+
+    let oathbreaker_identity = request.commander.first().and_then(|ob_name| {
+        db.get_face_by_name(resolve_card_name(db, ob_name))
+            .filter(|face| face.is_oathbreaker)
+            .map(|face| {
+                card_color_identity(face)
+                    .into_iter()
+                    .collect::<HashSet<_>>()
+            })
+    });
+
+    // Oathbreaker RC: exactly one signature spell (instant or sorcery within color identity).
+    if request.signature_spell.len() != 1 {
+        reasons.push(format!(
+            "Oathbreaker decks require exactly 1 signature spell (found {})",
+            request.signature_spell.len()
+        ));
+    } else {
+        let sig_name = &request.signature_spell[0];
+        if let Some(face) = db.get_face_by_name(resolve_card_name(db, sig_name)) {
+            if !is_instant_or_sorcery(face) {
+                reasons.push(format!(
+                    "{sig_name}: signature spell must be an instant or sorcery"
+                ));
+            }
+            // Signature spell must be within the Oathbreaker's color identity.
+            if let Some(identity) = &oathbreaker_identity {
+                for color in card_color_identity(face) {
+                    if !identity.contains(&color) {
+                        reasons.push(format!(
+                            "{sig_name}: signature spell is outside the Oathbreaker's color identity"
+                        ));
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // Oathbreaker RC: exactly 60 cards total (main + commander + signature spell,
+    // de-duplicating any that appear in both main and a command-zone slot).
+    let commander_represented = request
+        .commander
+        .iter()
+        .filter(|n| request.main_deck.iter().any(|c| names_match(c, n)))
+        .count();
+    let sig_represented = request
+        .signature_spell
+        .iter()
+        .filter(|n| request.main_deck.iter().any(|c| names_match(c, n)))
+        .count();
+    let total_cards = request.main_deck.len()
+        + (request
+            .commander
+            .len()
+            .saturating_sub(commander_represented))
+        + (request
+            .signature_spell
+            .len()
+            .saturating_sub(sig_represented));
+    if total_cards != 60 {
+        reasons.push(format!(
+            "Oathbreaker deck must have exactly 60 cards (found {total_cards})"
+        ));
+    }
+
+    // Oathbreaker RC: singleton (basic lands exempt, consistent with other
+    // singleton command-zone formats). `all_deck_cards` now includes `signature_spell`
+    // so a card in both the main deck and signature-spell slot is caught here.
+    let counts = combined_copy_counts(db, request);
+    let singleton_violations = copy_limit_violations(db, &counts, 1);
+    if !singleton_violations.is_empty() {
+        reasons.push(summarize_cards(
+            "Singleton violations",
+            &singleton_violations,
+            6,
+        ));
+    }
+
+    // Oathbreaker RC: every main-deck card must be within the Oathbreaker's
+    // color identity. CR 903.5c (color identity) is shared with the other
+    // command-zone formats via `color_identity_violations`; CR 903.5d (off-
+    // identity basic land types) is reported in its own bucket alongside it.
+    let mut identity_violations = BTreeSet::new();
+    let mut basic_type_violations = BTreeSet::new();
+    if let Some(identity) = &oathbreaker_identity {
+        identity_violations =
+            color_identity_violations(db, &request.main_deck, identity, unknown_cards, |_| false);
+        for name in request.main_deck.iter().map(String::as_str) {
+            if unknown_cards.contains(name) {
+                continue;
+            }
+            let resolved = resolve_card_name(db, name);
+            let Some(face) = db.get_face_by_name(resolved) else {
+                continue;
+            };
+            for color in basic_land_type_colors(face) {
+                if !identity.contains(&color) {
+                    basic_type_violations.insert(face.name.clone());
+                    break;
+                }
+            }
+        }
+    }
+    if !identity_violations.is_empty() {
+        reasons.push(summarize_cards(
+            "Cards outside Oathbreaker color identity",
+            &identity_violations,
+            6,
+        ));
+    }
+    if !basic_type_violations.is_empty() {
+        reasons.push(summarize_cards(
+            "Cards with off-identity basic land types",
+            &basic_type_violations,
+            6,
+        ));
+    }
+
+    CompatibilityCheck {
+        compatible: reasons.is_empty(),
+        reasons,
+    }
+}
+
+/// CR 305.6: the five basic land types (Plains/Island/Swamp/Mountain/Forest).
+/// "Wastes" is the basic colorless land but is NOT a basic land type, so
+/// Snow-Covered Wastes is naturally excluded from the Momir's Madness deck by
+/// requiring a subtype in this set.
+const BASIC_LAND_TYPES: [&str; 5] = ["Plains", "Island", "Swamp", "Mountain", "Forest"];
+
+/// Momir's Madness format deck rule: the deck is fixed at exactly 12 copies of
+/// each of the five snow basic lands (Snow-Covered Plains/Island/Swamp/Mountain/
+/// Forest), totaling 60, with nothing else. Players cannot adjust this ratio.
+///
+/// A "snow basic land" is identified by typed checks (CR 205.4a Snow + Basic
+/// supertypes, CR 305 Land core type, and a CR 305.6 basic land type subtype) —
+/// never by matching printed card names. Snow-Covered Wastes is excluded because
+/// its subtype is "Wastes", which is not a basic land type (CR 305.6). This is a
+/// format-construction rule, not a Comprehensive Rule; CR 100.2a's basic-land
+/// copy exception is what makes the 12-of-each copies legal despite the
+/// four-copy default.
+fn evaluate_momir(
+    db: &CardDatabase,
+    request: &DeckCompatibilityRequest,
+    unknown_cards: &BTreeSet<String>,
+) -> CompatibilityCheck {
+    const EXPECTED_PER_TYPE: usize = 12;
+
+    let mut reasons = Vec::new();
+
+    if !unknown_cards.is_empty() {
+        reasons.push(summarize_cards("Unknown cards", unknown_cards, 6));
+    }
+
+    if request.main_deck.len() != 60 {
+        reasons.push(format!(
+            "Momir's Madness decks must have exactly 60 cards (found {})",
+            request.main_deck.len()
+        ));
+    }
+
+    // Tally snow-basic copies per basic land type; collect anything that is not a
+    // snow basic land of a CR 305.6 basic land type.
+    let mut per_type: BTreeMap<&'static str, usize> = BTreeMap::new();
+    let mut non_snow_basic = BTreeSet::new();
+    for name in request.main_deck.iter().map(String::as_str) {
+        if unknown_cards.contains(name) {
+            continue;
+        }
+        let resolved = resolve_card_name(db, name);
+        let Some(face) = db.get_face_by_name(resolved) else {
+            continue;
+        };
+        // CR 205.4a + CR 305: Snow + Basic supertypes on a Land.
+        let is_snow_basic_land = face.card_type.supertypes.contains(&Supertype::Snow)
+            && face.card_type.supertypes.contains(&Supertype::Basic)
+            && face.card_type.core_types.contains(&CoreType::Land);
+        // CR 305.6: must carry one of the five basic land type subtypes
+        // (excludes Snow-Covered Wastes, whose subtype is "Wastes").
+        let basic_type = is_snow_basic_land
+            .then(|| {
+                BASIC_LAND_TYPES.into_iter().find(|bt| {
+                    face.card_type
+                        .subtypes
+                        .iter()
+                        .any(|s| s.eq_ignore_ascii_case(bt))
+                })
+            })
+            .flatten();
+        match basic_type {
+            Some(bt) => *per_type.entry(bt).or_insert(0) += 1,
+            None => {
+                non_snow_basic.insert(face.name.clone());
+            }
+        }
+    }
+    if !non_snow_basic.is_empty() {
+        reasons.push(summarize_cards(
+            "Momir's Madness decks may only contain the five snow basic lands \
+             (Snow-Covered Plains/Island/Swamp/Mountain/Forest)",
+            &non_snow_basic,
+            6,
+        ));
+    }
+
+    // The ratio is fixed: exactly 12 of each of the five snow basic types.
+    for bt in BASIC_LAND_TYPES {
+        let count = per_type.get(bt).copied().unwrap_or(0);
+        if count != EXPECTED_PER_TYPE {
+            reasons.push(format!(
+                "Momir's Madness decks must contain exactly {EXPECTED_PER_TYPE} \
+                 copies of Snow-Covered {bt} (found {count})"
+            ));
+        }
+    }
+
+    if !request.sideboard.is_empty() {
+        reasons.push("Momir's Madness does not use a sideboard".to_string());
+    }
+    if !request.commander.is_empty() || !request.signature_spell.is_empty() {
+        reasons.push("Momir's Madness does not use command-zone cards".to_string());
+    }
+
+    CompatibilityCheck {
+        compatible: reasons.is_empty(),
+        reasons,
+    }
+}
+
+fn quick_momir_check(db: &CardDatabase, request: &DeckCompatibilityRequest) -> QuickCheckResult {
+    let unknown_cards = collect_unknown_cards(db, request);
+    let check = evaluate_momir(db, request, &unknown_cards);
+    QuickCheckResult {
+        reason: check.reasons.into_iter().next(),
+        unknown_cards,
+    }
+}
+
+fn quick_oathbreaker_check(
+    db: &CardDatabase,
+    request: &DeckCompatibilityRequest,
+) -> QuickCheckResult {
+    let unknown_cards = collect_unknown_cards(db, request);
+    let check = evaluate_oathbreaker(db, request, &unknown_cards);
+    QuickCheckResult {
+        reason: check.reasons.into_iter().next(),
+        unknown_cards,
+    }
+}
+
+fn quick_planechase_check(
+    db: &CardDatabase,
+    request: &DeckCompatibilityRequest,
+) -> QuickCheckResult {
+    let unknown_cards = collect_unknown_cards(db, request);
+    let check = evaluate_planechase(db, request, &unknown_cards);
+    QuickCheckResult {
+        reason: check.reasons.into_iter().next(),
+        unknown_cards,
+    }
+}
+
+fn quick_archenemy_check(
+    db: &CardDatabase,
+    request: &DeckCompatibilityRequest,
+) -> QuickCheckResult {
+    let unknown_cards = collect_unknown_cards(db, request);
+    let check = evaluate_archenemy(db, request, &unknown_cards);
+    QuickCheckResult {
+        reason: check.reasons.into_iter().next(),
+        unknown_cards,
+    }
+}
+
 fn evaluate_selected_format_summary(
     db: &CardDatabase,
     request: &DeckCompatibilityRequest,
@@ -1191,6 +1771,10 @@ fn evaluate_selected_format_summary(
             100,
         ),
         GameFormat::TinyLeaders => quick_tiny_leaders_check(db, request),
+        GameFormat::Oathbreaker => quick_oathbreaker_check(db, request),
+        GameFormat::Momir => quick_momir_check(db, request),
+        GameFormat::Planechase => quick_planechase_check(db, request),
+        GameFormat::Archenemy => quick_archenemy_check(db, request),
         GameFormat::Brawl | GameFormat::HistoricBrawl => quick_brawl_check(
             db,
             request,
@@ -1272,11 +1856,12 @@ fn quick_constructed_check(
         if db.get_face_by_name(resolved).is_none() {
             return QuickCheckResult::unknown(name);
         }
-        *counts.entry(resolved.to_ascii_lowercase()).or_insert(0) += 1;
+        let canonical = canonical_deck_count_key(db, name);
+        *counts.entry(canonical.clone()).or_insert(0) += 1;
         match db.legality_status(resolved, legality_format) {
             Some(LegalityStatus::Legal) => {}
             Some(LegalityStatus::Restricted) => {
-                restricted.insert(resolved.to_ascii_lowercase());
+                restricted.insert(canonical);
             }
             Some(status) => {
                 return QuickCheckResult::incompatible(format!(
@@ -1377,7 +1962,9 @@ fn quick_commander_check(
         let Some(face) = db.get_face_by_name(resolved) else {
             return QuickCheckResult::unknown(name);
         };
-        *counts.entry(resolved.to_ascii_lowercase()).or_insert(0) += 1;
+        *counts
+            .entry(canonical_deck_count_key(db, name))
+            .or_insert(0) += 1;
         if !rules.skip_commander_legality
             || !request
                 .commander
@@ -1548,6 +2135,34 @@ fn evaluate_selected_format(
             }
             check.compatible
         }
+        GameFormat::Oathbreaker => {
+            let check = evaluate_oathbreaker(db, request, unknown_cards);
+            if !check.compatible {
+                reasons.extend(check.reasons);
+            }
+            check.compatible
+        }
+        GameFormat::Momir => {
+            let check = evaluate_momir(db, request, unknown_cards);
+            if !check.compatible {
+                reasons.extend(check.reasons);
+            }
+            check.compatible
+        }
+        GameFormat::Planechase => {
+            let check = evaluate_planechase(db, request, unknown_cards);
+            if !check.compatible {
+                reasons.extend(check.reasons);
+            }
+            check.compatible
+        }
+        GameFormat::Archenemy => {
+            let check = evaluate_archenemy(db, request, unknown_cards);
+            if !check.compatible {
+                reasons.extend(check.reasons);
+            }
+            check.compatible
+        }
         GameFormat::FreeForAll | GameFormat::TwoHeadedGiant | GameFormat::Limited => true,
     };
 
@@ -1656,10 +2271,50 @@ fn collect_unknown_cards(
             unknown.insert(name.to_string());
         }
     }
+    for name in &request.planar_deck {
+        if !card_is_known(db, name) {
+            unknown.insert(name.to_string());
+        }
+    }
+    for name in &request.scheme_deck {
+        if !card_is_known(db, name) {
+            unknown.insert(name.to_string());
+        }
+    }
     unknown
 }
 
 /// CR 903.4: Compute color identity of a single card from mana cost + color indicator.
+/// CR 903.5c: collect every main-deck card whose color identity is not a
+/// subset of `identity`. Shared by the command-zone formats so the
+/// color-identity-subset loop lives in one place instead of being copied per
+/// format. `is_command_zone_card` skips cards that occupy the command zone
+/// (e.g. a commander also listed in the main deck); unknown cards are skipped
+/// so they are reported only once under "Unknown cards".
+fn color_identity_violations(
+    db: &CardDatabase,
+    main_deck: &[String],
+    identity: &HashSet<ManaColor>,
+    unknown_cards: &BTreeSet<String>,
+    is_command_zone_card: impl Fn(&str) -> bool,
+) -> BTreeSet<String> {
+    let mut violations = BTreeSet::new();
+    for name in main_deck {
+        if is_command_zone_card(name.as_str()) || unknown_cards.contains(name.as_str()) {
+            continue;
+        }
+        if let Some(face) = db.get_face_by_name(resolve_card_name(db, name)) {
+            if card_color_identity(face)
+                .iter()
+                .any(|color| !identity.contains(color))
+            {
+                violations.insert(name.clone());
+            }
+        }
+    }
+    violations
+}
+
 fn card_color_identity(face: &CardFace) -> HashSet<ManaColor> {
     if !face.color_identity.is_empty() {
         return face.color_identity.iter().copied().collect();
@@ -1728,15 +2383,23 @@ fn card_is_known(db: &CardDatabase, name: &str) -> bool {
 /// `"Delver of Secrets // Insectile Aberration"`/`"Delver of Secrets"` are
 /// counted as the same card.
 ///
-/// CR 201.3 + CR 903.5b: For deck construction, cards with interchangeable
-/// names have the same name.
+/// CR 201.3 + CR 100.2a: Canonical key for aggregating deck copy counts.
+/// Uses the indexed face name when the card resolves so alias spellings
+/// ("Nazgul" vs "Nazgûl") merge into one bucket for copy-limit checks.
+fn canonical_deck_count_key(db: &CardDatabase, name: &str) -> String {
+    let resolved = resolve_card_name(db, name);
+    db.get_face_by_name(resolved)
+        .map(|face| face.name.to_lowercase())
+        .unwrap_or_else(|| resolved.to_lowercase())
+}
+
 fn combined_copy_counts(
     db: &CardDatabase,
     request: &DeckCompatibilityRequest,
 ) -> HashMap<String, u32> {
     let mut counts: HashMap<String, u32> = HashMap::new();
     for name in all_deck_cards(request) {
-        let canonical = resolve_card_name(db, name).to_ascii_lowercase();
+        let canonical = canonical_deck_count_key(db, name);
         *counts.entry(canonical).or_insert(0) += 1;
     }
     counts
@@ -1744,14 +2407,10 @@ fn combined_copy_counts(
 
 /// CR 100.2a: Flag card names whose combined count exceeds `max_copies`,
 /// excluding basic lands and cards whose Oracle text grants a per-card deck-limit
-/// override (e.g. Relentless Rats, Shadowborn Apostle, Rat Colony, Persistent
-/// Petitioners — all printed with "A deck can have any number of cards named ...").
-///
-/// Seven Dwarves / Nazgûl have finite caps printed on the card (7 and 9
-/// respectively) via "A deck can have up to <N> cards named ..."; their phrasing
-/// does not match the "any number" override, so they currently fall through to
-/// the default 4-per-name limit. That's a known gap — supporting arbitrary N-caps
-/// requires parsing the printed number, which is out of scope for this pass.
+/// override (e.g. Relentless Rats — "any number"; Seven Dwarves → 7, Nazgûl → 9
+/// via "up to N"; Vazal singleton → 1). The typed override is resolved from
+/// `face.deck_copy_limit`, falling back to a live Oracle-text parse for faces
+/// loaded without synthesis (test fixtures, `from_json_str`).
 ///
 /// Input counts must be keyed by canonical (DFC-resolved, lowercased) names —
 /// use `combined_copy_counts`.
@@ -1762,21 +2421,25 @@ fn copy_limit_violations(
 ) -> BTreeSet<String> {
     let mut violations = BTreeSet::new();
     for (canonical_name, count) in counts {
-        if *count <= max_copies {
-            continue;
-        }
-        // CR 100.2a + CR 205.3i: Basic lands are exempt from copy limits.
-        // "Basic" is a supertype (covering Plains/Island/Swamp/Mountain/Forest,
-        // Snow-Covered variants, Wastes, and any future basic), not a fixed
-        // name allowlist — trust the MTGJSON-populated supertype field.
+        // CR 100.2a + CR 205.4c: Basic lands are exempt from copy limits
+        // regardless of any other override. "Basic" is a supertype (covering
+        // Plains/Island/Swamp/Mountain/Forest, Snow-Covered variants, Wastes,
+        // and any future basic), not a fixed name allowlist — trust the
+        // MTGJSON-populated supertype field. Checked FIRST so basics never flag.
         if db
             .get_face_by_name(canonical_name)
             .is_some_and(|face| face.card_type.supertypes.contains(&Supertype::Basic))
         {
             continue;
         }
-        if has_deck_limit_override(db, canonical_name) {
-            continue;
+        // CR 100.2a / CR 903.5b: apply the per-card override when present,
+        // otherwise the format-default `max_copies` (4 constructed, 1 singleton).
+        match deck_copy_limit_for(db, canonical_name) {
+            Some(DeckCopyLimit::Unlimited) => continue,
+            Some(DeckCopyLimit::UpTo(n)) if *count <= n => continue,
+            Some(DeckCopyLimit::UpTo(_)) => {} // override cap exceeded — flag
+            None if *count <= max_copies => continue,
+            None => {} // default limit exceeded — flag
         }
         // Prefer the database's canonical display casing for error messages;
         // fall back to the lowercased key if the face is missing (e.g. for
@@ -1797,6 +2460,10 @@ fn copy_limit_violations(
 /// `restricted_canonical` is the set of canonical (DFC-resolved, lowercased)
 /// names that the legality table marks as `Restricted` for the active format;
 /// `counts` is the combined main+sideboard map produced by `combined_copy_counts`.
+///
+/// Note: this hardcodes the `<= 1` Restricted ceiling and does NOT consult any
+/// per-card `DeckCopyLimit` override — no override card is currently
+/// Vintage-Restricted, so the interaction is out of scope.
 fn restricted_copy_violations(
     db: &CardDatabase,
     counts: &HashMap<String, u32>,
@@ -1819,19 +2486,17 @@ fn restricted_copy_violations(
     violations
 }
 
-/// CR 100.2a exception: a card's Oracle text may read
-/// "A deck can have any number of cards named <Name>." When present, the
-/// 4-per-name constructed limit and the 1-per-name singleton limit do not
-/// apply to that card. Class-level Oracle text detection — covers Relentless
-/// Rats, Shadowborn Apostle, Rat Colony, Persistent Petitioners, and any
-/// future card printed with the same phrasing.
-fn has_deck_limit_override(db: &CardDatabase, canonical_name: &str) -> bool {
-    db.get_face_by_name(canonical_name)
-        .and_then(|face| face.oracle_text.as_deref())
-        .is_some_and(|text| {
-            text.to_ascii_lowercase()
-                .contains("a deck can have any number of cards named")
-        })
+/// CR 100.2a / CR 903.5b: Resolve a card's deck-construction copy-limit override.
+/// Reads the precomputed `face.deck_copy_limit` field; falls back to a live
+/// Oracle-text parse for faces loaded without synthesis (test fixtures and
+/// `CardDatabase::from_json_str` / `from_export_entries`, which skip synthesis).
+/// Mirrors `is_commander_eligible`'s synthesized-field-with-live-fallback shape.
+pub fn deck_copy_limit_for(db: &CardDatabase, canonical_name: &str) -> Option<DeckCopyLimit> {
+    let face = db.get_face_by_name(canonical_name)?;
+    if let Some(limit) = face.deck_copy_limit {
+        return Some(limit);
+    }
+    compute_deck_copy_limit_from_text(face.oracle_text.as_deref()?)
 }
 
 /// Resolves a card name to the key used in the database. For DFC names like "Front // Back",
@@ -1855,6 +2520,7 @@ fn all_deck_cards(request: &DeckCompatibilityRequest) -> impl Iterator<Item = &s
         .iter()
         .chain(request.sideboard.iter())
         .chain(request.commander.iter())
+        .chain(request.signature_spell.iter())
         .map(String::as_str)
 }
 
@@ -1901,6 +2567,20 @@ fn is_pauper_commander_eligible(face: &CardFace) -> bool {
         });
     let has_uncommon_printing = face.rarities.contains(&Rarity::Uncommon);
     is_creature_or_vehicle && has_uncommon_printing
+}
+
+/// CR 702.124: Public entry point — can these two named cards form a legal
+/// co-commander pair? Resolves both faces in the database and applies the full
+/// partner-family rules. Returns false if either name is unknown.
+///
+/// This is the single authority for partner-pairing legality. Deck-builder UIs
+/// consume it through the WASM bridge rather than re-implementing the rules, so
+/// the engine and frontend can never disagree about a pairing.
+pub fn can_pair_commanders(db: &CardDatabase, name_a: &str, name_b: &str) -> bool {
+    match (db.get_face_by_name(name_a), db.get_face_by_name(name_b)) {
+        (Some(a), Some(b)) => are_valid_partners(a, b),
+        _ => false,
+    }
 }
 
 /// CR 702.124: Check if two cards form a valid partner pair for co-commanders.
@@ -1960,8 +2640,36 @@ fn partner_types_compatible(
     }
 }
 
-/// CR 702.124: Check if a partner type matches the other face by subtype.
-/// Doctor's Companion pairs with any Doctor; Choose a Background pairs with any Background.
+/// CR 702.124m: Doctor's companion pairs with a legendary Time Lord Doctor
+/// creature card that has no other creature types.
+fn is_time_lord_doctor_commander(face: &CardFace) -> bool {
+    if !face.card_type.supertypes.contains(&Supertype::Legendary)
+        || !face.card_type.core_types.contains(&CoreType::Creature)
+    {
+        return false;
+    }
+    if !is_commander_eligible(face) {
+        return false;
+    }
+    let subtypes = &face.card_type.subtypes;
+    // MTGJSON may emit the single two-word subtype or the split pair.
+    if subtypes
+        .iter()
+        .any(|s| s.eq_ignore_ascii_case("Time Lord Doctor"))
+    {
+        return subtypes.len() == 1;
+    }
+    subtypes.len() == 2
+        && subtypes.iter().any(|s| s.eq_ignore_ascii_case("Doctor"))
+        && subtypes.iter().any(|s| s.eq_ignore_ascii_case("Time Lord"))
+        && subtypes
+            .iter()
+            .all(|s| s.eq_ignore_ascii_case("Doctor") || s.eq_ignore_ascii_case("Time Lord"))
+}
+
+/// CR 702.124k + CR 702.124m: Check if a partner type matches the other face by subtype.
+/// Doctor's Companion pairs with a Time Lord Doctor commander; Choose a Background
+/// pairs with any Background.
 fn subtype_partner_match(
     partner_type: &crate::types::keywords::PartnerType,
     other_face: &CardFace,
@@ -1969,11 +2677,7 @@ fn subtype_partner_match(
     use crate::types::keywords::PartnerType;
 
     match partner_type {
-        PartnerType::DoctorsCompanion => other_face
-            .card_type
-            .subtypes
-            .iter()
-            .any(|s| s.eq_ignore_ascii_case("Doctor")),
+        PartnerType::DoctorsCompanion => is_time_lord_doctor_commander(other_face),
         PartnerType::ChooseABackground => other_face
             .card_type
             .subtypes
@@ -1986,6 +2690,9 @@ fn subtype_partner_match(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::types::keywords::PartnerType;
+    use serde_json::{Map, Value};
 
     fn test_db_json() -> String {
         serde_json::json!({
@@ -2283,6 +2990,109 @@ mod tests {
                     "standard": "legal",
                     "commander": "legal"
                 }
+            },
+            "mountain": {
+                "name": "Mountain",
+                "mana_cost": { "type": "NoCost" },
+                "card_type": { "supertypes": ["Basic"], "core_types": ["Land"], "subtypes": ["Mountain"] },
+                "power": null, "toughness": null, "loyalty": null, "defense": null,
+                "oracle_text": null, "non_ability_text": null, "flavor_name": null,
+                "keywords": [], "abilities": [], "triggers": [], "static_abilities": [], "replacements": [],
+                "color_override": null, "color_identity": ["Red"], "scryfall_oracle_id": null,
+                "legalities": { "standard": "legal", "commander": "legal" }
+            },
+            "relentless rats": {
+                "name": "Relentless Rats",
+                "mana_cost": { "type": "NoCost" },
+                "card_type": { "supertypes": [], "core_types": ["Creature"], "subtypes": ["Rat"] },
+                "power": "2", "toughness": "2", "loyalty": null, "defense": null,
+                "oracle_text": "This creature gets +1/+1 for each other creature on the battlefield named Relentless Rats.\nA deck can have any number of cards named Relentless Rats.",
+                "non_ability_text": null, "flavor_name": null,
+                "keywords": [], "abilities": [], "triggers": [], "static_abilities": [], "replacements": [],
+                "color_override": null, "color_identity": ["Black"], "scryfall_oracle_id": null,
+                "legalities": { "standard": "legal", "commander": "legal" }
+            },
+            "seven dwarves": {
+                "name": "Seven Dwarves",
+                "mana_cost": { "type": "NoCost" },
+                "card_type": { "supertypes": [], "core_types": ["Creature"], "subtypes": ["Dwarf"] },
+                "power": "3", "toughness": "3", "loyalty": null, "defense": null,
+                "oracle_text": "This creature gets +1/+1 for each other creature named Seven Dwarves you control.\nA deck can have up to seven cards named Seven Dwarves.",
+                "non_ability_text": null, "flavor_name": null,
+                "keywords": [], "abilities": [], "triggers": [], "static_abilities": [], "replacements": [],
+                "color_override": null, "color_identity": ["Red"], "scryfall_oracle_id": null,
+                "legalities": { "standard": "legal", "commander": "legal" }
+            },
+            "nazgûl": {
+                "name": "Nazgûl",
+                "mana_cost": { "type": "NoCost" },
+                "card_type": { "supertypes": [], "core_types": ["Creature"], "subtypes": ["Wraith"] },
+                "power": "3", "toughness": "3", "loyalty": null, "defense": null,
+                "oracle_text": "Deathtouch\nA deck can have up to nine cards named Nazgûl.",
+                "non_ability_text": null, "flavor_name": null,
+                "keywords": [], "abilities": [], "triggers": [], "static_abilities": [], "replacements": [],
+                "color_override": null, "color_identity": ["Black"], "scryfall_oracle_id": null,
+                "legalities": { "standard": "legal", "commander": "legal" }
+            },
+            "snow-covered plains": {
+                "name": "Snow-Covered Plains",
+                "mana_cost": { "type": "NoCost" },
+                "card_type": { "supertypes": ["Basic", "Snow"], "core_types": ["Land"], "subtypes": ["Plains"] },
+                "power": null, "toughness": null, "loyalty": null, "defense": null,
+                "oracle_text": null, "non_ability_text": null, "flavor_name": null,
+                "keywords": [], "abilities": [], "triggers": [], "static_abilities": [], "replacements": [],
+                "color_override": null, "scryfall_oracle_id": null,
+                "legalities": { "standard": "legal", "commander": "legal" }
+            },
+            "snow-covered island": {
+                "name": "Snow-Covered Island",
+                "mana_cost": { "type": "NoCost" },
+                "card_type": { "supertypes": ["Basic", "Snow"], "core_types": ["Land"], "subtypes": ["Island"] },
+                "power": null, "toughness": null, "loyalty": null, "defense": null,
+                "oracle_text": null, "non_ability_text": null, "flavor_name": null,
+                "keywords": [], "abilities": [], "triggers": [], "static_abilities": [], "replacements": [],
+                "color_override": null, "scryfall_oracle_id": null,
+                "legalities": { "standard": "legal", "commander": "legal" }
+            },
+            "snow-covered swamp": {
+                "name": "Snow-Covered Swamp",
+                "mana_cost": { "type": "NoCost" },
+                "card_type": { "supertypes": ["Basic", "Snow"], "core_types": ["Land"], "subtypes": ["Swamp"] },
+                "power": null, "toughness": null, "loyalty": null, "defense": null,
+                "oracle_text": null, "non_ability_text": null, "flavor_name": null,
+                "keywords": [], "abilities": [], "triggers": [], "static_abilities": [], "replacements": [],
+                "color_override": null, "scryfall_oracle_id": null,
+                "legalities": { "standard": "legal", "commander": "legal" }
+            },
+            "snow-covered mountain": {
+                "name": "Snow-Covered Mountain",
+                "mana_cost": { "type": "NoCost" },
+                "card_type": { "supertypes": ["Basic", "Snow"], "core_types": ["Land"], "subtypes": ["Mountain"] },
+                "power": null, "toughness": null, "loyalty": null, "defense": null,
+                "oracle_text": null, "non_ability_text": null, "flavor_name": null,
+                "keywords": [], "abilities": [], "triggers": [], "static_abilities": [], "replacements": [],
+                "color_override": null, "scryfall_oracle_id": null,
+                "legalities": { "standard": "legal", "commander": "legal" }
+            },
+            "snow-covered forest": {
+                "name": "Snow-Covered Forest",
+                "mana_cost": { "type": "NoCost" },
+                "card_type": { "supertypes": ["Basic", "Snow"], "core_types": ["Land"], "subtypes": ["Forest"] },
+                "power": null, "toughness": null, "loyalty": null, "defense": null,
+                "oracle_text": null, "non_ability_text": null, "flavor_name": null,
+                "keywords": [], "abilities": [], "triggers": [], "static_abilities": [], "replacements": [],
+                "color_override": null, "scryfall_oracle_id": null,
+                "legalities": { "standard": "legal", "commander": "legal" }
+            },
+            "snow-covered wastes": {
+                "name": "Snow-Covered Wastes",
+                "mana_cost": { "type": "NoCost" },
+                "card_type": { "supertypes": ["Basic", "Snow"], "core_types": ["Land"], "subtypes": ["Wastes"] },
+                "power": null, "toughness": null, "loyalty": null, "defense": null,
+                "oracle_text": null, "non_ability_text": null, "flavor_name": null,
+                "keywords": [], "abilities": [], "triggers": [], "static_abilities": [], "replacements": [],
+                "color_override": null, "scryfall_oracle_id": null,
+                "legalities": { "standard": "legal", "commander": "legal" }
             }
         })
         .to_string()
@@ -2298,6 +3108,329 @@ mod tests {
         let mut deck = expand(name, 4);
         deck.extend(expand("Plains", 56));
         deck
+    }
+
+    fn planechase_card_json(name: &str, supertypes: &[&str], core_types: &[&str]) -> Value {
+        serde_json::json!({
+            "name": name,
+            "mana_cost": { "type": "NoCost" },
+            "card_type": {
+                "supertypes": supertypes,
+                "core_types": core_types,
+                "subtypes": []
+            },
+            "power": null,
+            "toughness": null,
+            "loyalty": null,
+            "defense": null,
+            "oracle_text": null,
+            "non_ability_text": null,
+            "flavor_name": null,
+            "keywords": [],
+            "abilities": [],
+            "triggers": [],
+            "static_abilities": [],
+            "replacements": [],
+            "color_override": null,
+            "scryfall_oracle_id": null,
+            "legalities": {
+                "standard": "legal",
+                "commander": "legal"
+            }
+        })
+    }
+
+    fn insert_planechase_card(
+        cards: &mut Map<String, Value>,
+        name: &str,
+        supertypes: &[&str],
+        core_types: &[&str],
+    ) {
+        cards.insert(
+            name.to_lowercase(),
+            planechase_card_json(name, supertypes, core_types),
+        );
+    }
+
+    fn planechase_test_db() -> CardDatabase {
+        let mut cards = Map::new();
+        insert_planechase_card(&mut cards, "Legal Standard", &[], &[]);
+        insert_planechase_card(&mut cards, "Plains", &["Basic"], &["Land"]);
+        for index in 1..=40 {
+            insert_planechase_card(&mut cards, &format!("Plane {index}"), &[], &["Plane"]);
+        }
+        for index in 1..=5 {
+            insert_planechase_card(
+                &mut cards,
+                &format!("Phenomenon {index}"),
+                &[],
+                &["Phenomenon"],
+            );
+        }
+        CardDatabase::from_json_str(&Value::Object(cards).to_string()).unwrap()
+    }
+
+    fn plane_names(count: usize) -> Vec<String> {
+        (1..=count).map(|index| format!("Plane {index}")).collect()
+    }
+
+    fn phenomenon_names(count: usize) -> Vec<String> {
+        (1..=count)
+            .map(|index| format!("Phenomenon {index}"))
+            .collect()
+    }
+
+    fn planechase_request(
+        player_count: usize,
+        planar_deck: Vec<String>,
+    ) -> DeckCompatibilityRequest {
+        DeckCompatibilityRequest {
+            main_deck: legal_60_main("Legal Standard"),
+            sideboard: Vec::new(),
+            commander: Vec::new(),
+            planar_deck,
+            scheme_deck: Vec::new(),
+            signature_spell: Vec::new(),
+            selected_format: Some(GameFormat::Planechase),
+            selected_match_type: None,
+            player_count,
+            summary_only: false,
+        }
+    }
+
+    fn insert_scheme_card(cards: &mut Map<String, Value>, name: &str) {
+        cards.insert(
+            name.to_lowercase(),
+            planechase_card_json(name, &[], &["Scheme"]),
+        );
+    }
+
+    fn insert_unsupported_scheme_card(cards: &mut Map<String, Value>, name: &str) {
+        let mut card = planechase_card_json(name, &[], &["Scheme"]);
+        card["abilities"] = serde_json::to_value(vec![crate::types::AbilityDefinition::new(
+            crate::types::AbilityKind::Spell,
+            crate::types::Effect::unimplemented("scheme_test", "unsupported scheme test"),
+        )])
+        .unwrap();
+        cards.insert(name.to_lowercase(), card);
+    }
+
+    fn archenemy_test_db() -> CardDatabase {
+        let mut cards = Map::new();
+        insert_planechase_card(&mut cards, "Legal Standard", &[], &[]);
+        insert_planechase_card(&mut cards, "Plains", &["Basic"], &["Land"]);
+        for index in 1..=20 {
+            insert_scheme_card(&mut cards, &format!("Scheme {index}"));
+        }
+        insert_unsupported_scheme_card(&mut cards, "Unsupported Scheme");
+        CardDatabase::from_json_str(&Value::Object(cards).to_string()).unwrap()
+    }
+
+    fn scheme_names(count: usize) -> Vec<String> {
+        (1..=count).map(|index| format!("Scheme {index}")).collect()
+    }
+
+    fn archenemy_request(scheme_deck: Vec<String>) -> DeckCompatibilityRequest {
+        DeckCompatibilityRequest {
+            main_deck: legal_60_main("Legal Standard"),
+            sideboard: Vec::new(),
+            commander: Vec::new(),
+            planar_deck: Vec::new(),
+            scheme_deck,
+            signature_spell: Vec::new(),
+            selected_format: Some(GameFormat::Archenemy),
+            selected_match_type: None,
+            player_count: 4,
+            summary_only: false,
+        }
+    }
+
+    #[test]
+    fn archenemy_accepts_valid_twenty_card_scheme_deck() {
+        let db = archenemy_test_db();
+        let request = archenemy_request(scheme_names(20));
+        let check = evaluate_archenemy(&db, &request, &BTreeSet::new());
+
+        assert!(check.compatible, "reasons: {:?}", check.reasons);
+    }
+
+    #[test]
+    fn archenemy_rejects_short_scheme_deck() {
+        let db = archenemy_test_db();
+        let request = archenemy_request(scheme_names(19));
+        let check = evaluate_archenemy(&db, &request, &BTreeSet::new());
+
+        assert!(!check.compatible);
+        assert!(
+            check
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("minimum 20")),
+            "reasons: {:?}",
+            check.reasons
+        );
+    }
+
+    #[test]
+    fn archenemy_rejects_third_scheme_copy() {
+        let db = archenemy_test_db();
+        let mut scheme_deck = scheme_names(18);
+        scheme_deck.extend(["Scheme 1".to_string(), "Scheme 1".to_string()]);
+        let request = archenemy_request(scheme_deck);
+        let check = evaluate_archenemy(&db, &request, &BTreeSet::new());
+
+        assert!(!check.compatible);
+        assert!(
+            check
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("copy-limit")),
+            "reasons: {:?}",
+            check.reasons
+        );
+    }
+
+    #[test]
+    fn archenemy_rejects_non_scheme_in_scheme_deck() {
+        let db = archenemy_test_db();
+        let mut scheme_deck = scheme_names(19);
+        scheme_deck.push("Legal Standard".to_string());
+        let request = archenemy_request(scheme_deck);
+        let check = evaluate_archenemy(&db, &request, &BTreeSet::new());
+
+        assert!(!check.compatible);
+        assert!(
+            check
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("must be Scheme")),
+            "reasons: {:?}",
+            check.reasons
+        );
+    }
+
+    #[test]
+    fn archenemy_rejects_unsupported_scheme() {
+        let db = archenemy_test_db();
+        let mut scheme_deck = scheme_names(19);
+        scheme_deck.push("Unsupported Scheme".to_string());
+        let request = archenemy_request(scheme_deck);
+        let check = evaluate_archenemy(&db, &request, &BTreeSet::new());
+
+        assert!(!check.compatible);
+        assert!(
+            check
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("Unsupported scheme cards")),
+            "reasons: {:?}",
+            check.reasons
+        );
+    }
+
+    #[test]
+    fn planechase_planar_minimum_scales_with_actual_player_count() {
+        let db = planechase_test_db();
+
+        for (player_count, minimum) in [(2, 20), (3, 30), (4, 40)] {
+            let short = planechase_request(player_count, plane_names(minimum - 1));
+            let check = evaluate_planechase(&db, &short, &BTreeSet::new());
+            assert!(
+                !check.compatible,
+                "{player_count}-player Planechase must reject a {minimum_minus_one}-card planar deck",
+                minimum_minus_one = minimum - 1
+            );
+            assert!(
+                check
+                    .reasons
+                    .iter()
+                    .any(|reason| reason.contains(&format!("minimum {minimum}"))),
+                "reasons: {:?}",
+                check.reasons
+            );
+
+            let exact = planechase_request(player_count, plane_names(minimum));
+            let check = evaluate_planechase(&db, &exact, &BTreeSet::new());
+            assert!(
+                check.compatible,
+                "{player_count}-player Planechase must accept exactly {minimum} planar cards, reasons: {:?}",
+                check.reasons
+            );
+        }
+    }
+
+    #[test]
+    fn planechase_phenomenon_cap_is_player_count_scaled() {
+        let db = planechase_test_db();
+        let mut planar_deck = plane_names(15);
+        planar_deck.extend(phenomenon_names(5));
+
+        let check = evaluate_planechase(&db, &planechase_request(2, planar_deck), &BTreeSet::new());
+
+        assert!(!check.compatible, "five phenomena exceeds the 2-player cap");
+        assert!(
+            check
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("5 phenomena (maximum 4)")),
+            "reasons: {:?}",
+            check.reasons
+        );
+    }
+
+    #[test]
+    fn planechase_planar_deck_is_singleton_by_english_name() {
+        let db = planechase_test_db();
+        let mut planar_deck = plane_names(19);
+        planar_deck.push("Plane 1".to_string());
+
+        let check = evaluate_planechase(&db, &planechase_request(2, planar_deck), &BTreeSet::new());
+
+        assert!(
+            !check.compatible,
+            "duplicate English names must be rejected"
+        );
+        assert!(
+            check.reasons.iter().any(|reason| {
+                reason.contains("Planar deck singleton violations") && reason.contains("Plane 1")
+            }),
+            "reasons: {:?}",
+            check.reasons
+        );
+    }
+
+    #[test]
+    fn planechase_planar_deck_rejects_non_planar_cards() {
+        let db = planechase_test_db();
+        let mut planar_deck = plane_names(19);
+        planar_deck.push("Legal Standard".to_string());
+
+        let check = evaluate_planechase(&db, &planechase_request(2, planar_deck), &BTreeSet::new());
+
+        assert!(
+            !check.compatible,
+            "main-deck cards cannot appear in the planar deck"
+        );
+        assert!(
+            check.reasons.iter().any(|reason| {
+                reason.contains("Planar deck cards must be Plane or Phenomenon")
+                    && reason.contains("Legal Standard")
+            }),
+            "reasons: {:?}",
+            check.reasons
+        );
+    }
+
+    #[test]
+    fn planechase_empty_custom_planar_deck_is_allowed() {
+        let db = planechase_test_db();
+        let check = evaluate_planechase(&db, &planechase_request(2, Vec::new()), &BTreeSet::new());
+
+        assert!(
+            check.compatible,
+            "empty custom planar deck should pass validation so loading can use the default deck, reasons: {:?}",
+            check.reasons
+        );
     }
 
     fn tiny_leaders_test_db_json() -> String {
@@ -2415,8 +3548,12 @@ mod tests {
             main_deck: legal_60_main("Legal Standard"),
             sideboard: Vec::new(),
             commander: Vec::new(),
+            planar_deck: Vec::new(),
+            scheme_deck: Vec::new(),
+            signature_spell: Vec::new(),
             selected_format: None,
             selected_match_type: None,
+            player_count: default_player_count(),
             summary_only: false,
         };
 
@@ -2437,8 +3574,12 @@ mod tests {
             main_deck: deck,
             sideboard: Vec::new(),
             commander: vec!["Legal Standard".to_string()],
+            planar_deck: Vec::new(),
+            scheme_deck: Vec::new(),
+            signature_spell: Vec::new(),
             selected_format: None,
             selected_match_type: None,
+            player_count: default_player_count(),
             summary_only: false,
         };
 
@@ -2456,6 +3597,123 @@ mod tests {
             .any(|r| r.contains("Not Standard")));
     }
 
+    // CR 100.2a / CR 903.5b: per-card copy-limit overrides drive
+    // `copy_limit_violations`. Faces loaded via `from_json_str` skip synthesis,
+    // so the limit is resolved through the live Oracle-text fallback in
+    // `deck_copy_limit_for`. Helpers below build the canonical count map the way
+    // the production callers do.
+    fn counts_of(pairs: &[(&str, u32)]) -> HashMap<String, u32> {
+        pairs
+            .iter()
+            .map(|(name, n)| (name.to_ascii_lowercase(), *n))
+            .collect()
+    }
+
+    #[test]
+    fn copy_limit_respects_typed_overrides_constructed() {
+        let db = CardDatabase::from_json_str(&test_db_json()).unwrap();
+
+        // Seven Dwarves: UpTo(7) — 7 legal, 8 illegal.
+        assert!(copy_limit_violations(&db, &counts_of(&[("Seven Dwarves", 7)]), 4).is_empty());
+        assert!(!copy_limit_violations(&db, &counts_of(&[("Seven Dwarves", 8)]), 4).is_empty());
+
+        // Nazgûl: UpTo(9) — 8 legal, 10 illegal.
+        assert!(copy_limit_violations(&db, &counts_of(&[("Nazgûl", 8)]), 4).is_empty());
+        assert!(!copy_limit_violations(&db, &counts_of(&[("Nazgûl", 10)]), 4).is_empty());
+
+        // Relentless Rats: Unlimited — 5 legal.
+        assert!(copy_limit_violations(&db, &counts_of(&[("Relentless Rats", 5)]), 4).is_empty());
+
+        // Mountain: basic-land exemption — 30 legal.
+        assert!(copy_limit_violations(&db, &counts_of(&[("Mountain", 30)]), 4).is_empty());
+
+        // A normal card with no override is still flagged at 5.
+        let violations = copy_limit_violations(&db, &counts_of(&[("Red Card", 5)]), 4);
+        assert!(violations.iter().any(|v| v.contains("Red Card")));
+    }
+
+    #[test]
+    fn copy_limit_override_fires_before_commander_singleton() {
+        // CR 903.5b: in a singleton (Commander) context max_copies = 1, but
+        // Nazgûl's UpTo(9) override must raise the cap so 9 copies are legal.
+        let db = CardDatabase::from_json_str(&test_db_json()).unwrap();
+        assert!(copy_limit_violations(&db, &counts_of(&[("Nazgûl", 9)]), 1).is_empty());
+        // A normal card is still singleton-restricted to 1.
+        assert!(!copy_limit_violations(&db, &counts_of(&[("Red Card", 2)]), 1).is_empty());
+    }
+
+    #[test]
+    fn combined_copy_counts_merge_nazgul_spelling_variants() {
+        let db = CardDatabase::from_json_str(&test_db_json()).unwrap();
+        let mut main = expand("Nazgul", 5);
+        main.extend(expand("Nazgûl", 5));
+        main.extend(expand("Plains", 80));
+        let request = DeckCompatibilityRequest {
+            main_deck: main,
+            sideboard: Vec::new(),
+            commander: vec!["Legal Commander".to_string()],
+            planar_deck: Vec::new(),
+            scheme_deck: Vec::new(),
+            signature_spell: Vec::new(),
+            selected_format: None,
+            selected_match_type: None,
+            player_count: default_player_count(),
+            summary_only: false,
+        };
+
+        let counts = combined_copy_counts(&db, &request);
+        assert_eq!(counts.get("nazgûl"), Some(&10));
+        assert!(!copy_limit_violations(&db, &counts, 1).is_empty());
+    }
+
+    #[test]
+    fn commander_accepts_nine_nazgul_copies() {
+        let db = CardDatabase::from_json_str(&test_db_json()).unwrap();
+        let mut main = expand("Nazgul", 9);
+        main.extend(expand("Mountain", 90));
+        let request = DeckCompatibilityRequest {
+            main_deck: main,
+            sideboard: Vec::new(),
+            commander: vec!["Grub Commander".to_string()],
+            planar_deck: Vec::new(),
+            scheme_deck: Vec::new(),
+            signature_spell: Vec::new(),
+            selected_format: None,
+            selected_match_type: None,
+            player_count: default_player_count(),
+            summary_only: false,
+        };
+
+        let result = evaluate_deck_compatibility(&db, &request);
+        assert!(
+            result.commander.compatible,
+            "expected compatible commander deck, got: {:?}",
+            result.commander.reasons
+        );
+    }
+
+    #[test]
+    fn summary_commander_accepts_nine_nazgul_copies() {
+        let db = CardDatabase::from_json_str(&test_db_json()).unwrap();
+        let mut main = expand("Nazgul", 9);
+        main.extend(expand("Mountain", 90));
+        let request = DeckCompatibilityRequest {
+            main_deck: main,
+            sideboard: Vec::new(),
+            commander: vec!["Grub Commander".to_string()],
+            planar_deck: Vec::new(),
+            scheme_deck: Vec::new(),
+            signature_spell: Vec::new(),
+            selected_format: Some(GameFormat::Commander),
+            selected_match_type: None,
+            player_count: default_player_count(),
+            summary_only: true,
+        };
+
+        let result = evaluate_deck_compatibility(&db, &request);
+        assert_eq!(result.selected_format_compatible, Some(true));
+    }
+
     #[test]
     fn commander_rules_detect_size_singleton_and_legality_failures() {
         let db = CardDatabase::from_json_str(&test_db_json()).unwrap();
@@ -2470,8 +3728,12 @@ mod tests {
             // to the singleton count below.
             sideboard: vec!["Legal Standard".to_string()],
             commander: vec!["Legal Standard".to_string()],
+            planar_deck: Vec::new(),
+            scheme_deck: Vec::new(),
+            signature_spell: Vec::new(),
             selected_format: None,
             selected_match_type: None,
+            player_count: default_player_count(),
             summary_only: false,
         };
 
@@ -2496,8 +3758,12 @@ mod tests {
             main_deck: expand("Legal Standard", 60),
             sideboard: Vec::new(),
             commander: Vec::new(),
+            planar_deck: Vec::new(),
+            scheme_deck: Vec::new(),
+            signature_spell: Vec::new(),
             selected_format: Some(GameFormat::Standard),
             selected_match_type: Some(MatchType::Bo3),
+            player_count: default_player_count(),
             summary_only: false,
         };
         let with_sideboard = DeckCompatibilityRequest {
@@ -2524,8 +3790,12 @@ mod tests {
             main_deck: vec!["Mystery Card".to_string()],
             sideboard: Vec::new(),
             commander: Vec::new(),
+            planar_deck: Vec::new(),
+            scheme_deck: Vec::new(),
+            signature_spell: Vec::new(),
             selected_format: None,
             selected_match_type: None,
+            player_count: default_player_count(),
             summary_only: false,
         };
 
@@ -2547,8 +3817,12 @@ mod tests {
             main_deck: expand("Legal Standard", 99),
             sideboard: Vec::new(),
             commander: vec!["Legal Standard".to_string()],
+            planar_deck: Vec::new(),
+            scheme_deck: Vec::new(),
+            signature_spell: Vec::new(),
             selected_format: None,
             selected_match_type: None,
+            player_count: default_player_count(),
             summary_only: false,
         };
 
@@ -2616,8 +3890,12 @@ mod tests {
             main_deck: expand("Plains", 99),
             sideboard: Vec::new(),
             commander: vec!["PDH Commander".to_string()],
+            planar_deck: Vec::new(),
+            scheme_deck: Vec::new(),
+            signature_spell: Vec::new(),
             selected_format: Some(GameFormat::PauperCommander),
             selected_match_type: None,
+            player_count: default_player_count(),
             summary_only: false,
         };
 
@@ -2686,8 +3964,12 @@ mod tests {
             main_deck: expand("Plains", 99),
             sideboard: Vec::new(),
             commander: vec!["Rare Creature".to_string()],
+            planar_deck: Vec::new(),
+            scheme_deck: Vec::new(),
+            signature_spell: Vec::new(),
             selected_format: Some(GameFormat::PauperCommander),
             selected_match_type: None,
+            player_count: default_player_count(),
             summary_only: false,
         };
 
@@ -2755,8 +4037,12 @@ mod tests {
             main_deck: expand("Plains", 99),
             sideboard: Vec::new(),
             commander: vec!["Uncommon Sorcery".to_string()],
+            planar_deck: Vec::new(),
+            scheme_deck: Vec::new(),
+            signature_spell: Vec::new(),
             selected_format: Some(GameFormat::PauperCommander),
             selected_match_type: None,
+            player_count: default_player_count(),
             summary_only: false,
         };
 
@@ -2779,8 +4065,12 @@ mod tests {
                 "Partner Commander".to_string(),
                 "Legal Commander".to_string(),
             ],
+            planar_deck: Vec::new(),
+            scheme_deck: Vec::new(),
+            signature_spell: Vec::new(),
             selected_format: None,
             selected_match_type: None,
+            player_count: default_player_count(),
             summary_only: false,
         };
 
@@ -2800,11 +4090,16 @@ mod tests {
             main_deck: Vec::new(),
             sideboard: Vec::new(),
             commander: Vec::new(),
+            planar_deck: Vec::new(),
+            scheme_deck: Vec::new(),
+            signature_spell: Vec::new(),
             selected_format: Some(GameFormat::FreeForAll),
             selected_match_type: None,
+            player_count: default_player_count(),
             summary_only: false,
         };
         let thg_request = DeckCompatibilityRequest {
+            signature_spell: Vec::new(),
             selected_format: Some(GameFormat::TwoHeadedGiant),
             ..request.clone()
         };
@@ -2826,16 +4121,24 @@ mod tests {
             main_deck: legal_60_main("Legal Standard"),
             sideboard: Vec::new(),
             commander: Vec::new(),
+            planar_deck: Vec::new(),
+            scheme_deck: Vec::new(),
+            signature_spell: Vec::new(),
             selected_format: Some(GameFormat::Standard),
             selected_match_type: Some(MatchType::Bo1),
+            player_count: default_player_count(),
             summary_only: false,
         };
         let commander_request = DeckCompatibilityRequest {
             main_deck: expand("Legal Standard", 99),
             sideboard: Vec::new(),
             commander: vec!["Legal Standard".to_string()],
+            planar_deck: Vec::new(),
+            scheme_deck: Vec::new(),
+            signature_spell: Vec::new(),
             selected_format: Some(GameFormat::Commander),
             selected_match_type: Some(MatchType::Bo1),
+            player_count: default_player_count(),
             summary_only: false,
         };
 
@@ -2867,8 +4170,12 @@ mod tests {
             main_deck: legal_60_main("Pioneer Only"),
             sideboard: Vec::new(),
             commander: Vec::new(),
+            planar_deck: Vec::new(),
+            scheme_deck: Vec::new(),
+            signature_spell: Vec::new(),
             selected_format: Some(GameFormat::Pioneer),
             selected_match_type: None,
+            player_count: default_player_count(),
             summary_only: false,
         };
         let result = evaluate_deck_compatibility(&db, &legal_request);
@@ -2882,8 +4189,12 @@ mod tests {
             main_deck: legal_60_main("Legal Standard"),
             sideboard: Vec::new(),
             commander: Vec::new(),
+            planar_deck: Vec::new(),
+            scheme_deck: Vec::new(),
+            signature_spell: Vec::new(),
             selected_format: Some(GameFormat::Premodern),
             selected_match_type: None,
+            player_count: default_player_count(),
             summary_only: false,
         };
 
@@ -2899,8 +4210,12 @@ mod tests {
             main_deck: legal_60_main("Premodern Banned"),
             sideboard: Vec::new(),
             commander: Vec::new(),
+            planar_deck: Vec::new(),
+            scheme_deck: Vec::new(),
+            signature_spell: Vec::new(),
             selected_format: Some(GameFormat::Premodern),
             selected_match_type: None,
+            player_count: default_player_count(),
             summary_only: false,
         };
 
@@ -2920,8 +4235,12 @@ mod tests {
             main_deck: legal_60_main("Pioneer Only"),
             sideboard: Vec::new(),
             commander: Vec::new(),
+            planar_deck: Vec::new(),
+            scheme_deck: Vec::new(),
+            signature_spell: Vec::new(),
             selected_format: Some(GameFormat::Premodern),
             selected_match_type: None,
+            player_count: default_player_count(),
             summary_only: false,
         };
 
@@ -2942,8 +4261,12 @@ mod tests {
             main_deck: legal_60_main("Legal Standard"),
             sideboard: Vec::new(),
             commander: vec!["Legal Standard".to_string()],
+            planar_deck: Vec::new(),
+            scheme_deck: Vec::new(),
+            signature_spell: Vec::new(),
             selected_format: Some(GameFormat::Premodern),
             selected_match_type: None,
+            player_count: default_player_count(),
             summary_only: false,
         };
         let result = evaluate_deck_compatibility(&db, &commander_request);
@@ -2957,8 +4280,12 @@ mod tests {
             main_deck: legal_60_main("Legal Standard"),
             sideboard: expand("Plains", 16),
             commander: Vec::new(),
+            planar_deck: Vec::new(),
+            scheme_deck: Vec::new(),
+            signature_spell: Vec::new(),
             selected_format: Some(GameFormat::Premodern),
             selected_match_type: None,
+            player_count: default_player_count(),
             summary_only: false,
         };
         let result = evaluate_deck_compatibility(&db, &oversize_sideboard);
@@ -2974,8 +4301,12 @@ mod tests {
             main_deck: main,
             sideboard: Vec::new(),
             commander: Vec::new(),
+            planar_deck: Vec::new(),
+            scheme_deck: Vec::new(),
+            signature_spell: Vec::new(),
             selected_format: Some(GameFormat::Premodern),
             selected_match_type: None,
+            player_count: default_player_count(),
             summary_only: false,
         };
         let result = evaluate_deck_compatibility(&db, &copy_limit);
@@ -3005,8 +4336,12 @@ mod tests {
             main_deck: expand("Pioneer Only", 60),
             sideboard: Vec::new(),
             commander: Vec::new(),
+            planar_deck: Vec::new(),
+            scheme_deck: Vec::new(),
+            signature_spell: Vec::new(),
             selected_format: Some(GameFormat::Pauper),
             selected_match_type: None,
+            player_count: default_player_count(),
             summary_only: false,
         };
         let result = evaluate_deck_compatibility(&db, &illegal_request);
@@ -3026,8 +4361,12 @@ mod tests {
             main_deck: expand("Legal Standard", 30),
             sideboard: Vec::new(),
             commander: vec!["Legal Standard".to_string()],
+            planar_deck: Vec::new(),
+            scheme_deck: Vec::new(),
+            signature_spell: Vec::new(),
             selected_format: None,
             selected_match_type: None,
+            player_count: default_player_count(),
             summary_only: false,
         };
         let check = evaluate_constructed(
@@ -3053,8 +4392,12 @@ mod tests {
             main_deck: expand("Plains", 59),
             sideboard: Vec::new(),
             commander: vec!["Legal Commander".to_string()],
+            planar_deck: Vec::new(),
+            scheme_deck: Vec::new(),
+            signature_spell: Vec::new(),
             selected_format: Some(GameFormat::Brawl),
             selected_match_type: None,
+            player_count: default_player_count(),
             summary_only: false,
         };
         let result = evaluate_deck_compatibility(&db, &request);
@@ -3068,8 +4411,12 @@ mod tests {
             main_deck: expand("Plains", 59),
             sideboard: Vec::new(),
             commander: vec!["Legendary Planeswalker".to_string()],
+            planar_deck: Vec::new(),
+            scheme_deck: Vec::new(),
+            signature_spell: Vec::new(),
             selected_format: Some(GameFormat::Brawl),
             selected_match_type: None,
+            player_count: default_player_count(),
             summary_only: false,
         };
         let result = evaluate_deck_compatibility(&db, &request);
@@ -3083,8 +4430,12 @@ mod tests {
             main_deck: expand("Plains", 59),
             sideboard: Vec::new(),
             commander: vec!["Legal Standard".to_string()],
+            planar_deck: Vec::new(),
+            scheme_deck: Vec::new(),
+            signature_spell: Vec::new(),
             selected_format: Some(GameFormat::Brawl),
             selected_match_type: None,
+            player_count: default_player_count(),
             summary_only: false,
         };
         let result = evaluate_deck_compatibility(&db, &request);
@@ -3105,8 +4456,12 @@ mod tests {
                 "Legal Commander".to_string(),
                 "Partner Commander".to_string(),
             ],
+            planar_deck: Vec::new(),
+            scheme_deck: Vec::new(),
+            signature_spell: Vec::new(),
             selected_format: Some(GameFormat::Brawl),
             selected_match_type: None,
+            player_count: default_player_count(),
             summary_only: false,
         };
         let result = evaluate_deck_compatibility(&db, &request);
@@ -3124,8 +4479,12 @@ mod tests {
             main_deck: expand("Plains", 99),
             sideboard: Vec::new(),
             commander: vec!["Legal Commander".to_string()],
+            planar_deck: Vec::new(),
+            scheme_deck: Vec::new(),
+            signature_spell: Vec::new(),
             selected_format: Some(GameFormat::Brawl),
             selected_match_type: None,
+            player_count: default_player_count(),
             summary_only: false,
         };
         let result = evaluate_deck_compatibility(&db, &request);
@@ -3143,8 +4502,12 @@ mod tests {
             main_deck: expand("Plains", 49),
             sideboard: expand("Plains", 10),
             commander: vec!["White Tiny Leader".to_string()],
+            planar_deck: Vec::new(),
+            scheme_deck: Vec::new(),
+            signature_spell: Vec::new(),
             selected_format: Some(GameFormat::TinyLeaders),
             selected_match_type: None,
+            player_count: default_player_count(),
             summary_only: false,
         };
 
@@ -3178,8 +4541,12 @@ mod tests {
             main_deck: main,
             sideboard: Vec::new(),
             commander: vec!["White Tiny Leader".to_string()],
+            planar_deck: Vec::new(),
+            scheme_deck: Vec::new(),
+            signature_spell: Vec::new(),
             selected_format: Some(GameFormat::TinyLeaders),
             selected_match_type: None,
+            player_count: default_player_count(),
             summary_only: false,
         };
 
@@ -3203,8 +4570,12 @@ mod tests {
             main_deck: expand("Plains", 49),
             sideboard: Vec::new(),
             commander: vec!["Ajani, Nacatl Pariah".to_string()],
+            planar_deck: Vec::new(),
+            scheme_deck: Vec::new(),
+            signature_spell: Vec::new(),
             selected_format: Some(GameFormat::TinyLeaders),
             selected_match_type: None,
+            player_count: default_player_count(),
             summary_only: false,
         };
 
@@ -3228,8 +4599,12 @@ mod tests {
             main_deck: main,
             sideboard: Vec::new(),
             commander: vec!["Legal Commander".to_string()],
+            planar_deck: Vec::new(),
+            scheme_deck: Vec::new(),
+            signature_spell: Vec::new(),
             selected_format: Some(GameFormat::HistoricBrawl),
             selected_match_type: None,
+            player_count: default_player_count(),
             summary_only: false,
         };
         let result = evaluate_deck_compatibility(&db, &request);
@@ -3237,6 +4612,7 @@ mod tests {
 
         // Same deck should fail Standard Brawl
         let brawl_request = DeckCompatibilityRequest {
+            signature_spell: Vec::new(),
             selected_format: Some(GameFormat::Brawl),
             ..request
         };
@@ -3528,7 +4904,7 @@ mod tests {
             vec![],
         );
         // Can pair with a Doctor
-        let doctor = partner_face("The Thirteenth Doctor", vec![], vec!["Doctor"]);
+        let doctor = partner_face("The Thirteenth Doctor", vec![], vec!["Time Lord", "Doctor"]);
         assert!(are_valid_partners(&amy, &doctor));
 
         // Can pair with Rory Williams
@@ -3548,6 +4924,67 @@ mod tests {
         assert!(!are_valid_partners(&amy, &random));
     }
 
+    // CR 702.124: the public `can_pair_commanders` seam (consumed by the WASM
+    // deck-builder bridge) must resolve both names through the database and apply
+    // the asymmetric Doctor's Companion rule in either selection order.
+    #[test]
+    fn can_pair_commanders_resolves_doctor_pairing_through_db() {
+        fn card_json(
+            name: &str,
+            subtypes: &[&str],
+            keywords: serde_json::Value,
+        ) -> serde_json::Value {
+            serde_json::json!({
+                "name": name,
+                "mana_cost": { "type": "NoCost" },
+                "card_type": { "supertypes": ["Legendary"], "core_types": ["Creature"], "subtypes": subtypes },
+                "power": "2", "toughness": "2",
+                "loyalty": null, "defense": null,
+                "oracle_text": null, "non_ability_text": null, "flavor_name": null,
+                "keywords": keywords,
+                "abilities": [], "triggers": [], "static_abilities": [], "replacements": [],
+                "color_override": null, "scryfall_oracle_id": null, "legalities": {}
+            })
+        }
+        let db_json = serde_json::json!({
+            "amy pond": card_json("Amy Pond", &["Human"], serde_json::json!([{ "Partner": { "type": "DoctorsCompanion" } }])),
+            "the eleventh doctor": card_json("The Eleventh Doctor", &["Time Lord", "Doctor"], serde_json::json!([])),
+        })
+        .to_string();
+        let db = CardDatabase::from_json_str(&db_json).unwrap();
+
+        assert!(can_pair_commanders(&db, "Amy Pond", "The Eleventh Doctor"));
+        assert!(can_pair_commanders(&db, "The Eleventh Doctor", "Amy Pond"));
+        // Unknown names resolve to no pairing rather than panicking.
+        assert!(!can_pair_commanders(&db, "Amy Pond", "Nonexistent Card"));
+    }
+
+    #[test]
+    fn doctors_companion_rejects_non_doctor_subtypes() {
+        let companion = partner_face(
+            "Amy Pond",
+            vec![Keyword::Partner(PartnerType::DoctorsCompanion)],
+            vec![],
+        );
+        let human_doctor = partner_face("Not A Real Doctor", vec![], vec!["Human", "Doctor"]);
+        assert!(!are_valid_partners(&companion, &human_doctor));
+
+        let non_creature_doctor = CardFace {
+            name: "Noncreature Doctor".to_string(),
+            is_commander: true,
+            card_type: crate::types::card_type::CardType {
+                supertypes: vec![Supertype::Legendary],
+                core_types: vec![CoreType::Artifact],
+                subtypes: vec!["Time Lord".to_string(), "Doctor".to_string()],
+            },
+            ..CardFace::default()
+        };
+        assert!(!are_valid_partners(&companion, &non_creature_doctor));
+
+        let unified = partner_face("The Eleventh Doctor", vec![], vec!["Time Lord Doctor"]);
+        assert!(are_valid_partners(&companion, &unified));
+    }
+
     #[test]
     fn no_partner_keywords_rejected() {
         let a = partner_face("A", vec![], vec![]);
@@ -3564,8 +5001,12 @@ mod tests {
             main_deck: vec!["Not Standard".to_string(); 60],
             sideboard: vec![],
             commander: vec![],
+            planar_deck: Vec::new(),
+            scheme_deck: Vec::new(),
+            signature_spell: Vec::new(),
             selected_format: Some(GameFormat::Standard),
             selected_match_type: None,
+            player_count: default_player_count(),
             summary_only: false,
         };
         let result = validate_deck_for_format(&db, &request);
@@ -3592,8 +5033,12 @@ mod tests {
             main_deck: legal_60_main("Legal Standard"),
             sideboard: vec![],
             commander: vec![],
+            planar_deck: Vec::new(),
+            scheme_deck: Vec::new(),
+            signature_spell: Vec::new(),
             selected_format: Some(GameFormat::Standard),
             selected_match_type: None,
+            player_count: default_player_count(),
             summary_only: false,
         };
         assert!(validate_deck_for_format(&db, &request).is_ok());
@@ -3606,11 +5051,48 @@ mod tests {
             main_deck: vec!["Not Standard".to_string(); 60],
             sideboard: vec![],
             commander: vec![],
+            planar_deck: Vec::new(),
+            scheme_deck: Vec::new(),
+            signature_spell: Vec::new(),
             selected_format: Some(GameFormat::FreeForAll),
             selected_match_type: None,
+            player_count: default_player_count(),
             summary_only: false,
         };
         assert!(validate_deck_for_format(&db, &request).is_ok());
+    }
+
+    #[test]
+    fn oathbreaker_missing_commander_does_not_spam_color_identity_errors() {
+        let db = CardDatabase::from_json_str(&test_db_json()).unwrap();
+        let request = DeckCompatibilityRequest {
+            main_deck: expand("Red Card", 58),
+            sideboard: Vec::new(),
+            commander: Vec::new(),
+            planar_deck: Vec::new(),
+            scheme_deck: Vec::new(),
+            signature_spell: vec!["Big Spell".to_string()],
+            selected_format: Some(GameFormat::Oathbreaker),
+            selected_match_type: None,
+            player_count: default_player_count(),
+            summary_only: false,
+        };
+
+        let result = evaluate_deck_compatibility(&db, &request);
+
+        assert_eq!(result.selected_format_compatible, Some(false));
+        assert!(result
+            .selected_format_reasons
+            .iter()
+            .any(|r| r.contains("exactly 1 Oathbreaker")));
+        assert!(!result
+            .selected_format_reasons
+            .iter()
+            .any(|r| r.contains("outside Oathbreaker color identity")));
+        assert!(!result
+            .selected_format_reasons
+            .iter()
+            .any(|r| r.contains("signature spell is outside")));
     }
 
     #[test]
@@ -3620,8 +5102,12 @@ mod tests {
             main_deck: vec!["Not Standard".to_string(); 60],
             sideboard: vec![],
             commander: vec![],
+            planar_deck: Vec::new(),
+            scheme_deck: Vec::new(),
+            signature_spell: Vec::new(),
             selected_format: None,
             selected_match_type: None,
+            player_count: default_player_count(),
             summary_only: false,
         };
         assert!(validate_deck_for_format(&db, &request).is_ok());
@@ -3636,8 +5122,12 @@ mod tests {
             main_deck: legal_60_main("Legal Standard"),
             sideboard: expand("Plains", 15),
             commander: Vec::new(),
+            planar_deck: Vec::new(),
+            scheme_deck: Vec::new(),
+            signature_spell: Vec::new(),
             selected_format: Some(GameFormat::Standard),
             selected_match_type: None,
+            player_count: default_player_count(),
             summary_only: false,
         };
         let result = evaluate_deck_compatibility(&db, &request);
@@ -3656,8 +5146,12 @@ mod tests {
             main_deck: expand("Legal Standard", 60),
             sideboard: expand("Plains", 16),
             commander: Vec::new(),
+            planar_deck: Vec::new(),
+            scheme_deck: Vec::new(),
+            signature_spell: Vec::new(),
             selected_format: Some(GameFormat::Standard),
             selected_match_type: None,
+            player_count: default_player_count(),
             summary_only: false,
         };
         let result = evaluate_deck_compatibility(&db, &request);
@@ -3678,8 +5172,12 @@ mod tests {
             main_deck: main,
             sideboard: expand("Legal Standard", 2),
             commander: Vec::new(),
+            planar_deck: Vec::new(),
+            scheme_deck: Vec::new(),
+            signature_spell: Vec::new(),
             selected_format: Some(GameFormat::Standard),
             selected_match_type: None,
+            player_count: default_player_count(),
             summary_only: false,
         };
         let result = evaluate_deck_compatibility(&db, &request);
@@ -3698,8 +5196,12 @@ mod tests {
             main_deck: expand("Plains", 60),
             sideboard: expand("Plains", 15),
             commander: Vec::new(),
+            planar_deck: Vec::new(),
+            scheme_deck: Vec::new(),
+            signature_spell: Vec::new(),
             selected_format: Some(GameFormat::Standard),
             selected_match_type: None,
+            player_count: default_player_count(),
             summary_only: false,
         };
         let result = evaluate_deck_compatibility(&db, &request);
@@ -3718,8 +5220,12 @@ mod tests {
             main_deck: main,
             sideboard: Vec::new(),
             commander: Vec::new(),
+            planar_deck: Vec::new(),
+            scheme_deck: Vec::new(),
+            signature_spell: Vec::new(),
             selected_format: Some(GameFormat::Standard),
             selected_match_type: None,
+            player_count: default_player_count(),
             summary_only: false,
         };
         let result = evaluate_deck_compatibility(&db, &request);
@@ -3766,8 +5272,12 @@ mod tests {
             main_deck: expand("Relentless Rats", 60),
             sideboard: expand("Relentless Rats", 15),
             commander: Vec::new(),
+            planar_deck: Vec::new(),
+            scheme_deck: Vec::new(),
+            signature_spell: Vec::new(),
             selected_format: Some(GameFormat::Standard),
             selected_match_type: None,
+            player_count: default_player_count(),
             summary_only: false,
         };
         let result = evaluate_deck_compatibility(&db, &request);
@@ -3787,8 +5297,12 @@ mod tests {
             main_deck: main,
             sideboard: Vec::new(),
             commander: vec!["Legal Commander".to_string()],
+            planar_deck: Vec::new(),
+            scheme_deck: Vec::new(),
+            signature_spell: Vec::new(),
             selected_format: Some(GameFormat::Commander),
             selected_match_type: None,
+            player_count: default_player_count(),
             summary_only: false,
         };
         let result = evaluate_deck_compatibility(&db, &request);
@@ -3809,8 +5323,12 @@ mod tests {
             main_deck: main,
             sideboard: Vec::new(),
             commander: vec!["Grub Commander".to_string()],
+            planar_deck: Vec::new(),
+            scheme_deck: Vec::new(),
+            signature_spell: Vec::new(),
             selected_format: Some(GameFormat::Commander),
             selected_match_type: None,
+            player_count: default_player_count(),
             summary_only: false,
         };
 
@@ -3868,8 +5386,74 @@ mod tests {
             main_deck: main,
             sideboard: Vec::new(),
             commander: vec!["Legal Commander".to_string()],
+            planar_deck: Vec::new(),
+            scheme_deck: Vec::new(),
+            signature_spell: Vec::new(),
             selected_format: Some(GameFormat::Commander),
             selected_match_type: None,
+            player_count: default_player_count(),
+            summary_only: false,
+        };
+        let result = evaluate_deck_compatibility(&db, &request);
+        assert!(
+            result.commander.compatible,
+            "expected compatible, got reasons: {:?}",
+            result.commander.reasons
+        );
+    }
+
+    #[test]
+    fn commander_accepts_ten_slime_against_humanity_copies() {
+        // Issue #1138: "A deck can have any number of cards named Slime Against
+        // Humanity" must override the Commander singleton default.
+        let db_json = serde_json::json!({
+            "slime against humanity": {
+                "name": "Slime Against Humanity",
+                "mana_cost": { "type": "Cost", "shards": ["Green"], "generic": 2 },
+                "card_type": { "supertypes": [], "core_types": ["Sorcery"], "subtypes": [] },
+                "power": null, "toughness": null, "loyalty": null, "defense": null,
+                "oracle_text": "Create a 0/0 green Ooze creature token with trample. Put X +1/+1 counters on it, where X is two plus the total number of cards you own in exile and in your graveyard that are Oozes or are named Slime Against Humanity.\nA deck can have any number of cards named Slime Against Humanity.",
+                "non_ability_text": null, "flavor_name": null,
+                "keywords": [], "abilities": [], "triggers": [], "static_abilities": [], "replacements": [],
+                "color_override": ["Green"], "scryfall_oracle_id": null,
+                "deck_copy_limit": { "type": "Unlimited" },
+                "legalities": { "commander": "legal" }
+            },
+            "legal commander": {
+                "name": "Legal Commander",
+                "mana_cost": { "type": "NoCost" },
+                "card_type": { "supertypes": ["Legendary"], "core_types": ["Creature"], "subtypes": [] },
+                "power": null, "toughness": null, "loyalty": null, "defense": null,
+                "oracle_text": null, "non_ability_text": null, "flavor_name": null,
+                "keywords": [], "abilities": [], "triggers": [], "static_abilities": [], "replacements": [],
+                "color_override": ["Green"], "scryfall_oracle_id": null,
+                "legalities": { "commander": "legal" }
+            },
+            "forest": {
+                "name": "Forest",
+                "mana_cost": { "type": "NoCost" },
+                "card_type": { "supertypes": ["Basic"], "core_types": ["Land"], "subtypes": ["Forest"] },
+                "power": null, "toughness": null, "loyalty": null, "defense": null,
+                "oracle_text": null, "non_ability_text": null, "flavor_name": null,
+                "keywords": [], "abilities": [], "triggers": [], "static_abilities": [], "replacements": [],
+                "color_override": null, "scryfall_oracle_id": null,
+                "legalities": { "commander": "legal" }
+            }
+        })
+        .to_string();
+        let db = CardDatabase::from_json_str(&db_json).unwrap();
+        let mut main = expand("Slime Against Humanity", 10);
+        main.extend(expand("Forest", 89));
+        let request = DeckCompatibilityRequest {
+            main_deck: main,
+            sideboard: Vec::new(),
+            commander: vec!["Legal Commander".to_string()],
+            planar_deck: Vec::new(),
+            scheme_deck: Vec::new(),
+            signature_spell: Vec::new(),
+            selected_format: Some(GameFormat::Commander),
+            selected_match_type: None,
+            player_count: default_player_count(),
             summary_only: false,
         };
         let result = evaluate_deck_compatibility(&db, &request);
@@ -3891,8 +5475,12 @@ mod tests {
             main_deck: expand("Plains", 99),
             sideboard: vec!["Plains".to_string()],
             commander: vec!["Legal Commander".to_string()],
+            planar_deck: Vec::new(),
+            scheme_deck: Vec::new(),
+            signature_spell: Vec::new(),
             selected_format: Some(GameFormat::Commander),
             selected_match_type: None,
+            player_count: default_player_count(),
             summary_only: false,
         };
         let result = evaluate_deck_compatibility(&db, &request);
@@ -3914,8 +5502,12 @@ mod tests {
             main_deck: expand("Legal Standard", 60),
             sideboard: expand("Plains", 16),
             commander: Vec::new(),
+            planar_deck: Vec::new(),
+            scheme_deck: Vec::new(),
+            signature_spell: Vec::new(),
             selected_format: Some(GameFormat::Standard),
             selected_match_type: None,
+            player_count: default_player_count(),
             summary_only: false,
         };
         let err = validate_deck_for_format(&db, &request)
@@ -3933,8 +5525,12 @@ mod tests {
             main_deck: expand("Plains", 60),
             sideboard: Vec::new(),
             commander: Vec::new(),
+            planar_deck: Vec::new(),
+            scheme_deck: Vec::new(),
+            signature_spell: Vec::new(),
             selected_format: Some(GameFormat::FreeForAll),
             selected_match_type: Some(MatchType::Bo3),
+            player_count: default_player_count(),
             summary_only: false,
         };
         let result = evaluate_deck_compatibility(&db, &no_sideboard);
@@ -3959,8 +5555,12 @@ mod tests {
             main_deck: vec!["Legal Standard".to_string(); 99],
             sideboard: vec![],
             commander: vec!["Test Commander".to_string()],
+            planar_deck: Vec::new(),
+            scheme_deck: Vec::new(),
+            signature_spell: Vec::new(),
             selected_format: Some(GameFormat::Commander),
             selected_match_type: None,
+            player_count: default_player_count(),
             summary_only: false,
         };
         let result = validate_deck_for_format(&db, &request);
@@ -4058,8 +5658,12 @@ mod tests {
             main_deck: main,
             sideboard: Vec::new(),
             commander: vec!["Legal Commander".to_string()],
+            planar_deck: Vec::new(),
+            scheme_deck: Vec::new(),
+            signature_spell: Vec::new(),
             selected_format: Some(GameFormat::Commander),
             selected_match_type: None,
+            player_count: default_player_count(),
             summary_only: false,
         };
         let result = evaluate_deck_compatibility(&db, &request);
@@ -4079,8 +5683,12 @@ mod tests {
             main_deck: main,
             sideboard: Vec::new(),
             commander: vec!["Legal Commander".to_string()],
+            planar_deck: Vec::new(),
+            scheme_deck: Vec::new(),
+            signature_spell: Vec::new(),
             selected_format: Some(GameFormat::Commander),
             selected_match_type: None,
+            player_count: default_player_count(),
             summary_only: false,
         };
         let result = evaluate_deck_compatibility(&db, &request);
@@ -4100,8 +5708,12 @@ mod tests {
             main_deck: main,
             sideboard: Vec::new(),
             commander: vec!["Legal Commander".to_string()],
+            planar_deck: Vec::new(),
+            scheme_deck: Vec::new(),
+            signature_spell: Vec::new(),
             selected_format: Some(GameFormat::Commander),
             selected_match_type: None,
+            player_count: default_player_count(),
             summary_only: false,
         };
         let result = evaluate_deck_compatibility(&db, &request);
@@ -4125,8 +5737,12 @@ mod tests {
             main_deck: main,
             sideboard: Vec::new(),
             commander: vec!["Legal Commander".to_string()],
+            planar_deck: Vec::new(),
+            scheme_deck: Vec::new(),
+            signature_spell: Vec::new(),
             selected_format: Some(GameFormat::Commander),
             selected_match_type: None,
+            player_count: default_player_count(),
             summary_only: false,
         };
         let result = evaluate_deck_compatibility(&db, &request);
@@ -4181,8 +5797,12 @@ mod tests {
             main_deck: main,
             sideboard: Vec::new(),
             commander: Vec::new(),
+            planar_deck: Vec::new(),
+            scheme_deck: Vec::new(),
+            signature_spell: Vec::new(),
             selected_format: Some(GameFormat::Vintage),
             selected_match_type: None,
+            player_count: default_player_count(),
             summary_only: false,
         };
         let result = evaluate_deck_compatibility(&db, &request);
@@ -4206,8 +5826,12 @@ mod tests {
             main_deck: main,
             sideboard: Vec::new(),
             commander: Vec::new(),
+            planar_deck: Vec::new(),
+            scheme_deck: Vec::new(),
+            signature_spell: Vec::new(),
             selected_format: Some(GameFormat::Vintage),
             selected_match_type: None,
+            player_count: default_player_count(),
             summary_only: false,
         };
         let result = evaluate_deck_compatibility(&db, &request);
@@ -4229,5 +5853,183 @@ mod tests {
             "restricted card must not be flagged as illegal; reasons: {:?}",
             result.selected_format_reasons
         );
+    }
+
+    fn momir_request(main: Vec<String>) -> DeckCompatibilityRequest {
+        DeckCompatibilityRequest {
+            main_deck: main,
+            sideboard: Vec::new(),
+            commander: Vec::new(),
+            planar_deck: Vec::new(),
+            scheme_deck: Vec::new(),
+            signature_spell: Vec::new(),
+            selected_format: Some(GameFormat::Momir),
+            selected_match_type: None,
+            player_count: default_player_count(),
+            summary_only: false,
+        }
+    }
+
+    /// The fixed Momir's Madness deck: 12 copies of each of the five snow basic
+    /// lands (no Snow-Covered Wastes), totaling 60. Delegates to the engine's
+    /// canonical `momir_fixed_deck_names()` so the auto-supplied deck and this
+    /// validator are exercised against the same single source of truth — if they
+    /// ever drift, `momir_madness_snow_basics_pass` below catches it.
+    fn momir_madness_deck() -> Vec<String> {
+        crate::game::deck_loading::momir_fixed_deck_names()
+    }
+
+    #[test]
+    fn momir_madness_snow_basics_pass() {
+        let db = CardDatabase::from_json_str(&test_db_json()).unwrap();
+        let request = momir_request(momir_madness_deck());
+        let check = evaluate_momir(&db, &request, &BTreeSet::new());
+        assert!(
+            check.compatible,
+            "12x each of the five snow basics must be a legal Momir's Madness deck, reasons: {:?}",
+            check.reasons
+        );
+    }
+
+    #[test]
+    fn momir_madness_regular_basics_fail() {
+        // 60 regular (non-snow) Plains must be rejected — Momir's Madness
+        // requires snow basics, not ordinary basics.
+        let db = CardDatabase::from_json_str(&test_db_json()).unwrap();
+        let check = evaluate_momir(&db, &momir_request(expand("Plains", 60)), &BTreeSet::new());
+        assert!(
+            !check.compatible,
+            "60 regular (non-snow) basics must be rejected"
+        );
+        assert!(
+            check
+                .reasons
+                .iter()
+                .any(|r| r.contains("only contain the five snow basic lands")),
+            "reasons: {:?}",
+            check.reasons
+        );
+    }
+
+    #[test]
+    fn momir_madness_wrong_per_type_count_fails() {
+        let db = CardDatabase::from_json_str(&test_db_json()).unwrap();
+        // 11 Plains + 13 Island + 12 each of the other three = 60 total, but the
+        // fixed 12-per-type ratio is broken.
+        let mut deck = expand("Snow-Covered Plains", 11);
+        deck.extend(expand("Snow-Covered Island", 13));
+        deck.extend(expand("Snow-Covered Swamp", 12));
+        deck.extend(expand("Snow-Covered Mountain", 12));
+        deck.extend(expand("Snow-Covered Forest", 12));
+        assert_eq!(deck.len(), 60);
+        let check = evaluate_momir(&db, &momir_request(deck), &BTreeSet::new());
+        assert!(!check.compatible, "an off-ratio deck must be rejected");
+        assert!(
+            check
+                .reasons
+                .iter()
+                .any(|r| r.contains("exactly 12") && r.contains("Plains")),
+            "reasons: {:?}",
+            check.reasons
+        );
+    }
+
+    #[test]
+    fn momir_madness_missing_type_fails() {
+        let db = CardDatabase::from_json_str(&test_db_json()).unwrap();
+        // 15 each of four types = 60 total, but Forest is entirely absent. This is
+        // the "iterate over expected types, not present types" guard: a naive
+        // per-present-type check would pass this (every present type is off-ratio
+        // too, but the danger is a 12-each-of-four + 12-extra shape; here the rule
+        // must reject because Forest's count resolves to 0 != 12.
+        let mut deck = expand("Snow-Covered Plains", 15);
+        deck.extend(expand("Snow-Covered Island", 15));
+        deck.extend(expand("Snow-Covered Swamp", 15));
+        deck.extend(expand("Snow-Covered Mountain", 15));
+        assert_eq!(deck.len(), 60);
+        let check = evaluate_momir(&db, &momir_request(deck), &BTreeSet::new());
+        assert!(
+            !check.compatible,
+            "a deck missing one of the five snow basic types must be rejected"
+        );
+        assert!(
+            check
+                .reasons
+                .iter()
+                .any(|r| r.contains("exactly 12") && r.contains("Forest")),
+            "reasons: {:?}",
+            check.reasons
+        );
+    }
+
+    #[test]
+    fn momir_madness_count_off_total_fails() {
+        let db = CardDatabase::from_json_str(&test_db_json()).unwrap();
+        for delta in [-1i32, 1] {
+            let mut deck = momir_madness_deck();
+            if delta > 0 {
+                deck.push("Snow-Covered Plains".to_string());
+            } else {
+                deck.pop();
+            }
+            let check = evaluate_momir(&db, &momir_request(deck), &BTreeSet::new());
+            assert!(
+                !check.compatible,
+                "a deck off the 60-card total (delta {delta}) must be rejected"
+            );
+            assert!(check.reasons.iter().any(|r| r.contains("exactly 60")));
+        }
+    }
+
+    #[test]
+    fn momir_madness_snow_covered_wastes_fails() {
+        let db = CardDatabase::from_json_str(&test_db_json()).unwrap();
+        // Swap one Snow-Covered Plains for a Snow-Covered Wastes: still snow +
+        // basic + land, but "Wastes" is not a basic land type (CR 305.6).
+        let mut deck = expand("Snow-Covered Wastes", 1);
+        deck.extend(expand("Snow-Covered Plains", 11));
+        deck.extend(expand("Snow-Covered Island", 12));
+        deck.extend(expand("Snow-Covered Swamp", 12));
+        deck.extend(expand("Snow-Covered Mountain", 12));
+        deck.extend(expand("Snow-Covered Forest", 12));
+        assert_eq!(deck.len(), 60);
+        let check = evaluate_momir(&db, &momir_request(deck), &BTreeSet::new());
+        assert!(!check.compatible, "Snow-Covered Wastes must be rejected");
+        assert!(
+            check
+                .reasons
+                .iter()
+                .any(|r| r.contains("only contain the five snow basic lands")),
+            "Snow-Covered Wastes must be flagged as a non-snow-basic-type card; reasons: {:?}",
+            check.reasons
+        );
+    }
+
+    #[test]
+    fn momir_madness_non_basic_fails() {
+        let db = CardDatabase::from_json_str(&test_db_json()).unwrap();
+        let mut deck = expand("Snow-Covered Plains", 11);
+        deck.extend(expand("Snow-Covered Island", 12));
+        deck.extend(expand("Snow-Covered Swamp", 12));
+        deck.extend(expand("Snow-Covered Mountain", 12));
+        deck.extend(expand("Snow-Covered Forest", 12));
+        deck.push("Legal Standard".to_string()); // non-basic, total 60
+        assert_eq!(deck.len(), 60);
+        let check = evaluate_momir(&db, &momir_request(deck), &BTreeSet::new());
+        assert!(!check.compatible, "a non-basic card must be rejected");
+        assert!(check
+            .reasons
+            .iter()
+            .any(|r| r.contains("only contain the five snow basic lands")));
+    }
+
+    #[test]
+    fn momir_madness_non_empty_sideboard_fails() {
+        let db = CardDatabase::from_json_str(&test_db_json()).unwrap();
+        let mut request = momir_request(momir_madness_deck());
+        request.sideboard = vec!["Snow-Covered Plains".to_string()];
+        let check = evaluate_momir(&db, &request, &BTreeSet::new());
+        assert!(!check.compatible, "Momir's Madness has no sideboard");
+        assert!(check.reasons.iter().any(|r| r.contains("sideboard")));
     }
 }

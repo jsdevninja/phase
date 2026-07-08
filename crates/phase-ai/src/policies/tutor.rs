@@ -15,6 +15,8 @@ use crate::features::DeckFeatures;
 use super::activation::turn_only;
 use super::context::PolicyContext;
 use super::registry::{DecisionKind, PolicyId, PolicyReason, PolicyVerdict, TacticalPolicy};
+#[cfg(test)]
+use engine::types::game_state::CastPaymentMode;
 
 pub struct TutorPolicy;
 
@@ -462,6 +464,7 @@ mod tests {
                     target_player: None,
                     selection_constraint: engine::types::ability::SearchSelectionConstraint::None,
                     split: None,
+                    source_zones: vec![engine::types::zones::Zone::Library],
                 },
             ),
         );
@@ -471,6 +474,8 @@ mod tests {
                 object_id: tutor,
                 card_id: CardId(10),
                 targets: Vec::new(),
+
+                payment_mode: CastPaymentMode::Auto,
             },
             metadata: ActionMetadata {
                 actor: Some(PlayerId(0)),
@@ -492,6 +497,7 @@ mod tests {
             config: &config,
             context: &crate::context::AiContext::empty(&config.weights),
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
 
         assert!(

@@ -9,7 +9,7 @@ use engine::types::ability::{
     AbilityKind, ContinuousModification, Duration, PlayerScope, QuantityExpr, StaticCondition,
     StaticDefinition,
 };
-use engine::types::statics::StaticMode;
+use engine::types::statics::{CombatAloneAction, CombatAloneRequirement, StaticMode};
 use engine::types::Phase;
 
 use crate::convert::keyword::try_convert as keyword_try_convert;
@@ -292,20 +292,40 @@ pub fn convert_permanent_rule(
         // CR 509.1b: Attack/block bare prohibitions/requirements.
         P::CantAttack => StaticMode::CantAttack,
         P::CantBlock => StaticMode::CantBlock,
-        P::CantAttackAlone => StaticMode::CantAttackAlone,
-        P::CantBlockAlone => StaticMode::CantBlockAlone,
+        P::CantCrew => StaticMode::CantCrew,
+        // CR 506.5 + CR 508.1c + CR 509.1b: parameterized "alone" combat restriction.
+        P::CantAttackAlone => StaticMode::CombatAlone {
+            action: CombatAloneAction::Attack,
+            requirement: CombatAloneRequirement::NeedsCompanion,
+        },
+        P::CantBlockAlone => StaticMode::CombatAlone {
+            action: CombatAloneAction::Block,
+            requirement: CombatAloneRequirement::NeedsCompanion,
+        },
+        P::CanOnlyAttackAlone => StaticMode::CombatAlone {
+            action: CombatAloneAction::Attack,
+            requirement: CombatAloneRequirement::MustBeSole,
+        },
         P::MustAttack => StaticMode::MustAttack,
         P::MustBlock => StaticMode::MustBlock,
-        P::MustBeBlocked => StaticMode::MustBeBlocked,
+        // CR 509.1c: bare "must be blocked if able" — no filter, any assigned
+        // blocker satisfies the requirement.
+        P::MustBeBlocked => StaticMode::MustBeBlocked { by: None },
+        // CR 509.1c: filtered "must be blocked by a <Permanents> if able" —
+        // only an assigned blocker matching `filter` satisfies the requirement.
+        // Covers Ace's Baseball Bat ("must be blocked by a Dalek if able") and
+        // Slayer's Cleaver ("must be blocked by an Eldrazi if able").
+        P::MustBeBlockedByADefender(filter) => StaticMode::MustBeBlocked {
+            by: Some(filter::convert(filter)?),
+        },
         P::CanBlockOnly(filter) if is_creature_with_flying_filter(filter) => {
-            StaticMode::BlockRestriction
+            StaticMode::BlockRestriction {
+                filter: engine::types::statics::block_only_creatures_with_flying_filter(),
+            }
         }
-        P::CanBlockOnly(filter) => {
-            return Err(ConversionGap::EnginePrerequisiteMissing {
-                engine_type: "StaticMode::BlockRestriction",
-                needed_variant: format!("parameterized block-only filter: {filter:?}"),
-            });
-        }
+        P::CanBlockOnly(filter) => StaticMode::BlockRestriction {
+            filter: filter::convert(filter)?,
+        },
         P::CantAttackIfDefendingPlayer(condition) => {
             return Ok(StaticDefinition::new(StaticMode::CantAttack)
                 .affected(affected)
@@ -340,6 +360,9 @@ pub fn convert_permanent_rule(
         // restriction. `StaticMode::CantBeBlockedBy { filter }` is the
         // documented inverse of `CantBeBlockedExceptBy` (statics.rs:484).
         P::CantBeBlockedByDefenders(p) => StaticMode::CantBeBlockedBy {
+            filter: filter::convert(p)?,
+        },
+        P::CanBeAttachedOnlyToAPermanent(p) => StaticMode::AttachmentRestriction {
             filter: filter::convert(p)?,
         },
 
@@ -641,15 +664,20 @@ pub fn expiration_to_duration(exp: &Expiration) -> ConvResult<Duration> {
         // effect's controller. Player-scoped variants only convert for
         // `SelfPlayer` because the engine resolves `PlayerScope::Controller`
         // against the grantee/controller.
-        Expiration::UntilPlayersNextTurn(p)
-        | Expiration::UntilTheEndOfPlayersNextTurn(p)
-        | Expiration::UntilEndOfNextTurn(p)
+        // CR 514.2: "until the end of [your/their] next turn" — persists through
+        // that entire turn and expires at cleanup (Light Up the Stage, Reckless
+        // Impulse). Distinct from `UntilNextTurnOf`, which expires at the
+        // beginning of the next turn.
+        Expiration::UntilTheEndOfPlayersNextTurn(p) | Expiration::UntilEndOfNextTurn(p)
             if is_self_player(p) =>
         {
-            Duration::UntilNextTurnOf {
+            Duration::UntilEndOfNextTurnOf {
                 player: PlayerScope::Controller,
             }
         }
+        Expiration::UntilPlayersNextTurn(p) if is_self_player(p) => Duration::UntilNextTurnOf {
+            player: PlayerScope::Controller,
+        },
         // CR 502.1: "during your next untap step" — Π-2 parameterized
         // `UntilNextStepOf { step: Untap, player: Controller }` ends at the affected
         // permanent's controller's next untap step, matching the SelfPlayer scope.
@@ -688,7 +716,7 @@ pub fn expiration_to_duration(exp: &Expiration) -> ConvResult<Duration> {
 
 /// True when the `Player` reference resolves to the effect's own controller —
 /// the only `PlayerScope` (`Controller`) the `Duration::UntilNextTurnOf` /
-/// `UntilNextStepOf` parameterizations bind today.
+/// `UntilEndOfNextTurnOf` / `UntilNextStepOf` parameterizations bind today.
 fn is_self_player(p: &Player) -> bool {
     matches!(p, Player::You | Player::SelfPlayer | Player::ItsController)
 }
@@ -986,8 +1014,49 @@ fn check_hasable_to_keyword(c: &CheckHasable) -> ConvResult<engine::types::keywo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::types::{LandType, PermanentRule, Permanents, Player};
+    use crate::schema::types::{CreatureType, LandType, PermanentRule, Permanents, Player};
     use engine::types::ability::{TargetFilter, TypeFilter, TypedFilter};
+
+    /// CR 509.1c: `MustBeBlockedByADefender(filter)` converts to
+    /// `StaticMode::MustBeBlocked { by: Some(filter) }` — the filtered form
+    /// that the engine's combat validator enforces. Covers Ace's Baseball Bat
+    /// (Dalek) and Slayer's Cleaver (Eldrazi).
+    #[test]
+    fn must_be_blocked_by_a_defender_lowers_to_filtered_must_be_blocked() {
+        // Dalek case: "must be blocked by a Dalek if able"
+        let converted = convert_permanent_rule(
+            &PermanentRule::MustBeBlockedByADefender(Box::new(Permanents::IsCreatureType(
+                CreatureType::Dalek,
+            ))),
+            TargetFilter::SelfRef,
+        )
+        .unwrap();
+
+        assert!(
+            matches!(converted.mode, StaticMode::MustBeBlocked { by: Some(_) }),
+            "expected MustBeBlocked {{ by: Some(_) }}, got {:?}",
+            converted.mode
+        );
+        assert_eq!(converted.affected, Some(TargetFilter::SelfRef));
+
+        // Eldrazi case: "must be blocked by an Eldrazi if able"
+        let converted_eldrazi = convert_permanent_rule(
+            &PermanentRule::MustBeBlockedByADefender(Box::new(Permanents::IsCreatureType(
+                CreatureType::Eldrazi,
+            ))),
+            TargetFilter::SelfRef,
+        )
+        .unwrap();
+
+        assert!(
+            matches!(
+                converted_eldrazi.mode,
+                StaticMode::MustBeBlocked { by: Some(_) }
+            ),
+            "expected MustBeBlocked {{ by: Some(_) }} for Eldrazi, got {:?}",
+            converted_eldrazi.mode
+        );
+    }
 
     #[test]
     fn can_block_only_creatures_with_flying_lowers_to_block_restriction() {
@@ -1000,8 +1069,39 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(converted.mode, StaticMode::BlockRestriction);
+        assert!(matches!(
+            converted.mode,
+            StaticMode::BlockRestriction { .. }
+        ));
         assert_eq!(converted.affected, Some(TargetFilter::SelfRef));
+    }
+
+    #[test]
+    fn can_be_attached_only_to_permanent_lowers_to_attach_filter_static() {
+        use crate::schema::types::{CardType, PermanentRule, Permanents, SuperType};
+        use engine::types::ability::{FilterProp, TargetFilter, TypeFilter};
+        use engine::types::card_type::Supertype as EngineSupertype;
+        use engine::types::statics::StaticMode;
+
+        let converted = convert_permanent_rule(
+            &PermanentRule::CanBeAttachedOnlyToAPermanent(Box::new(Permanents::And(vec![
+                Permanents::IsCardtype(CardType::Creature),
+                Permanents::IsSupertype(SuperType::Legendary),
+            ]))),
+            TargetFilter::SelfRef,
+        )
+        .unwrap();
+
+        assert!(
+            matches!(
+                converted.mode,
+                StaticMode::AttachmentRestriction { filter: TargetFilter::Typed(ref tf) }
+                if tf.type_filters.contains(&TypeFilter::Creature)
+                    && tf.properties.iter().any(|p| matches!(p, FilterProp::HasSupertype { value: EngineSupertype::Legendary }))
+            ),
+            "got {:?}",
+            converted.mode
+        );
     }
 
     #[test]
@@ -1040,6 +1140,29 @@ mod tests {
             expiration_to_duration(&Expiration::UntilPlayersNextTurn(Box::new(Player::You)))
                 .unwrap(),
             Duration::UntilNextTurnOf {
+                player: PlayerScope::Controller,
+            }
+        );
+    }
+
+    #[test]
+    fn until_the_end_of_your_next_turn_lowers_to_end_of_next_turn_duration() {
+        assert_eq!(
+            expiration_to_duration(&Expiration::UntilTheEndOfPlayersNextTurn(Box::new(
+                Player::You
+            )))
+            .unwrap(),
+            Duration::UntilEndOfNextTurnOf {
+                player: PlayerScope::Controller,
+            }
+        );
+    }
+
+    #[test]
+    fn until_end_of_next_turn_lowers_to_end_of_next_turn_duration() {
+        assert_eq!(
+            expiration_to_duration(&Expiration::UntilEndOfNextTurn(Box::new(Player::You))).unwrap(),
+            Duration::UntilEndOfNextTurnOf {
                 player: PlayerScope::Controller,
             }
         );

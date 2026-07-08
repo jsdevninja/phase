@@ -2,10 +2,12 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
+use super::ability::{AbilityTag, Comparator};
 use super::events::GameEvent;
 use super::identifiers::ObjectId;
 use super::keywords::{Keyword, KeywordKind};
 use super::player::PlayerId;
+use super::zones::Zone;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ManaColor {
@@ -41,7 +43,7 @@ impl FromStr for ManaColor {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum ManaType {
     White,
     Blue,
@@ -242,6 +244,40 @@ pub struct SpellMeta {
     pub keyword_kinds: Vec<KeywordKind>,
     /// Zone the spell is being cast from.
     pub cast_from_zone: Option<crate::types::zones::Zone>,
+    /// CR 202.3: Mana value of the spell being cast, consulted by mana-value
+    /// spend restrictions (`OnlyForSpellWithManaValue`). `None` at payment
+    /// sites with no associated spell mana value.
+    pub mana_value: Option<u32>,
+    /// CR 105.2: Number of colors of the spell being cast, consulted by
+    /// color-count spend restrictions (`OnlyForSpellWithColorCount`). `None` at
+    /// payment sites with no associated spell.
+    pub color_count: Option<u32>,
+    /// CR 107.3 + CR 202.3e: Whether the spell's printed mana cost contains an
+    /// `{X}` symbol. Consulted by the "with {X} in their mana costs" disjunct of
+    /// MV/X spend restrictions (`OnlyForSpellMatchingCostCriteria`). `false` at
+    /// payment sites with no associated spell, or when the spell has no `{X}`.
+    pub has_x_in_cost: bool,
+    /// CR 708.4: Whether the spell is being CAST FACE DOWN (morph/disguise/cloak
+    /// cast as a 2/2 face-down creature). Consulted by the "cast face-down
+    /// spells" spend restriction ([`ManaRestriction::OnlyForFaceDownSpell`],
+    /// Tin Street Gossip). `false` at payment sites with no associated spell or
+    /// for a normal face-up cast.
+    ///
+    /// This is "being cast face down", NOT "the object is currently face down" —
+    /// the two differ for exile/library concealment. Foretell (CR 702.143a),
+    /// hideaway, and similar effects set `obj.face_down = true` while the card
+    /// waits in exile, yet that card is CAST FACE UP (CR 702.143c: a foretold card
+    /// is cast face up "even if it was cast for a cost other than a foretell
+    /// cost"). `game::casting::build_spell_meta` therefore sources this field from
+    /// the cast's face-down intent, hardcoded `false` today — never from raw
+    /// `obj.face_down` — so a foretold/hideaway cast is correctly reported as
+    /// face-up. No engine path casts a spell face down (CR 708.4 face-down play,
+    /// `PlayFaceDown` → `game::morph::play_face_down`, enters the battlefield via
+    /// the zone pipeline and charges no mana, building no spell-payment context),
+    /// so the field is fail-closed: never `true` at a real `PaymentContext::Spell`
+    /// site. It is wired for forward compatibility — see
+    /// [`ManaRestriction::OnlyForFaceDownSpell`] for the contract.
+    pub is_face_down: bool,
 }
 
 /// CR 106.6: Context for a mana-payment decision. Distinguishes "paying for a
@@ -259,15 +295,176 @@ pub enum PaymentContext<'a> {
     /// Payment for a spell being cast — consult `allows_spell`.
     Spell(&'a SpellMeta),
     /// Payment for an activated ability — consult `allows_activation` using
-    /// the source permanent's core types and subtypes.
+    /// the source permanent's core types and subtypes plus the ability's
+    /// keyword tag (CR 106.6, for tag-scoped restrictions like Quinjet's).
     Activation {
         source_types: &'a [String],
         source_subtypes: &'a [String],
+        ability_tag: Option<AbilityTag>,
     },
     /// Payment for a cost during spell or ability resolution. Current
     /// restriction variants name spell-casting or ability-activation use, so
     /// restricted mana is not eligible here.
     Effect,
+    /// CR 116.2: Payment for a special action's mana cost (e.g. a Room's
+    /// unlock cost, CR 116.2m / CR 709.5e). Special actions don't use the stack
+    /// and are neither spell casts nor ability activations, so they need a
+    /// distinct context: spell/activation-restricted mana must reject them, but
+    /// special-action-restricted mana (`OnlyForSpecialAction`) must accept the
+    /// matching action class. Parameterized over [`SpecialAction`] so one
+    /// context variant covers every restrictable special-action class rather
+    /// than a sibling per action.
+    SpecialAction(SpecialAction),
+}
+
+/// CR 116.2: A class of special action whose mana cost can be the subject of a
+/// CR 106.6 mana-spend restriction ("Spend this mana only to unlock doors").
+///
+/// Only special actions that pay a mana cost *through the mana pool* with a
+/// restriction-aware payment context belong here. CR 116.2m / CR 709.5e door
+/// unlock is one such action (its unlock cost routes through
+/// `pay_special_action_mana_cost`). CR 116.2b turn-face-up is another: the
+/// `GameAction::TurnFaceUp` handler now derives the morph/disguise/manifest cost
+/// (`game::morph::turn_face_up_prepare`, CR 702.37e / CR 702.168d / CR 701.40b)
+/// and pays it through `PaymentContext::SpecialAction(TurnFaceUp)` before flipping
+/// the permanent, so a `TurnFaceUp`-restricted mana's runtime gate
+/// ([`ManaRestriction::OnlyForSpecialAction(SpecialAction::TurnFaceUp)`]) is live
+/// there and correctly rejected for every other context. A card whose spend
+/// restriction names only production-live branches (Overgrown Zealot; Creeping
+/// Peeper; and, since CR 708.4 face-down spell casting, Tin Street Gossip) is
+/// therefore absorbed at the `Effect::Mana` seam and supported via
+/// `ManaSpendRestriction::is_coverage_supported`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SpecialAction {
+    /// CR 116.2m + CR 709.5e: Paying a locked Room half's unlock cost to give
+    /// the permanent the appropriate unlocked designation.
+    UnlockDoor,
+    /// CR 116.2k + CR 702.170a: Exiling a card from hand and paying its plot
+    /// cost to make it a plotted card. The plot ability is synthesized as a
+    /// hand-zone activated ability (`synthesize_plot`); this variant lets a
+    /// `StaticMode::ReduceActionCost { action: Plot, .. }` (Doc Aurlock) reduce
+    /// that plot cost without conflating plot with generic activated-ability
+    /// cost reducers.
+    Plot,
+    /// CR 116.2b + CR 702.37e / CR 702.168d / CR 701.40b: Paying a face-down
+    /// permanent's morph/disguise cost (or a manifested creature card's mana cost)
+    /// to turn it face up. The `GameAction::TurnFaceUp` handler emits
+    /// `PaymentContext::SpecialAction(TurnFaceUp)` when charging that cost, so mana
+    /// restricted to this action is spendable there and rejected elsewhere — see
+    /// the type-level note above.
+    TurnFaceUp,
+    /// CR 901.9 / CR 116.2i: Paying the escalating generic cost to roll the
+    /// planar die as a Planechase special action.
+    RollPlanarDie,
+}
+
+/// CR 106.6: The ability-activation half of a "spend only to cast [X] spell or
+/// activate …" restriction. Parameterizes *which* ability activations the mana
+/// may also be spent on, so the spell-type + ability-activation OR restriction
+/// needs a single variant rather than a sibling per ability scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AbilityActivationScope {
+    /// "… or activate abilities of [the spell's type]" — only abilities on a
+    /// permanent whose type matches the restriction's `spell_type`
+    /// (e.g. "cast creature spells or activate abilities of creatures").
+    OfSpellType,
+    /// "… or to activate an ability" — any ability activation is permitted
+    /// (e.g. Sage of the Unknowable, "a colorless spell or to activate an ability").
+    Any,
+}
+
+/// CR 106.6 + CR 400.7: Whether a zone-gated spend restriction names the zone a
+/// spell *must* be cast from or a zone it must *not* be cast from. This is the
+/// inclusion/exclusion axis of [`ManaRestriction::OnlyForSpellFromZone`] — "from
+/// your graveyard" (`From`) versus "from anywhere other than your hand"
+/// (`NotFrom`, Mm'menon, the Right Hand). Parameterizing the existing zone
+/// variant over this polarity keeps a single zone-spend variant rather than a
+/// `SpellFromZone` / `SpellNotFromZone` sibling pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ZoneSpendPolarity {
+    /// "from [your] <zone>" — the spell must be cast from the named zone.
+    #[default]
+    From,
+    /// "from anywhere other than [your] <zone>" — the spell must be cast from
+    /// any zone *except* the named one. A spell with no recorded cast-from zone
+    /// is treated as not satisfying the restriction (conservative).
+    NotFrom,
+}
+
+/// CR 106.6 + CR 400.7: parameterized zone-gated spend restriction payload —
+/// the named zone plus an inclusion/exclusion [`ZoneSpendPolarity`]. Carried as
+/// a newtype payload of [`ManaRestriction::OnlyForSpellFromZone`] (and the
+/// parse-time [`crate::types::ability::ManaSpendRestriction::SpellFromZone`]) so
+/// the externally-tagged serialized form stays a single value rather than a
+/// struct variant. A custom [`Deserialize`] (see [`ZoneSpendPayload`]) accepts
+/// both the legacy bare-`Zone` form (`{"OnlyForSpellFromZone":"Graveyard"}`) and
+/// the current `{zone, polarity}` form, mapping the legacy form to `From`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ZoneSpend {
+    pub zone: Zone,
+    pub polarity: ZoneSpendPolarity,
+}
+
+/// Untagged payload bridging legacy bare-`Zone` serialized data and the current
+/// `{zone, polarity}` object form. Serde cannot deserialize a bare string into a
+/// struct variant, so this enum gives [`ZoneSpend`]'s custom `Deserialize` both
+/// shapes; `polarity` defaults to `From` for the current form when absent.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ZoneSpendPayload {
+    Current {
+        zone: Zone,
+        #[serde(default)]
+        polarity: ZoneSpendPolarity,
+    },
+    Legacy(Zone),
+}
+
+impl<'de> Deserialize<'de> for ZoneSpend {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(match ZoneSpendPayload::deserialize(deserializer)? {
+            ZoneSpendPayload::Legacy(zone) => Self {
+                zone,
+                polarity: ZoneSpendPolarity::From,
+            },
+            ZoneSpendPayload::Current { zone, polarity } => Self { zone, polarity },
+        })
+    }
+}
+
+/// CR 106.6 + CR 107.3 + CR 202.3: A single qualifying criterion on the cost of
+/// the spell a restricted mana may be spent on. Used by
+/// [`ManaRestriction::OnlyForSpellMatchingCostCriteria`] to express the
+/// disjunctive "spells with mana value N or greater **or** spells with {X} in
+/// their mana costs" reading (Helga, Skittish Seer; Troyan, Gutsy Explorer)
+/// without proliferating one variant per (threshold × X-disjunct) combination.
+///
+/// Both criteria are properties of the spell's *cost* (CR 202.3 mana value /
+/// CR 107.3 X symbol), so they share a single categorical axis and belong to one
+/// typed predicate rather than a raw bool flag bolted onto the mana-value variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SpellCostCriterion {
+    /// CR 202.3: The spell's mana value satisfies `spell_mana_value <cmp> value`.
+    ManaValue { comparator: Comparator, value: u32 },
+    /// CR 107.3 + CR 202.3e: The spell's printed mana cost contains an `{X}`
+    /// symbol. Detected structurally (X contributes 0 to mana value off the
+    /// stack), via `SpellMeta.has_x_in_cost`.
+    HasXInCost,
+}
+
+impl SpellCostCriterion {
+    /// CR 106.6: Whether the described spell satisfies this single cost criterion.
+    pub fn matches(&self, meta: &SpellMeta) -> bool {
+        match self {
+            SpellCostCriterion::ManaValue { comparator, value } => meta
+                .mana_value
+                .is_some_and(|mv| comparator.evaluate(mv as i32, *value as i32)),
+            SpellCostCriterion::HasXInCost => meta.has_x_in_cost,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -279,13 +476,33 @@ pub enum ManaRestriction {
     /// "Spend this mana only to cast a creature spell of the chosen type."
     /// The `String` is the chosen creature type (e.g., "Elf").
     OnlyForCreatureType(String),
+    /// CR 106.6 + CR 205.3m + CR 903.3: "a creature spell that shares a creature
+    /// type with your commander" — relational spend filter for Path of Ancestry.
+    /// This is a distinct *relational-to-commander* axis, not a fixed-subtype
+    /// parameterization of `OnlyForCreatureType`: the matching subtype set is
+    /// computed from live commander state per spend, so it cannot be evaluated
+    /// from `SpellMeta` alone. `allows_spell` returns `false` (no commander
+    /// context here); the real relational evaluation happens at the
+    /// `apply_mana_spell_grants` spend-check site, which has game-state access —
+    /// mirroring how `OnlyForXCosts` defers full detection to its call site.
+    SharesCreatureTypeWithCommander,
     /// CR 106.6: "Spend this mana only to cast creature spells or activate abilities of creatures."
-    /// Allows spending for spells of the type (checked via `allows_spell`) OR for ability
-    /// activations on permanents of the type (checked via `allows_activation`).
-    OnlyForTypeSpellsOrAbilities(String),
+    /// Allows spending for spells of `spell_type` (checked via `allows_spell`) OR for ability
+    /// activations whose scope is described by `ability` (checked via `allows_activation`):
+    /// `OfSpellType` restricts to abilities of permanents of `spell_type`; `Any` permits any
+    /// ability activation ("… or to activate an ability").
+    OnlyForTypeSpellsOrAbilities {
+        spell_type: String,
+        ability: AbilityActivationScope,
+    },
     /// "Spend this mana only to activate abilities."
     /// Cannot be used for casting spells — activation-only.
     OnlyForActivation,
+    /// CR 106.6: "Spend this mana only to activate power-up abilities." Keyed on
+    /// the activating ability's keyword tag (Quinjet Technician), a distinct axis
+    /// from `OnlyForTypeSpellsOrAbilities` (which keys on the source permanent's
+    /// type) and `OnlyForActivation` (which permits any activation).
+    OnlyForTaggedActivation(AbilityTag),
     /// "Spend this mana only on costs that include {X}."
     /// Only permits spending on spells or abilities with {X} in their cost.
     OnlyForXCosts,
@@ -293,6 +510,73 @@ pub enum ManaRestriction {
     OnlyForSpellWithKeywordKind(KeywordKind),
     /// "Spend this mana only to cast spells with flashback from a graveyard."
     OnlyForSpellWithKeywordKindFromZone(KeywordKind, crate::types::zones::Zone),
+    /// CR 106.6: "Spend this mana only to cast spells with mana value N or
+    /// greater" (or "or less"). `comparator` applies `spell_mana_value <cmp>
+    /// value`. Parameterized over [`Comparator`] — one variant per threshold reading.
+    OnlyForSpellWithManaValue { comparator: Comparator, value: u32 },
+    /// CR 106.6 + CR 107.3 + CR 202.3: "Spend this mana only to cast [creature]
+    /// spells with mana value N or greater **or** [creature] spells with {X} in
+    /// their mana costs" (Helga, Skittish Seer — creature-narrowed; Troyan, Gutsy
+    /// Explorer — any spell). A spell qualifies when it matches **any** listed
+    /// [`SpellCostCriterion`] (disjunction) AND, if `spell_type` is `Some`, also
+    /// has that type. Parameterized over the optional type narrowing and the
+    /// criteria set rather than proliferating one variant per
+    /// (type × threshold × X-disjunct) combination.
+    OnlyForSpellMatchingCostCriteria {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        spell_type: Option<String>,
+        criteria: Vec<SpellCostCriterion>,
+    },
+    /// CR 105.2 + CR 106.6: "Spend this mana only to cast spells with exactly N
+    /// colors" (also "N or more / N or fewer"). `comparator` applies
+    /// `spell_color_count <cmp> count`. Colorless spells have color_count 0.
+    OnlyForSpellWithColorCount { comparator: Comparator, count: u32 },
+    /// CR 106.6 + CR 400.7: "Spend this mana only to cast spells from your
+    /// graveyard" / "from exile" ([`ZoneSpendPolarity::From`]) and "from anywhere
+    /// other than your hand" ([`ZoneSpendPolarity::NotFrom`], Mm'menon, the Right
+    /// Hand). Gates on the spell's cast-from zone, consulting
+    /// `SpellMeta.cast_from_zone`. A distinct axis from
+    /// `OnlyForSpellWithKeywordKindFromZone` (which also requires a keyword).
+    /// Carried as a [`ZoneSpend`] newtype payload whose custom `Deserialize`
+    /// accepts the legacy bare-`Zone` form (`{"OnlyForSpellFromZone":"Graveyard"}`)
+    /// for backward compatibility, mapping it to the inclusion reading.
+    OnlyForSpellFromZone(ZoneSpend),
+    /// CR 106.6 + CR 708.4: "Spend this mana only to cast face-down spells"
+    /// (Tin Street Gossip). Gates spending on whether the spell is being CAST
+    /// face down (morph/disguise/cloak), consulting `SpellMeta.is_face_down`.
+    /// Rejects normal face-up casts, ability activations, and special actions.
+    ///
+    /// The gate reads `meta.is_face_down`, which `build_spell_meta` sources from
+    /// the cast's face-down intent — NOT from `obj.face_down`. That distinction
+    /// matters: exile/library concealment (foretell, hideaway) sets
+    /// `obj.face_down = true` for a card that is nonetheless CAST FACE UP
+    /// (CR 702.143c), so the gate correctly REJECTS those concealment casts.
+    ///
+    /// The gate is now live: CR 708.4 morph/megamorph/disguise face-down spell
+    /// casting (`AlternativeCastKeyword::FaceDown` → `continue_cast_face_down`)
+    /// routes the `{3}` face-down cost (CR 702.37c) through `PaymentContext::Spell`
+    /// with `SpellMeta.is_face_down = true`, so this gate is satisfiable there and
+    /// correctly rejected for every other context — a normal face-up cast, and an
+    /// exile-concealment cast (foretell/hideaway) whose `obj.face_down = true` but
+    /// which is cast face up (CR 702.143c), both report `is_face_down = false` —
+    /// see [`ManaRestriction::allows_spell`]. A card whose spend restriction
+    /// includes this leaf is therefore absorbed at the `Effect::Mana` seam and
+    /// coverage-supported via `ManaSpendRestriction::is_coverage_supported`.
+    OnlyForFaceDownSpell,
+    /// CR 106.6: Disjunctive spend restriction — the mana may be spent on any
+    /// payment that satisfies at least one inner restriction. Composition
+    /// combinator (each branch is itself a full restriction), not a leaf
+    /// parameterization. Models "… to cast a Dragon spell or an Omen spell" and
+    /// "… to cast an Assassin spell, a spell that has freerunning, or to activate
+    /// an ability of an Assassin source."
+    OnlyForAny(Vec<ManaRestriction>),
+    /// CR 106.6 + CR 116.2: "Spend this mana only to [unlock doors]" — the
+    /// special-action half of a spend restriction. Payable only for a
+    /// [`PaymentContext::SpecialAction`] whose [`SpecialAction`] matches.
+    /// Rejects spell casts, ability activations, and generic effect payments.
+    /// Parameterized over the action class so one variant covers every
+    /// restrictable special action (door unlock today; extensible).
+    OnlyForSpecialAction(SpecialAction),
     /// CR 702.51a: Internal marker for a convoke tap that substitutes for
     /// paying mana. The payment algorithm may consume it for the current spell,
     /// but cast-spent metrics and mana-added triggers must ignore it.
@@ -305,22 +589,38 @@ impl ManaRestriction {
         qualities: impl IntoIterator<Item = &'a String>,
     ) -> bool {
         let qualities = qualities.into_iter().collect::<Vec<_>>();
-        required.split(" or ").any(|alternative| {
-            alternative.split_whitespace().all(|part| {
-                qualities
-                    .iter()
-                    .any(|quality| quality.eq_ignore_ascii_case(part))
+        // CR 106.6: A restricted-spend type phrase names the *set* of objects the
+        // mana may be spent on. Both connectives — " or " and " and " — enumerate
+        // distinct acceptable types, so each is an alternative the object need
+        // only satisfy one of. Per the Melek, Izzet Paragon example (CR 601.3e),
+        // "instant and sorcery spells" (Tablet of Discovery, issue #1975) lets a
+        // spell that is an instant *or* a sorcery qualify; a single object is
+        // never required to carry both types. Whitespace within an alternative
+        // still ANDs (a compound single quality like "Colorless Eldrazi" must
+        // match every word).
+        required
+            .split(" or ")
+            .flat_map(|clause| clause.split(" and "))
+            .any(|alternative| {
+                alternative.split_whitespace().all(|part| {
+                    qualities
+                        .iter()
+                        .any(|quality| quality.eq_ignore_ascii_case(part))
+                })
             })
-        })
     }
 
     /// Returns `true` if this restriction permits spending mana on the given spell.
     pub fn allows_spell(&self, meta: &SpellMeta) -> bool {
         match self {
             ManaRestriction::OnlyForSpell => true,
-            ManaRestriction::OnlyForSpellType(required_type) => {
-                Self::matches_required_quality(required_type, meta.types.iter())
-            }
+            // CR 106.6: Oracle type phrases in spend restrictions name both core
+            // types (Creature, Instant, …) and subtypes (Ninja, Turtle, …). Consult
+            // both buckets uniformly, same as `OnlyForTypeSpellsOrAbilities`.
+            ManaRestriction::OnlyForSpellType(required_type) => Self::matches_required_quality(
+                required_type,
+                meta.types.iter().chain(meta.subtypes.iter()),
+            ),
             ManaRestriction::OnlyForCreatureType(required_subtype) => {
                 // Must be a creature spell AND have the required subtype
                 let is_creature = meta
@@ -333,22 +633,31 @@ impl ManaRestriction {
                     .any(|s| s.eq_ignore_ascii_case(required_subtype));
                 is_creature && has_subtype
             }
+            // CR 106.6 + CR 903.3: Relational commander-subtype filter. `SpellMeta`
+            // carries no commander context, so this restriction can never
+            // independently authorize a spend here — it returns `false` and the
+            // authoritative relational evaluation (comparing the spell's creature
+            // subtypes against the controller's commander's creature types) is done
+            // at the `apply_mana_spell_grants` call site, which has `&GameState`.
+            // Mirrors the deferral contract of `OnlyForXCosts`.
+            ManaRestriction::SharesCreatureTypeWithCommander => false,
             // CR 106.6: The spell-casting half of the OR — allows if the spell has the
             // required type, consulting both core card types (Creature, Instant, ...)
             // and subtypes (Elemental, Goblin, ...). Flamebraider's "Elemental" names
             // a creature subtype; "Artifact" would name a core type. The check treats
             // both buckets uniformly because Oracle text doesn't distinguish the two.
-            ManaRestriction::OnlyForTypeSpellsOrAbilities(required_type) => {
+            ManaRestriction::OnlyForTypeSpellsOrAbilities { spell_type, .. } => {
                 Self::matches_required_quality(
-                    required_type,
+                    spell_type,
                     meta.types.iter().chain(meta.subtypes.iter()),
                 )
             }
             // Activation-only mana cannot be used to cast spells.
             ManaRestriction::OnlyForActivation => false,
-            // CR 106.6: X-cost restriction — conservatively disallow for spells.
-            // Full X-cost detection requires ManaCost inspection at the call site.
-            ManaRestriction::OnlyForXCosts => false,
+            // CR 106.6: Tag-scoped activation mana cannot be used to cast spells.
+            ManaRestriction::OnlyForTaggedActivation(_) => false,
+            // CR 106.6: X-cost restriction — spell must have {X} in its mana cost.
+            ManaRestriction::OnlyForXCosts => meta.has_x_in_cost,
             ManaRestriction::OnlyForSpellWithKeywordKind(required_keyword) => {
                 meta.keyword_kinds.contains(required_keyword)
             }
@@ -359,6 +668,66 @@ impl ManaRestriction {
                 meta.keyword_kinds.contains(required_keyword)
                     && meta.cast_from_zone == Some(*required_zone)
             }
+            // CR 106.6: Mana-value-gated spend. Mirrors the cast-permission
+            // mana-value check in game::casting
+            // (`comparator.evaluate(obj.mana_cost.mana_value() as i32, value)`).
+            // A spell with no known mana value (None) is not eligible.
+            ManaRestriction::OnlyForSpellWithManaValue { comparator, value } => meta
+                .mana_value
+                .is_some_and(|mv| comparator.evaluate(mv as i32, *value as i32)),
+            // CR 106.6 + CR 107.3 + CR 202.3: Disjunctive cost-criteria spend.
+            // The spell must satisfy the optional type narrowing AND at least one
+            // listed criterion ("MV ≥ N" OR "has {X} in cost"). An empty criteria
+            // set never authorizes a spend (no criterion can be satisfied).
+            ManaRestriction::OnlyForSpellMatchingCostCriteria {
+                spell_type,
+                criteria,
+            } => {
+                let type_ok = spell_type.as_deref().is_none_or(|required| {
+                    Self::matches_required_quality(
+                        required,
+                        meta.types.iter().chain(meta.subtypes.iter()),
+                    )
+                });
+                type_ok && criteria.iter().any(|c| c.matches(meta))
+            }
+            // CR 105.2: Color-count-gated spend. Colorless spells have a color
+            // count of 0. A spell with no recorded color count (None) is ineligible.
+            ManaRestriction::OnlyForSpellWithColorCount { comparator, count } => meta
+                .color_count
+                .is_some_and(|cc| comparator.evaluate(cc as i32, *count as i32)),
+            // CR 106.6 + CR 400.7: zone-gated spend. `From` requires the spell be
+            // cast from the named zone; `NotFrom` requires it be cast from any
+            // zone *except* the named one (e.g. "from anywhere other than your
+            // hand"). A spell with no recorded cast-from zone satisfies neither
+            // reading (conservative — `None == Some(zone)` is false for `From`,
+            // and `NotFrom` treats unknown origin as ineligible).
+            ManaRestriction::OnlyForSpellFromZone(zs) => match zs.polarity {
+                ZoneSpendPolarity::From => meta.cast_from_zone == Some(zs.zone),
+                ZoneSpendPolarity::NotFrom => meta
+                    .cast_from_zone
+                    .is_some_and(|cast_from| cast_from != zs.zone),
+            },
+            // CR 708.4: Face-down-spell-gated spend. The eligibility predicate is
+            // `meta.is_face_down` — a spell qualifies only when it is being CAST
+            // face down (morph/disguise/cloak); normal face-up casts are
+            // ineligible. `is_face_down` is sourced from the cast's face-down
+            // intent (`build_spell_meta`), not from `obj.face_down`, so this arm
+            // correctly REJECTS both normal face-up casts AND exile-concealment
+            // casts (foretell/hideaway, CR 702.143c) whose `obj.face_down = true`
+            // but which are cast face up. It is also fail-closed: no production
+            // payment site casts a spell face down (`GameAction::PlayFaceDown` →
+            // `game::morph::play_face_down` enters the battlefield via the zone
+            // pipeline and charges no mana), so `is_face_down` is never `true` at a
+            // real `PaymentContext::Spell` site and the gate never over-permits. It
+            // already reads `meta.is_face_down`, so the day a real face-down CAST
+            // routes its `{3}` cost through `PaymentContext::Spell` with that flag
+            // set, the gate becomes live with no change here. See the variant doc.
+            ManaRestriction::OnlyForFaceDownSpell => meta.is_face_down,
+            // CR 106.6: Disjunction — the spell is payable if it satisfies any branch.
+            ManaRestriction::OnlyForAny(subs) => subs.iter().any(|r| r.allows_spell(meta)),
+            // CR 116.2: Special-action-only mana never pays for a spell cast.
+            ManaRestriction::OnlyForSpecialAction(_) => false,
             ManaRestriction::ConvokePayment => true,
         }
     }
@@ -367,24 +736,53 @@ impl ManaRestriction {
     /// on a permanent whose core types include `source_types` and subtypes include
     /// `source_subtypes`.
     /// CR 106.6: Used for "or activate abilities of creatures" restrictions.
-    pub fn allows_activation(&self, source_types: &[String], source_subtypes: &[String]) -> bool {
+    pub fn allows_activation(
+        &self,
+        source_types: &[String],
+        source_subtypes: &[String],
+        ability_tag: Option<AbilityTag>,
+    ) -> bool {
         match self {
             // Spell-only restrictions don't permit ability activation.
             ManaRestriction::OnlyForSpell
             | ManaRestriction::OnlyForSpellType(_)
             | ManaRestriction::OnlyForCreatureType(_)
+            | ManaRestriction::SharesCreatureTypeWithCommander
             | ManaRestriction::OnlyForSpellWithKeywordKind(_)
-            | ManaRestriction::OnlyForSpellWithKeywordKindFromZone(_, _) => false,
-            // CR 106.6: The ability-activation half of the OR. "Elemental sources"
-            // includes objects with creature type Elemental — consult subtypes too.
-            ManaRestriction::OnlyForTypeSpellsOrAbilities(required_type) => {
-                Self::matches_required_quality(
-                    required_type,
+            | ManaRestriction::OnlyForSpellWithKeywordKindFromZone(_, _)
+            | ManaRestriction::OnlyForSpellWithManaValue { .. }
+            | ManaRestriction::OnlyForSpellMatchingCostCriteria { .. }
+            | ManaRestriction::OnlyForSpellWithColorCount { .. }
+            | ManaRestriction::OnlyForSpellFromZone(_)
+            // CR 708.4: Face-down-spell-only mana never pays for ability activation.
+            | ManaRestriction::OnlyForFaceDownSpell
+            // CR 116.2: Special-action-only mana never pays for ability activation.
+            | ManaRestriction::OnlyForSpecialAction(_) => false,
+            // CR 106.6: The ability-activation half of the OR. `OfSpellType`
+            // restricts to abilities of permanents whose type matches the
+            // restriction ("Elemental sources" includes creature type Elemental —
+            // consult subtypes too); `Any` permits any ability activation.
+            ManaRestriction::OnlyForTypeSpellsOrAbilities {
+                spell_type,
+                ability,
+            } => match ability {
+                AbilityActivationScope::OfSpellType => Self::matches_required_quality(
+                    spell_type,
                     source_types.iter().chain(source_subtypes.iter()),
-                )
-            }
+                ),
+                AbilityActivationScope::Any => true,
+            },
             // Activation-only mana always allows ability activation.
             ManaRestriction::OnlyForActivation => true,
+            // CR 106.6: Tag-scoped mana — payable only for an activation whose
+            // ability carries the matching keyword tag (Quinjet → power-up).
+            ManaRestriction::OnlyForTaggedActivation(required_tag) => {
+                ability_tag == Some(*required_tag)
+            }
+            // CR 106.6: Disjunction — the activation is payable if any branch allows it.
+            ManaRestriction::OnlyForAny(subs) => subs
+                .iter()
+                .any(|r| r.allows_activation(source_types, source_subtypes, ability_tag)),
             // X-cost mana can be used for abilities with {X} in their cost.
             // TODO: Check if the ability has {X} in its cost once that data is available.
             ManaRestriction::OnlyForXCosts | ManaRestriction::ConvokePayment => false,
@@ -401,8 +799,29 @@ impl ManaRestriction {
             PaymentContext::Activation {
                 source_types,
                 source_subtypes,
-            } => self.allows_activation(source_types, source_subtypes),
+                ability_tag,
+            } => self.allows_activation(source_types, source_subtypes, *ability_tag),
             PaymentContext::Effect => false,
+            // CR 116.2: A special-action payment is permitted only by mana that
+            // is restricted to that exact special-action class, or by a
+            // disjunction that contains such a branch. Spell/activation/generic
+            // effect restrictions all reject it.
+            PaymentContext::SpecialAction(action) => self.allows_special_action(*action),
+        }
+    }
+
+    /// CR 106.6 + CR 116.2: Returns `true` if this restriction permits spending
+    /// mana on the given special action (e.g. a Room door unlock). Only
+    /// [`ManaRestriction::OnlyForSpecialAction`] with a matching action — or a
+    /// disjunction containing one — qualifies; every spell/activation/effect
+    /// restriction rejects special actions.
+    pub fn allows_special_action(&self, action: SpecialAction) -> bool {
+        match self {
+            ManaRestriction::OnlyForSpecialAction(allowed) => *allowed == action,
+            ManaRestriction::OnlyForAny(subs) => {
+                subs.iter().any(|r| r.allows_special_action(action))
+            }
+            _ => false,
         }
     }
 }
@@ -420,6 +839,17 @@ pub enum ManaSpellGrant {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         restriction: Option<ManaRestriction>,
     },
+    /// CR 106.6 + CR 603.3: "When you spend this mana to cast a [filter] spell,
+    /// [effect]" — a reflexive trigger riding the produced mana (Lapis Orb of
+    /// Dragonkind, Scaled Nurturer, Gilanra). When the mana is spent on a spell
+    /// satisfying `restriction` (`None` = any spell), the controller's `ability`
+    /// is put on the stack as a triggered ability. The ability's source is the
+    /// permanent that produced the mana.
+    TriggerOnSpend {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        restriction: Option<ManaRestriction>,
+        ability: Box<crate::types::ability::AbilityDefinition>,
+    },
 }
 
 /// When mana expires — controls lifecycle beyond the normal CR 106.4 step/phase drain.
@@ -433,11 +863,56 @@ pub enum ManaExpiry {
     EndOfCombat,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// CR 205.4g: Supertype carried by produced mana (Snow today; extensible).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ManaSupertype {
+    Snow,
+}
+
+/// Serde adapter for legacy `snow: bool` on `ManaUnit`.
+pub mod snow_compat {
+    use super::ManaSupertype;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(
+        supertype: &Option<ManaSupertype>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.serialize_bool(matches!(supertype, Some(ManaSupertype::Snow)))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<ManaSupertype>, D::Error> {
+        let snow = bool::deserialize(deserializer)?;
+        Ok(if snow {
+            Some(ManaSupertype::Snow)
+        } else {
+            None
+        })
+    }
+}
+
+/// Stable per-unit identity for an individual mana pip in a player's pool.
+///
+/// Minted by `GameState::next_pip_id` when mana enters a real pool so that a
+/// player can direct (pin) which specific unit pays a pending cost. The sentinel
+/// `ManaPipId(0)` marks an unstamped unit (convoke markers, detached preview
+/// pools) and never matches a real pin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ManaPipId(pub u64);
+
+#[derive(Debug, Clone, Eq, Serialize, Deserialize)]
 pub struct ManaUnit {
     pub color: ManaType,
     pub source_id: ObjectId,
-    pub snow: bool,
+    /// CR 118.3a: stable identity used to direct which pool unit pays a cost.
+    /// `ManaPipId(0)` = unstamped sentinel (set by constructors; stamped on pool
+    /// entry by `GameState::add_mana_to_pool`).
+    #[serde(default = "unstamped_pip_id")]
+    pub pip_id: ManaPipId,
+    #[serde(default, with = "snow_compat", rename = "snow")]
+    pub supertype: Option<ManaSupertype>,
     /// True when this unit was produced by a source that could produce two or
     /// more colors of mana. Used by the Universes Beyond `{Z}` cost symbol.
     #[serde(default, skip_serializing_if = "is_false")]
@@ -452,6 +927,27 @@ pub struct ManaUnit {
     pub expiry: Option<ManaExpiry>,
 }
 
+// CR 104.4b: `pip_id` is a runtime/UI identity tag (the pin key used to direct
+// which pool unit pays a cost), NOT a game-state-semantic property. It must not
+// participate in `ManaUnit` value-equality, otherwise two pool units that differ
+// only by their monotonic pip_id would compare unequal and break game-state
+// equality — defeating CR 104.4b mandatory-loop detection (a loop that floats
+// mana each iteration would never compare equal) and AI-search state dedup.
+// `Eq` is derived (it only requires `PartialEq` to exist); ignoring one field
+// keeps the relation reflexive/symmetric/transitive.
+impl PartialEq for ManaUnit {
+    fn eq(&self, other: &Self) -> bool {
+        self.color == other.color
+            && self.source_id == other.source_id
+            && self.supertype == other.supertype
+            && self.source_could_produce_two_or_more_colors
+                == other.source_could_produce_two_or_more_colors
+            && self.restrictions == other.restrictions
+            && self.grants == other.grants
+            && self.expiry == other.expiry
+    }
+}
+
 impl ManaUnit {
     /// Construct a standard mana unit with no expiry.
     pub fn new(
@@ -463,7 +959,8 @@ impl ManaUnit {
         Self {
             color,
             source_id,
-            snow,
+            pip_id: ManaPipId(0),
+            supertype: snow.then_some(ManaSupertype::Snow),
             source_could_produce_two_or_more_colors: false,
             restrictions,
             grants: Vec::new(),
@@ -474,11 +971,16 @@ impl ManaUnit {
     /// Construct a convoke payment marker. This is intentionally not mana
     /// production; it exists only so the shared mana-payment algorithm can
     /// consume a tap as satisfying the selected shard.
+    pub fn is_snow(&self) -> bool {
+        matches!(self.supertype, Some(ManaSupertype::Snow))
+    }
+
     pub fn convoke_payment(color: ManaType, source_id: ObjectId) -> Self {
         Self {
             color,
             source_id,
-            snow: false,
+            pip_id: ManaPipId(0),
+            supertype: None,
             source_could_produce_two_or_more_colors: false,
             restrictions: vec![ManaRestriction::ConvokePayment],
             grants: Vec::new(),
@@ -735,6 +1237,21 @@ pub enum ManaCost {
     },
     /// The card's own mana cost (used for "the flashback cost is equal to its mana cost").
     SelfManaCost,
+    /// The card's own mana value (CR 202.3), as generic mana only — used for
+    /// "encore {X}, where X is its mana value" (Sliver Gravemother class).
+    SelfManaValue,
+    /// The card's own mana cost reduced by `reduction` generic mana — used for
+    /// granted alt-cost keywords whose cost is "its mana cost reduced by {N}"
+    /// (Dream Devourer foretell = MV−2, Aminatou miracle = MV−4).
+    ///
+    /// INVARIANT: this is a pre-resolution placeholder like `SelfManaCost` /
+    /// `SelfManaValue`; it MUST be concretized by `resolve_keyword_mana_cost`
+    /// (game/keywords.rs) into a concrete `Cost` before any arithmetic path
+    /// (`plus` / `scaled` / `concretize_x`) — it never reaches them unresolved.
+    /// CR 601.2f: reduction floors at {0} and only the generic component is reduced.
+    SelfManaCostReduced {
+        reduction: u32,
+    },
 }
 
 impl ManaCost {
@@ -742,6 +1259,31 @@ impl ManaCost {
         ManaCost::Cost {
             shards: Vec::new(),
             generic: 0,
+        }
+    }
+
+    /// CR 118.9a: Whether this mana cost represents casting without paying mana
+    /// (`NoCost`, or a zero `{0}` cost from `ExileWithAltCost` grants).
+    pub fn is_without_paying_mana(&self) -> bool {
+        match self {
+            ManaCost::NoCost => true,
+            ManaCost::Cost { shards, generic } => shards.is_empty() && *generic == 0,
+            ManaCost::SelfManaCost
+            | ManaCost::SelfManaValue
+            | ManaCost::SelfManaCostReduced { .. } => false,
+        }
+    }
+
+    /// CR 601.2f: reduce ONLY the generic component, saturating at 0; colored/
+    /// hybrid/X pips (shards) untouched. An alternative cost's mana component
+    /// can't be reduced below {0}.
+    pub fn reduced_by_generic(&self, reduction: u32) -> ManaCost {
+        match self {
+            ManaCost::Cost { shards, generic } => ManaCost::Cost {
+                shards: shards.clone(),
+                generic: generic.saturating_sub(reduction),
+            },
+            other => other.clone(),
         }
     }
 
@@ -758,12 +1300,93 @@ impl ManaCost {
     /// CR 202.3f: For hybrid symbols, use the largest component.
     pub fn mana_value(&self) -> u32 {
         match self {
-            ManaCost::NoCost | ManaCost::SelfManaCost => 0,
+            ManaCost::NoCost
+            | ManaCost::SelfManaCost
+            | ManaCost::SelfManaValue
+            | ManaCost::SelfManaCostReduced { .. } => 0,
             ManaCost::Cost { shards, generic } => {
                 let shard_total: u32 = shards.iter().map(|s| s.mana_value_contribution()).sum();
                 shard_total + generic
             }
         }
+    }
+
+    /// CR 702.143 (foretell-cost reduction) / CR 118.7: return this cost with its
+    /// generic component reduced by `reduction`'s mana value (floored at 0),
+    /// colored pips preserved. "Its foretell cost is equal to its mana cost
+    /// reduced by {2}" applied to `{4}{U}{U}` yields `{2}{U}{U}`; `{U}` yields
+    /// `{U}`; `{1}` reduced by `{2}` yields `{0}`. `NoCost` / `SelfManaCost` /
+    /// `SelfManaValue` return `self` unchanged defensively — a recipient's printed
+    /// cost is always a concrete `Cost`.
+    pub fn reduced_generic_by(&self, reduction: &ManaCost) -> ManaCost {
+        match self {
+            ManaCost::Cost { shards, generic } => ManaCost::Cost {
+                shards: shards.clone(),
+                generic: generic.saturating_sub(reduction.mana_value()),
+            },
+            ManaCost::NoCost
+            | ManaCost::SelfManaCost
+            | ManaCost::SelfManaValue
+            | ManaCost::SelfManaCostReduced { .. } => self.clone(),
+        }
+    }
+
+    /// CR 107.3 + CR 202.3e: Whether this printed mana cost contains an `{X}`
+    /// symbol. Independent of mana value (X contributes 0 to mana value off the
+    /// stack per CR 202.3e), so "has {X} in its cost" must be detected from the
+    /// shards directly — it is a structural property of the cost, not of its
+    /// mana value. Consulted by spend restrictions whose Oracle text reads
+    /// "spells with {X} in their mana costs" (Helga, Skittish Seer; Troyan,
+    /// Gutsy Explorer).
+    pub fn has_x(&self) -> bool {
+        match self {
+            ManaCost::NoCost
+            | ManaCost::SelfManaCost
+            | ManaCost::SelfManaValue
+            | ManaCost::SelfManaCostReduced { .. } => false,
+            ManaCost::Cost { shards, .. } => shards.iter().any(|s| matches!(s, ManaCostShard::X)),
+        }
+    }
+
+    /// CR 107.4 + CR 202.1: Count colored mana symbols in this mana cost.
+    /// `Some(c)` counts symbols contributing to color `c` (hybrid /
+    /// monocolored-hybrid / Phyrexian symbols included via
+    /// `ManaCostShard::contributes_to`). `None` counts each colored shard once
+    /// regardless of color — CR 107.4a/107.4e/107.4f: a hybrid or Phyrexian
+    /// symbol is a single colored mana symbol even though it is all of its
+    /// component colors, so `{G/W}{G/W}` counts as 2 (not 4). Generic, X,
+    /// colorless, and snow shards are not colored and never count.
+    /// `NoCost`/`SelfManaCost`/`SelfManaValue` have no per-shard cost → 0.
+    ///
+    /// Single counting authority shared by `QuantityRef::ManaSymbolsInManaCost`
+    /// (game/quantity.rs) and `FilterProp::ManaSymbolCount` (game/filter.rs).
+    pub fn count_colored_pips(&self, color: Option<ManaColor>) -> i32 {
+        match self {
+            ManaCost::Cost { shards, .. } => {
+                let count = shards
+                    .iter()
+                    .filter(|shard| match color {
+                        Some(c) => shard.contributes_to(c),
+                        None => ManaColor::ALL.iter().any(|c| shard.contributes_to(*c)),
+                    })
+                    .count();
+                i32::try_from(count).unwrap_or(i32::MAX)
+            }
+            ManaCost::NoCost
+            | ManaCost::SelfManaCost
+            | ManaCost::SelfManaValue
+            | ManaCost::SelfManaCostReduced { .. } => 0,
+        }
+    }
+
+    /// CR 202.3e: X in a mana cost equals the announced value only while the
+    /// object is on the stack; in every other zone, X contributes 0.
+    pub fn mana_value_with_x(&self, zone: Zone, cost_x_paid: Option<u32>) -> u32 {
+        self.mana_value()
+            + match zone {
+                Zone::Stack => cost_x_paid.unwrap_or(0),
+                _ => 0,
+            }
     }
 
     /// CR 508.1h + CR 509.1d: Aggregate this cost with another cost, producing a
@@ -869,6 +1492,12 @@ fn is_zero_u32(n: &u32) -> bool {
 
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+/// Serde default for `ManaUnit::pip_id`: legacy saves and freshly built units
+/// carry the unstamped sentinel until pool entry stamps a real id.
+fn unstamped_pip_id() -> ManaPipId {
+    ManaPipId(0)
 }
 
 impl ColoredManaCount {
@@ -1072,11 +1701,13 @@ pub fn apply_empty_mana_pool_decisions(
     // Descending pool_index order preserves index validity across removes.
     let mut sorted: Vec<&UnitDecision> = units.iter().collect();
     sorted.sort_by_key(|d| std::cmp::Reverse(d.pool_index));
+    let mut changed = false;
     for decision in sorted {
         match decision.disposition {
             UnitDisposition::Drop => {
                 if decision.pool_index < player.mana_pool.mana.len() {
                     let removed = player.mana_pool.mana.remove(decision.pool_index);
+                    changed = true;
                     events.push(GameEvent::ManaPoolEmptied {
                         player_id,
                         source_id: removed.source_id,
@@ -1089,6 +1720,7 @@ pub fn apply_empty_mana_pool_decisions(
                 if let Some(unit) = player.mana_pool.mana.get_mut(decision.pool_index) {
                     let from = unit.color;
                     unit.color = to;
+                    changed = true;
                     events.push(GameEvent::ManaRecolored {
                         player_id,
                         from,
@@ -1098,11 +1730,52 @@ pub fn apply_empty_mana_pool_decisions(
             }
         }
     }
+    if changed {
+        state.layers_dirty.mark_full();
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CR 702.143: `reduced_generic_by` reduces only the generic component,
+    /// preserving colored pips and flooring at 0.
+    #[test]
+    fn reduced_generic_by_reduces_generic_and_preserves_pips() {
+        // {4}{U}{U} - {2} = {2}{U}{U}
+        let base = ManaCost::Cost {
+            shards: vec![ManaCostShard::Blue; 2],
+            generic: 4,
+        };
+        let reduced = base.reduced_generic_by(&ManaCost::generic(2));
+        assert_eq!(
+            reduced,
+            ManaCost::Cost {
+                shards: vec![ManaCostShard::Blue; 2],
+                generic: 2,
+            }
+        );
+
+        // {U} - {2} = {U} (no generic to reduce)
+        let mono = ManaCost::Cost {
+            shards: vec![ManaCostShard::Blue],
+            generic: 0,
+        };
+        assert_eq!(mono.reduced_generic_by(&ManaCost::generic(2)), mono);
+
+        // {1} - {2} = {0} (floored)
+        assert_eq!(
+            ManaCost::generic(1).reduced_generic_by(&ManaCost::generic(2)),
+            ManaCost::generic(0)
+        );
+
+        // Non-Cost variants return self unchanged.
+        assert_eq!(
+            ManaCost::NoCost.reduced_generic_by(&ManaCost::generic(2)),
+            ManaCost::NoCost
+        );
+    }
 
     fn make_unit(color: ManaType) -> ManaUnit {
         ManaUnit::new(color, ObjectId(1), false, Vec::new())
@@ -1272,7 +1945,7 @@ mod tests {
             vec![ManaRestriction::OnlyForSpellType("Creature".to_string())],
         );
         assert_eq!(unit.source_id, ObjectId(42));
-        assert!(unit.snow);
+        assert!(unit.is_snow());
         assert_eq!(unit.restrictions.len(), 1);
     }
 
@@ -1293,18 +1966,30 @@ mod tests {
             subtypes: vec!["Elf".to_string()],
             keyword_kinds: vec![],
             cast_from_zone: None,
+            mana_value: None,
+            color_count: None,
+            has_x_in_cost: false,
+            is_face_down: false,
         };
         let instant_spell = SpellMeta {
             types: vec!["Instant".to_string()],
             subtypes: vec![],
             keyword_kinds: vec![],
             cast_from_zone: None,
+            mana_value: None,
+            color_count: None,
+            has_x_in_cost: false,
+            is_face_down: false,
         };
         let legendary_spell = SpellMeta {
             types: vec!["Legendary".to_string(), "Creature".to_string()],
             subtypes: vec![],
             keyword_kinds: vec![],
             cast_from_zone: None,
+            mana_value: None,
+            color_count: None,
+            has_x_in_cost: false,
+            is_face_down: false,
         };
         assert!(restriction.allows_spell(&creature_spell));
         assert!(!restriction.allows_spell(&instant_spell));
@@ -1312,6 +1997,117 @@ mod tests {
         let legendary_restriction = ManaRestriction::OnlyForSpellType("Legendary".to_string());
         assert!(legendary_restriction.allows_spell(&legendary_spell));
         assert!(!legendary_restriction.allows_spell(&creature_spell));
+    }
+
+    // CR 106.6: A disjunctive restriction allows a spell if it satisfies ANY
+    // inner branch (Maelstrom of the Spirit Dragon: Dragon spell OR Omen spell).
+    #[test]
+    fn restriction_only_for_any_allows_spell_matching_a_branch() {
+        let restriction = ManaRestriction::OnlyForAny(vec![
+            ManaRestriction::OnlyForSpellType("Dragon".to_string()),
+            ManaRestriction::OnlyForSpellType("Omen".to_string()),
+        ]);
+        let dragon_spell = SpellMeta {
+            types: vec!["Creature".to_string()],
+            subtypes: vec!["Dragon".to_string()],
+            keyword_kinds: vec![],
+            cast_from_zone: None,
+            mana_value: None,
+            color_count: None,
+            has_x_in_cost: false,
+            is_face_down: false,
+        };
+        let omen_spell = SpellMeta {
+            types: vec!["Enchantment".to_string(), "Omen".to_string()],
+            subtypes: vec![],
+            keyword_kinds: vec![],
+            cast_from_zone: None,
+            mana_value: None,
+            color_count: None,
+            has_x_in_cost: false,
+            is_face_down: false,
+        };
+        let goblin_spell = SpellMeta {
+            types: vec!["Creature".to_string()],
+            subtypes: vec!["Goblin".to_string()],
+            keyword_kinds: vec![],
+            cast_from_zone: None,
+            mana_value: None,
+            color_count: None,
+            has_x_in_cost: false,
+            is_face_down: false,
+        };
+        // Matches one branch each.
+        assert!(restriction.allows_spell(&dragon_spell));
+        assert!(restriction.allows_spell(&omen_spell));
+        // Matches no branch.
+        assert!(!restriction.allows_spell(&goblin_spell));
+    }
+
+    // CR 106.6: A disjunction allows an activation if any branch's activation
+    // half allows it (e.g. "… or to activate an ability of an Assassin source").
+    #[test]
+    fn restriction_only_for_any_allows_activation_via_branch() {
+        let restriction = ManaRestriction::OnlyForAny(vec![
+            ManaRestriction::OnlyForSpellType("Assassin".to_string()),
+            ManaRestriction::OnlyForTypeSpellsOrAbilities {
+                spell_type: "Assassin".to_string(),
+                ability: AbilityActivationScope::OfSpellType,
+            },
+        ]);
+        // An Assassin source's ability is allowed via the second branch.
+        assert!(restriction.allows_activation(
+            &["Creature".to_string()],
+            &["Assassin".to_string()],
+            None
+        ));
+        // A non-Assassin source's ability is allowed by no branch.
+        assert!(!restriction.allows_activation(
+            &["Creature".to_string()],
+            &["Goblin".to_string()],
+            None
+        ));
+    }
+
+    // CR 106.6: "Spend this mana only to cast Ninja spells" (Turtle Lair, issue
+    // #3661) names a creature subtype. The restriction must match against
+    // `SpellMeta.subtypes`, not only core types.
+    #[test]
+    fn restriction_spell_type_allows_subtype_spell() {
+        let restriction = ManaRestriction::OnlyForSpellType("Ninja".to_string());
+        let ninja_creature = SpellMeta {
+            types: vec!["Creature".to_string()],
+            subtypes: vec!["Ninja".to_string(), "Turtle".to_string()],
+            keyword_kinds: vec![],
+            cast_from_zone: None,
+            mana_value: None,
+            color_count: None,
+            has_x_in_cost: false,
+            is_face_down: false,
+        };
+        let turtle_creature = SpellMeta {
+            types: vec!["Creature".to_string()],
+            subtypes: vec!["Turtle".to_string()],
+            keyword_kinds: vec![],
+            cast_from_zone: None,
+            mana_value: None,
+            color_count: None,
+            has_x_in_cost: false,
+            is_face_down: false,
+        };
+        let goblin_creature = SpellMeta {
+            types: vec!["Creature".to_string()],
+            subtypes: vec!["Goblin".to_string()],
+            keyword_kinds: vec![],
+            cast_from_zone: None,
+            mana_value: None,
+            color_count: None,
+            has_x_in_cost: false,
+            is_face_down: false,
+        };
+        assert!(restriction.allows_spell(&ninja_creature));
+        assert!(!restriction.allows_spell(&turtle_creature));
+        assert!(!restriction.allows_spell(&goblin_creature));
     }
 
     #[test]
@@ -1322,6 +2118,10 @@ mod tests {
             subtypes: vec![],
             keyword_kinds: vec![],
             cast_from_zone: None,
+            mana_value: None,
+            color_count: None,
+            has_x_in_cost: false,
+            is_face_down: false,
         };
         let source_types = vec!["Artifact".to_string()];
         let source_subtypes = Vec::new();
@@ -1330,6 +2130,7 @@ mod tests {
         assert!(!restriction.allows(&PaymentContext::Activation {
             source_types: &source_types,
             source_subtypes: &source_subtypes,
+            ability_tag: None,
         }));
         assert!(!restriction.allows(&PaymentContext::Effect));
     }
@@ -1342,22 +2143,58 @@ mod tests {
             subtypes: vec!["Elf".to_string(), "Warrior".to_string()],
             keyword_kinds: vec![],
             cast_from_zone: None,
+            mana_value: None,
+            color_count: None,
+            has_x_in_cost: false,
+            is_face_down: false,
         };
         let goblin_creature = SpellMeta {
             types: vec!["Creature".to_string()],
             subtypes: vec!["Goblin".to_string()],
             keyword_kinds: vec![],
             cast_from_zone: None,
+            mana_value: None,
+            color_count: None,
+            has_x_in_cost: false,
+            is_face_down: false,
         };
         let elf_instant = SpellMeta {
             types: vec!["Instant".to_string()],
             subtypes: vec!["Elf".to_string()],
             keyword_kinds: vec![],
             cast_from_zone: None,
+            mana_value: None,
+            color_count: None,
+            has_x_in_cost: false,
+            is_face_down: false,
         };
         assert!(restriction.allows_spell(&elf_creature));
         assert!(!restriction.allows_spell(&goblin_creature));
         assert!(!restriction.allows_spell(&elf_instant));
+    }
+
+    #[test]
+    fn shares_creature_type_with_commander_defers_to_call_site() {
+        // CR 106.6 + CR 903.3: The relational commander-subtype filter carries no
+        // commander context in `SpellMeta`, so `allows_spell`/`allows_activation`
+        // must return `false` for every payment context. The authoritative
+        // relational evaluation happens at the `apply_mana_spell_grants` spend
+        // site (game-state aware). This documents the deferral contract.
+        let restriction = ManaRestriction::SharesCreatureTypeWithCommander;
+        let elf_creature = SpellMeta {
+            types: vec!["Creature".to_string()],
+            subtypes: vec!["Elf".to_string()],
+            keyword_kinds: vec![],
+            cast_from_zone: None,
+            mana_value: None,
+            color_count: None,
+            has_x_in_cost: false,
+            is_face_down: false,
+        };
+        assert!(!restriction.allows_spell(&elf_creature));
+        let source_types = vec!["Creature".to_string()];
+        let source_subtypes = vec!["Elf".to_string()];
+        assert!(!restriction.allows_activation(&source_types, &source_subtypes, None));
     }
 
     #[test]
@@ -1376,6 +2213,10 @@ mod tests {
             subtypes: vec!["Elf".to_string()],
             keyword_kinds: vec![],
             cast_from_zone: None,
+            mana_value: None,
+            color_count: None,
+            has_x_in_cost: false,
+            is_face_down: false,
         };
         let spent = pool
             .spend_for(ManaType::Green, &PaymentContext::Spell(&spell))
@@ -1399,6 +2240,10 @@ mod tests {
             subtypes: vec!["Elf".to_string()],
             keyword_kinds: vec![],
             cast_from_zone: None,
+            mana_value: None,
+            color_count: None,
+            has_x_in_cost: false,
+            is_face_down: false,
         };
         assert!(pool
             .spend_for(ManaType::Green, &PaymentContext::Spell(&elf_spell))
@@ -1456,6 +2301,10 @@ mod tests {
             subtypes: vec!["Goblin".to_string()],
             keyword_kinds: vec![],
             cast_from_zone: None,
+            mana_value: None,
+            color_count: None,
+            has_x_in_cost: false,
+            is_face_down: false,
         };
         assert!(pool
             .spend_for(ManaType::Green, &PaymentContext::Spell(&goblin_spell))
@@ -1468,30 +2317,49 @@ mod tests {
     // must match against both core types and subtypes on `SpellMeta`.
     #[test]
     fn restriction_type_or_ability_allows_subtype_creature_spell() {
-        let restriction = ManaRestriction::OnlyForTypeSpellsOrAbilities("Elemental".to_string());
+        let restriction = ManaRestriction::OnlyForTypeSpellsOrAbilities {
+            spell_type: "Elemental".to_string(),
+            ability: AbilityActivationScope::OfSpellType,
+        };
         let elemental_creature = SpellMeta {
             types: vec!["Creature".to_string()],
             subtypes: vec!["Elemental".to_string()],
             keyword_kinds: vec![],
             cast_from_zone: None,
+            mana_value: None,
+            color_count: None,
+            has_x_in_cost: false,
+            is_face_down: false,
         };
         let tribal_elemental_instant = SpellMeta {
             types: vec!["Tribal".to_string(), "Instant".to_string()],
             subtypes: vec!["Elemental".to_string()],
             keyword_kinds: vec![],
             cast_from_zone: None,
+            mana_value: None,
+            color_count: None,
+            has_x_in_cost: false,
+            is_face_down: false,
         };
         let goblin_creature = SpellMeta {
             types: vec!["Creature".to_string()],
             subtypes: vec!["Goblin".to_string()],
             keyword_kinds: vec![],
             cast_from_zone: None,
+            mana_value: None,
+            color_count: None,
+            has_x_in_cost: false,
+            is_face_down: false,
         };
         let plain_instant = SpellMeta {
             types: vec!["Instant".to_string()],
             subtypes: vec![],
             keyword_kinds: vec![],
             cast_from_zone: None,
+            mana_value: None,
+            color_count: None,
+            has_x_in_cost: false,
+            is_face_down: false,
         };
         assert!(restriction.allows_spell(&elemental_creature));
         assert!(restriction.allows_spell(&tribal_elemental_instant));
@@ -1503,25 +2371,39 @@ mod tests {
     // Both the colorless quality and Eldrazi subtype must be true.
     #[test]
     fn restriction_type_or_ability_requires_all_compound_spell_qualities() {
-        let restriction =
-            ManaRestriction::OnlyForTypeSpellsOrAbilities("Colorless Eldrazi".to_string());
+        let restriction = ManaRestriction::OnlyForTypeSpellsOrAbilities {
+            spell_type: "Colorless Eldrazi".to_string(),
+            ability: AbilityActivationScope::OfSpellType,
+        };
         let colorless_eldrazi = SpellMeta {
             types: vec!["Creature".to_string(), "Colorless".to_string()],
             subtypes: vec!["Eldrazi".to_string()],
             keyword_kinds: vec![],
             cast_from_zone: None,
+            mana_value: None,
+            color_count: None,
+            has_x_in_cost: false,
+            is_face_down: false,
         };
         let colored_eldrazi = SpellMeta {
             types: vec!["Creature".to_string()],
             subtypes: vec!["Eldrazi".to_string()],
             keyword_kinds: vec![],
             cast_from_zone: None,
+            mana_value: None,
+            color_count: None,
+            has_x_in_cost: false,
+            is_face_down: false,
         };
         let colorless_construct = SpellMeta {
             types: vec!["Artifact".to_string(), "Colorless".to_string()],
             subtypes: vec!["Construct".to_string()],
             keyword_kinds: vec![],
             cast_from_zone: None,
+            mana_value: None,
+            color_count: None,
+            has_x_in_cost: false,
+            is_face_down: false,
         };
         assert!(restriction.allows_spell(&colorless_eldrazi));
         assert!(!restriction.allows_spell(&colored_eldrazi));
@@ -1532,36 +2414,175 @@ mod tests {
     // source whose subtypes include "Elemental"; activation must be permitted.
     #[test]
     fn restriction_type_or_ability_allows_subtype_activation() {
-        let restriction = ManaRestriction::OnlyForTypeSpellsOrAbilities("Elemental".to_string());
+        let restriction = ManaRestriction::OnlyForTypeSpellsOrAbilities {
+            spell_type: "Elemental".to_string(),
+            ability: AbilityActivationScope::OfSpellType,
+        };
         let elemental_creature_types = vec!["Creature".to_string()];
         let elemental_subtypes = vec!["Elemental".to_string(), "Shaman".to_string()];
-        assert!(restriction.allows_activation(&elemental_creature_types, &elemental_subtypes));
+        assert!(restriction.allows_activation(
+            &elemental_creature_types,
+            &elemental_subtypes,
+            None
+        ));
 
         let goblin_subtypes = vec!["Goblin".to_string()];
-        assert!(!restriction.allows_activation(&elemental_creature_types, &goblin_subtypes));
+        assert!(!restriction.allows_activation(&elemental_creature_types, &goblin_subtypes, None));
 
         // Core-type match also satisfies the check (e.g., "Artifact sources").
-        let artifact_restriction =
-            ManaRestriction::OnlyForTypeSpellsOrAbilities("Artifact".to_string());
+        let artifact_restriction = ManaRestriction::OnlyForTypeSpellsOrAbilities {
+            spell_type: "Artifact".to_string(),
+            ability: AbilityActivationScope::OfSpellType,
+        };
         let artifact_types = vec!["Artifact".to_string()];
         let no_subtypes: Vec<String> = vec![];
-        assert!(artifact_restriction.allows_activation(&artifact_types, &no_subtypes));
+        assert!(artifact_restriction.allows_activation(&artifact_types, &no_subtypes, None));
+    }
+
+    // CR 106.6: `AbilityActivationScope::Any` — "cast a colorless spell or to
+    // activate an ability" (Sage of the Unknowable). The spell half stays
+    // type-gated, while the ability half permits *any* activation regardless of
+    // the source's types.
+    #[test]
+    fn restriction_type_or_any_ability_gates_spell_but_allows_any_activation() {
+        let restriction = ManaRestriction::OnlyForTypeSpellsOrAbilities {
+            spell_type: "Colorless".to_string(),
+            ability: AbilityActivationScope::Any,
+        };
+        let colorless_spell = SpellMeta {
+            types: vec!["Artifact".to_string(), "Colorless".to_string()],
+            subtypes: vec![],
+            keyword_kinds: vec![],
+            cast_from_zone: None,
+            mana_value: None,
+            color_count: None,
+            has_x_in_cost: false,
+            is_face_down: false,
+        };
+        let colored_spell = SpellMeta {
+            types: vec!["Creature".to_string()],
+            subtypes: vec![],
+            keyword_kinds: vec![],
+            cast_from_zone: None,
+            mana_value: None,
+            color_count: None,
+            has_x_in_cost: false,
+            is_face_down: false,
+        };
+        // Spell half: still gated to the named type.
+        assert!(restriction.allows_spell(&colorless_spell));
+        assert!(!restriction.allows_spell(&colored_spell));
+        // Ability half: any activation is permitted, regardless of source type.
+        assert!(restriction.allows_activation(&["Goblin".to_string()], &[], None));
+        assert!(restriction.allows_activation(
+            &["Land".to_string()],
+            &["Forest".to_string()],
+            None
+        ));
+    }
+
+    // CR 106.6: Hydraulic Helper — "{T}: Add {U}. This mana can't be spent to
+    // cast a nonartifact spell." The negative phrasing lowers to
+    // `OnlyForTypeSpellsOrAbilities { spell_type: "Artifact", ability: Any }`:
+    // the produced {U} may pay for an artifact spell but not for any nonartifact
+    // spell (here, an instant), while leaving EVERY ability activation payable.
+    // This is the runtime half of the discriminating coverage — it exercises the
+    // single-authority `allows` dispatch (`allows_spell` for spells,
+    // `allows_activation` for abilities) every engine spend path funnels through.
+    // The discriminating assertion is the activation check: the buggy
+    // `OnlyForSpellType("Artifact")` lowering returns `false` from
+    // `allows_activation`, wrongly forbidding ability payment.
+    #[test]
+    fn hydraulic_helper_artifact_mana_casts_artifacts_and_pays_any_ability() {
+        let restriction = ManaRestriction::OnlyForTypeSpellsOrAbilities {
+            spell_type: "Artifact".to_string(),
+            ability: AbilityActivationScope::Any,
+        };
+        let artifact_spell = SpellMeta {
+            types: vec!["Artifact".to_string()],
+            subtypes: vec!["Equipment".to_string()],
+            keyword_kinds: vec![],
+            cast_from_zone: None,
+            mana_value: None,
+            color_count: None,
+            has_x_in_cost: false,
+            is_face_down: false,
+        };
+        let artifact_creature_spell = SpellMeta {
+            types: vec!["Artifact".to_string(), "Creature".to_string()],
+            subtypes: vec!["Golem".to_string()],
+            keyword_kinds: vec![],
+            cast_from_zone: None,
+            mana_value: None,
+            color_count: None,
+            has_x_in_cost: false,
+            is_face_down: false,
+        };
+        let instant_spell = SpellMeta {
+            types: vec!["Instant".to_string()],
+            subtypes: vec![],
+            keyword_kinds: vec![],
+            cast_from_zone: None,
+            mana_value: None,
+            color_count: None,
+            has_x_in_cost: false,
+            is_face_down: false,
+        };
+        let creature_spell = SpellMeta {
+            types: vec!["Creature".to_string()],
+            subtypes: vec!["Human".to_string()],
+            keyword_kinds: vec![],
+            cast_from_zone: None,
+            mana_value: None,
+            color_count: None,
+            has_x_in_cost: false,
+            is_face_down: false,
+        };
+        // Permitted: any artifact spell (incl. artifact creatures).
+        assert!(restriction.allows(&PaymentContext::Spell(&artifact_spell)));
+        assert!(restriction.allows(&PaymentContext::Spell(&artifact_creature_spell)));
+        // Rejected: nonartifact spells.
+        assert!(!restriction.allows(&PaymentContext::Spell(&instant_spell)));
+        assert!(!restriction.allows(&PaymentContext::Spell(&creature_spell)));
+        // DISCRIMINATING: ability activation stays unrestricted regardless of the
+        // source's types — the restriction governs only what spells may be cast.
+        assert!(restriction.allows(&PaymentContext::Activation {
+            source_types: &["Creature".to_string()],
+            source_subtypes: &["Human".to_string()],
+            ability_tag: None,
+        }));
+        assert!(restriction.allows(&PaymentContext::Activation {
+            source_types: &["Land".to_string()],
+            source_subtypes: &[],
+            ability_tag: None,
+        }));
     }
 
     #[test]
     fn restriction_artifact_spell_or_activation_uses_both_payment_contexts() {
-        let restriction = ManaRestriction::OnlyForTypeSpellsOrAbilities("Artifact".to_string());
+        let restriction = ManaRestriction::OnlyForTypeSpellsOrAbilities {
+            spell_type: "Artifact".to_string(),
+            ability: AbilityActivationScope::OfSpellType,
+        };
         let artifact_spell = SpellMeta {
             types: vec!["Artifact".to_string()],
             subtypes: vec![],
             keyword_kinds: vec![],
             cast_from_zone: None,
+            mana_value: None,
+            color_count: None,
+            has_x_in_cost: false,
+            is_face_down: false,
         };
         let creature_spell = SpellMeta {
             types: vec!["Creature".to_string()],
             subtypes: vec![],
             keyword_kinds: vec![],
             cast_from_zone: None,
+            mana_value: None,
+            color_count: None,
+            has_x_in_cost: false,
+            is_face_down: false,
         };
         let artifact_types = vec!["Artifact".to_string()];
         let creature_types = vec!["Creature".to_string()];
@@ -1572,29 +2593,172 @@ mod tests {
         assert!(restriction.allows(&PaymentContext::Activation {
             source_types: &artifact_types,
             source_subtypes: &no_subtypes,
+            ability_tag: None,
         }));
         assert!(!restriction.allows(&PaymentContext::Activation {
             source_types: &creature_types,
             source_subtypes: &no_subtypes,
+            ability_tag: None,
         }));
         assert!(!restriction.allows(&PaymentContext::Effect));
+    }
+
+    // CR 708.4: "Spend this mana only to cast face-down spells" (Tin Street
+    // Gossip). The restriction permits a face-down cast and rejects a normal
+    // face-up cast, ability activation, generic effects, and special actions.
+    #[test]
+    fn restriction_face_down_spell_only_allows_face_down_cast() {
+        let restriction = ManaRestriction::OnlyForFaceDownSpell;
+        let face_down_spell = SpellMeta {
+            // CR 708.2a: a face-down spell is a typeless 2/2; what matters here
+            // is the is_face_down flag, not the (cleared) type list.
+            types: vec!["Creature".to_string()],
+            is_face_down: true,
+            ..SpellMeta::default()
+        };
+        let face_up_spell = SpellMeta {
+            types: vec!["Creature".to_string()],
+            is_face_down: false,
+            ..SpellMeta::default()
+        };
+        // LEGAL: spending the mana on a face-down cast.
+        assert!(restriction.allows(&PaymentContext::Spell(&face_down_spell)));
+        // ILLEGAL: a normal face-up cast.
+        assert!(!restriction.allows(&PaymentContext::Spell(&face_up_spell)));
+        // ILLEGAL: ability activation, generic effect, and special actions.
+        assert!(!restriction.allows(&PaymentContext::Activation {
+            source_types: &["Creature".to_string()],
+            source_subtypes: &[],
+            ability_tag: None,
+        }));
+        assert!(!restriction.allows(&PaymentContext::Effect));
+        assert!(!restriction.allows(&PaymentContext::SpecialAction(SpecialAction::UnlockDoor)));
+        assert!(!restriction.allows(&PaymentContext::SpecialAction(SpecialAction::TurnFaceUp)));
+    }
+
+    // CR 116.2b + CR 702.37e: "turn permanents face up" lowers to a
+    // TurnFaceUp special-action restriction. It accepts only the matching
+    // special action and rejects every spell cast / activation / effect.
+    #[test]
+    fn restriction_turn_face_up_special_action_gate() {
+        let restriction = ManaRestriction::OnlyForSpecialAction(SpecialAction::TurnFaceUp);
+        // Accepts the matching special action.
+        assert!(restriction.allows(&PaymentContext::SpecialAction(SpecialAction::TurnFaceUp)));
+        // Rejects the unrelated door-unlock special action.
+        assert!(!restriction.allows(&PaymentContext::SpecialAction(SpecialAction::UnlockDoor)));
+        // Rejects spell casts (face-down or not), activations, and effects.
+        let spell = SpellMeta {
+            types: vec!["Creature".to_string()],
+            is_face_down: true,
+            ..SpellMeta::default()
+        };
+        assert!(!restriction.allows(&PaymentContext::Spell(&spell)));
+        assert!(!restriction.allows(&PaymentContext::Activation {
+            source_types: &["Creature".to_string()],
+            source_subtypes: &[],
+            ability_tag: None,
+        }));
+        assert!(!restriction.allows(&PaymentContext::Effect));
+    }
+
+    // CR 106.6: Creeping Peeper's three-way disjunction
+    // `Any([SpellType("Enchantment"), OnlyForSpecialAction(UnlockDoor),
+    // OnlyForSpecialAction(TurnFaceUp)])` accepts an enchantment cast and the
+    // door-unlock special action, and rejects a non-enchantment cast — the
+    // disjunction routes each payment context to the correct branch.
+    #[test]
+    fn restriction_creeping_peeper_disjunction_routes_each_context() {
+        let restriction = ManaRestriction::OnlyForAny(vec![
+            ManaRestriction::OnlyForSpellType("Enchantment".to_string()),
+            ManaRestriction::OnlyForSpecialAction(SpecialAction::UnlockDoor),
+            ManaRestriction::OnlyForSpecialAction(SpecialAction::TurnFaceUp),
+        ]);
+        let enchantment = SpellMeta {
+            types: vec!["Enchantment".to_string()],
+            ..SpellMeta::default()
+        };
+        let creature = SpellMeta {
+            types: vec!["Creature".to_string()],
+            ..SpellMeta::default()
+        };
+        // LEGAL: enchantment cast (first branch).
+        assert!(restriction.allows(&PaymentContext::Spell(&enchantment)));
+        // LEGAL: door-unlock special action (second branch).
+        assert!(restriction.allows(&PaymentContext::SpecialAction(SpecialAction::UnlockDoor)));
+        // ILLEGAL: a non-enchantment (creature) cast satisfies no branch.
+        assert!(!restriction.allows(&PaymentContext::Spell(&creature)));
+    }
+
+    // CR 106.6 + CR 601.2g: "Spend this mana only to cast instant and sorcery
+    // spells" (Tablet of Discovery, issue #1975) names a union of two distinct
+    // spell types. Per the Melek, Izzet Paragon example (CR 601.3e), an "instant
+    // and sorcery spells" permission lets a player cast a spell that is an
+    // instant OR a sorcery — a single spell never needs to be both. The "and"
+    // conjunction therefore distributes across the set of acceptable spells, the
+    // same way " or " does, rather than requiring one spell to carry both types.
+    #[test]
+    fn restriction_instant_and_sorcery_allows_either_type() {
+        let restriction = ManaRestriction::OnlyForTypeSpellsOrAbilities {
+            spell_type: "Instant and Sorcery".to_string(),
+            ability: AbilityActivationScope::OfSpellType,
+        };
+        let instant = SpellMeta {
+            types: vec!["Instant".to_string()],
+            subtypes: vec![],
+            keyword_kinds: vec![],
+            cast_from_zone: None,
+            mana_value: None,
+            color_count: None,
+            has_x_in_cost: false,
+            is_face_down: false,
+        };
+        let sorcery = SpellMeta {
+            types: vec!["Sorcery".to_string()],
+            subtypes: vec![],
+            keyword_kinds: vec![],
+            cast_from_zone: None,
+            mana_value: None,
+            color_count: None,
+            has_x_in_cost: false,
+            is_face_down: false,
+        };
+        let creature = SpellMeta {
+            types: vec!["Creature".to_string()],
+            subtypes: vec![],
+            keyword_kinds: vec![],
+            cast_from_zone: None,
+            mana_value: None,
+            color_count: None,
+            has_x_in_cost: false,
+            is_face_down: false,
+        };
+        // Manamorphose is an instant — the {R}{R} restricted mana must pay for it.
+        assert!(restriction.allows_spell(&instant));
+        assert!(restriction.allows_spell(&sorcery));
+        assert!(!restriction.allows_spell(&creature));
     }
 
     // CR 105.2c + CR 106.6: The activation half uses the same compound-quality
     // predicate as spell casting.
     #[test]
     fn restriction_type_or_ability_requires_all_compound_activation_qualities() {
-        let restriction =
-            ManaRestriction::OnlyForTypeSpellsOrAbilities("Colorless Eldrazi".to_string());
+        let restriction = ManaRestriction::OnlyForTypeSpellsOrAbilities {
+            spell_type: "Colorless Eldrazi".to_string(),
+            ability: AbilityActivationScope::OfSpellType,
+        };
         let colorless_creature_types = vec!["Creature".to_string(), "Colorless".to_string()];
         let eldrazi_subtypes = vec!["Eldrazi".to_string()];
-        assert!(restriction.allows_activation(&colorless_creature_types, &eldrazi_subtypes));
+        assert!(restriction.allows_activation(&colorless_creature_types, &eldrazi_subtypes, None));
 
         let colored_creature_types = vec!["Creature".to_string()];
-        assert!(!restriction.allows_activation(&colored_creature_types, &eldrazi_subtypes));
+        assert!(!restriction.allows_activation(&colored_creature_types, &eldrazi_subtypes, None));
 
         let construct_subtypes = vec!["Construct".to_string()];
-        assert!(!restriction.allows_activation(&colorless_creature_types, &construct_subtypes));
+        assert!(!restriction.allows_activation(
+            &colorless_creature_types,
+            &construct_subtypes,
+            None
+        ));
     }
 
     #[test]
@@ -1605,15 +2769,340 @@ mod tests {
             subtypes: vec![],
             keyword_kinds: vec![KeywordKind::Flashback],
             cast_from_zone: None,
+            mana_value: None,
+            color_count: None,
+            has_x_in_cost: false,
+            is_face_down: false,
         };
         let normal_spell = SpellMeta {
             types: vec!["Instant".to_string()],
             subtypes: vec![],
             keyword_kinds: vec![],
             cast_from_zone: None,
+            mana_value: None,
+            color_count: None,
+            has_x_in_cost: false,
+            is_face_down: false,
         };
         assert!(restriction.allows_spell(&flashback_spell));
         assert!(!restriction.allows_spell(&normal_spell));
+    }
+
+    // CR 106.6 + CR 202.3: "Spend this mana only to cast spells with mana value
+    // N or greater" — the GE half of the parameterized mana-value gate.
+    #[test]
+    fn restriction_allows_spell_with_mana_value_ge_threshold() {
+        let restriction = ManaRestriction::OnlyForSpellWithManaValue {
+            comparator: Comparator::GE,
+            value: 5,
+        };
+        let mv_six = SpellMeta {
+            mana_value: Some(6),
+            color_count: None,
+            has_x_in_cost: false,
+            is_face_down: false,
+            ..SpellMeta::default()
+        };
+        let mv_four = SpellMeta {
+            mana_value: Some(4),
+            color_count: None,
+            has_x_in_cost: false,
+            is_face_down: false,
+            ..SpellMeta::default()
+        };
+        let no_mv = SpellMeta::default();
+        assert!(restriction.allows_spell(&mv_six));
+        assert!(!restriction.allows_spell(&mv_four));
+        // A spell with no known mana value is not eligible.
+        assert!(!restriction.allows_spell(&no_mv));
+    }
+
+    // CR 106.6 + CR 202.3: the LE half of the parameterized mana-value gate
+    // ("mana value N or less").
+    #[test]
+    fn restriction_allows_spell_with_mana_value_le_threshold() {
+        let restriction = ManaRestriction::OnlyForSpellWithManaValue {
+            comparator: Comparator::LE,
+            value: 3,
+        };
+        let mv_two = SpellMeta {
+            mana_value: Some(2),
+            color_count: None,
+            has_x_in_cost: false,
+            is_face_down: false,
+            ..SpellMeta::default()
+        };
+        let mv_four = SpellMeta {
+            mana_value: Some(4),
+            color_count: None,
+            has_x_in_cost: false,
+            is_face_down: false,
+            ..SpellMeta::default()
+        };
+        assert!(restriction.allows_spell(&mv_two));
+        assert!(!restriction.allows_spell(&mv_four));
+    }
+
+    #[test]
+    fn spend_for_enforces_mana_value_restriction() {
+        let mut pool = ManaPool::default();
+        pool.add(make_restricted_unit(
+            ManaType::Green,
+            ObjectId(1),
+            vec![ManaRestriction::OnlyForSpellWithManaValue {
+                comparator: Comparator::GE,
+                value: 5,
+            }],
+        ));
+
+        let mv_four = SpellMeta {
+            mana_value: Some(4),
+            color_count: None,
+            has_x_in_cost: false,
+            is_face_down: false,
+            ..SpellMeta::default()
+        };
+        assert!(pool
+            .spend_for(ManaType::Green, &PaymentContext::Spell(&mv_four))
+            .is_none());
+        assert_eq!(pool.total(), 1);
+
+        let mv_five = SpellMeta {
+            mana_value: Some(5),
+            color_count: None,
+            has_x_in_cost: false,
+            is_face_down: false,
+            ..SpellMeta::default()
+        };
+        assert!(pool
+            .spend_for(ManaType::Green, &PaymentContext::Spell(&mv_five))
+            .is_some());
+        assert_eq!(pool.total(), 0);
+    }
+
+    // CR 106.6: a mana-value gate names spell casting, so it rejects ability
+    // activation regardless of comparator.
+    #[test]
+    fn restriction_mana_value_rejects_activation() {
+        let restriction = ManaRestriction::OnlyForSpellWithManaValue {
+            comparator: Comparator::GE,
+            value: 5,
+        };
+        let source_types = vec!["Creature".to_string()];
+        let source_subtypes: Vec<String> = vec![];
+        assert!(!restriction.allows_activation(&source_types, &source_subtypes, None));
+    }
+
+    // CR 105.2 + CR 106.6: "Spend this mana only to cast spells with exactly N
+    // colors" — the EQ reading of the parameterized color-count gate. A spell
+    // with no recorded color count (None) is ineligible.
+    #[test]
+    fn restriction_allows_spell_with_color_count_eq() {
+        let restriction = ManaRestriction::OnlyForSpellWithColorCount {
+            comparator: Comparator::EQ,
+            count: 3,
+        };
+        let three_colors = SpellMeta {
+            color_count: Some(3),
+            has_x_in_cost: false,
+            is_face_down: false,
+            ..SpellMeta::default()
+        };
+        let two_colors = SpellMeta {
+            color_count: Some(2),
+            has_x_in_cost: false,
+            is_face_down: false,
+            ..SpellMeta::default()
+        };
+        assert!(restriction.allows_spell(&three_colors));
+        assert!(!restriction.allows_spell(&two_colors));
+        // No recorded color count → ineligible.
+        assert!(!restriction.allows_spell(&SpellMeta::default()));
+        // CR 105.2: a color-count gate names spell casting, so it rejects ability
+        // activation.
+        assert!(!restriction.allows_activation(&["Creature".to_string()], &[], None));
+    }
+
+    // CR 105.2: colorless spells have a color count of 0, so "exactly 0 colors"
+    // matches colorless spells and rejects colored ones.
+    #[test]
+    fn restriction_allows_spell_with_color_count_colorless() {
+        let restriction = ManaRestriction::OnlyForSpellWithColorCount {
+            comparator: Comparator::EQ,
+            count: 0,
+        };
+        let colorless = SpellMeta {
+            color_count: Some(0),
+            has_x_in_cost: false,
+            is_face_down: false,
+            ..SpellMeta::default()
+        };
+        let one_color = SpellMeta {
+            color_count: Some(1),
+            has_x_in_cost: false,
+            is_face_down: false,
+            ..SpellMeta::default()
+        };
+        assert!(restriction.allows_spell(&colorless));
+        assert!(!restriction.allows_spell(&one_color));
+    }
+
+    // CR 105.2 + CR 106.6: range comparators share the same color-count gate as
+    // exact matching.
+    #[test]
+    fn restriction_allows_spell_with_color_count_ranges() {
+        let two_or_more = ManaRestriction::OnlyForSpellWithColorCount {
+            comparator: Comparator::GE,
+            count: 2,
+        };
+        let two_or_fewer = ManaRestriction::OnlyForSpellWithColorCount {
+            comparator: Comparator::LE,
+            count: 2,
+        };
+        let three_colors = SpellMeta {
+            color_count: Some(3),
+            has_x_in_cost: false,
+            is_face_down: false,
+            ..SpellMeta::default()
+        };
+        let one_color = SpellMeta {
+            color_count: Some(1),
+            has_x_in_cost: false,
+            is_face_down: false,
+            ..SpellMeta::default()
+        };
+        assert!(two_or_more.allows_spell(&three_colors));
+        assert!(!two_or_more.allows_spell(&one_color));
+        assert!(two_or_fewer.allows_spell(&one_color));
+        assert!(!two_or_fewer.allows_spell(&three_colors));
+    }
+
+    #[test]
+    fn spend_for_enforces_color_count_restriction() {
+        let mut pool = ManaPool::default();
+        pool.add(make_restricted_unit(
+            ManaType::Green,
+            ObjectId(1),
+            vec![ManaRestriction::OnlyForSpellWithColorCount {
+                comparator: Comparator::GE,
+                count: 2,
+            }],
+        ));
+
+        let one_color = SpellMeta {
+            color_count: Some(1),
+            has_x_in_cost: false,
+            is_face_down: false,
+            ..SpellMeta::default()
+        };
+        assert!(pool
+            .spend_for(ManaType::Green, &PaymentContext::Spell(&one_color))
+            .is_none());
+        assert_eq!(pool.total(), 1);
+
+        let two_colors = SpellMeta {
+            color_count: Some(2),
+            has_x_in_cost: false,
+            is_face_down: false,
+            ..SpellMeta::default()
+        };
+        assert!(pool
+            .spend_for(ManaType::Green, &PaymentContext::Spell(&two_colors))
+            .is_some());
+        assert_eq!(pool.total(), 0);
+    }
+
+    // CR 106.6 + CR 400.7: zone-gated spend allows only spells cast from the
+    // named zone; a different zone or an unknown (None) origin is ineligible,
+    // and the restriction never permits ability activation.
+    #[test]
+    fn restriction_allows_spell_from_zone() {
+        let restriction = ManaRestriction::OnlyForSpellFromZone(ZoneSpend {
+            zone: Zone::Graveyard,
+            polarity: ZoneSpendPolarity::From,
+        });
+        let from_gy = SpellMeta {
+            cast_from_zone: Some(Zone::Graveyard),
+            ..SpellMeta::default()
+        };
+        let from_exile = SpellMeta {
+            cast_from_zone: Some(Zone::Exile),
+            ..SpellMeta::default()
+        };
+        assert!(restriction.allows_spell(&from_gy));
+        assert!(!restriction.allows_spell(&from_exile));
+        // No recorded cast-from zone → ineligible.
+        assert!(!restriction.allows_spell(&SpellMeta::default()));
+        // Zone-gated spend is spell-casting only.
+        assert!(!restriction.allows_activation(&["Creature".to_string()], &[], None));
+    }
+
+    // CR 106.6 + CR 400.7: the `NotFrom` polarity (Mm'menon, the Right Hand —
+    // "from anywhere other than your hand") allows any cast-from zone except the
+    // named one, and treats an unknown origin as ineligible.
+    #[test]
+    fn restriction_allows_spell_not_from_zone() {
+        let restriction = ManaRestriction::OnlyForSpellFromZone(ZoneSpend {
+            zone: Zone::Hand,
+            polarity: ZoneSpendPolarity::NotFrom,
+        });
+        let from_hand = SpellMeta {
+            cast_from_zone: Some(Zone::Hand),
+            ..SpellMeta::default()
+        };
+        let from_gy = SpellMeta {
+            cast_from_zone: Some(Zone::Graveyard),
+            ..SpellMeta::default()
+        };
+        // Cast from hand → forbidden; cast from any other zone → allowed.
+        assert!(!restriction.allows_spell(&from_hand));
+        assert!(restriction.allows_spell(&from_gy));
+        // No recorded cast-from zone → ineligible (conservative).
+        assert!(!restriction.allows_spell(&SpellMeta::default()));
+        // Still spell-casting only — never permits ability activation.
+        assert!(!restriction.allows_activation(&["Creature".to_string()], &[], None));
+    }
+
+    // CR 106.6 + CR 400.7: backward-compat for the zone-spend restriction. The
+    // pre-polarity serialized form was a bare-string externally-tagged payload
+    // (`{"OnlyForSpellFromZone":"Graveyard"}`); the custom `ZoneSpend`
+    // deserializer must still accept it and map it to the inclusion (`From`)
+    // reading, while the current `{zone, polarity}` form round-trips. This test
+    // fails against a struct-variant encoding — serde cannot deserialize a bare
+    // string into a struct variant — so it discriminates the newtype+ZoneSpend
+    // backward-compat fix from the struct-variant regression it replaces.
+    #[test]
+    fn zone_spend_restriction_legacy_and_current_serde() {
+        // Legacy bare-`Zone` payload (no `polarity` field existed yet).
+        let legacy: ManaRestriction =
+            serde_json::from_str(r#"{"OnlyForSpellFromZone":"Graveyard"}"#).unwrap();
+        assert_eq!(
+            legacy,
+            ManaRestriction::OnlyForSpellFromZone(ZoneSpend {
+                zone: Zone::Graveyard,
+                polarity: ZoneSpendPolarity::From,
+            })
+        );
+
+        // Current `{zone, polarity}` object form with explicit NotFrom round-trips.
+        let current = ManaRestriction::OnlyForSpellFromZone(ZoneSpend {
+            zone: Zone::Hand,
+            polarity: ZoneSpendPolarity::NotFrom,
+        });
+        let json = serde_json::to_string(&current).unwrap();
+        let round_tripped: ManaRestriction = serde_json::from_str(&json).unwrap();
+        assert_eq!(current, round_tripped);
+
+        // Current object form omitting `polarity` defaults to the inclusion reading.
+        let defaulted: ManaRestriction =
+            serde_json::from_str(r#"{"OnlyForSpellFromZone":{"zone":"Exile"}}"#).unwrap();
+        assert_eq!(
+            defaulted,
+            ManaRestriction::OnlyForSpellFromZone(ZoneSpend {
+                zone: Zone::Exile,
+                polarity: ZoneSpendPolarity::From,
+            })
+        );
     }
 
     #[test]
@@ -1656,12 +3145,38 @@ mod tests {
 
     #[test]
     fn mana_value_x_contributes_zero() {
-        // CR 202.3e: {X}{R} → 0 + 1 = 1
+        // CR 202.3e: {X}{R} → 0 + 1 = 1 (off-stack, X=0)
         let cost = ManaCost::Cost {
             shards: vec![ManaCostShard::X, ManaCostShard::Red],
             generic: 0,
         };
         assert_eq!(cost.mana_value(), 1);
+    }
+
+    #[test]
+    fn mana_value_with_x_includes_chosen_value() {
+        // CR 202.3e: {X}{R}{R} cast with X=4 → 4 + 1 + 1 = 6 while on the stack.
+        let cost = ManaCost::Cost {
+            shards: vec![ManaCostShard::X, ManaCostShard::Red, ManaCostShard::Red],
+            generic: 0,
+        };
+        assert_eq!(cost.mana_value_with_x(Zone::Stack, Some(4)), 6);
+        assert_eq!(cost.mana_value_with_x(Zone::Stack, None), 2);
+        assert_eq!(cost.mana_value_with_x(Zone::Stack, Some(0)), 2);
+        assert_eq!(cost.mana_value_with_x(Zone::Battlefield, Some(4)), 2);
+    }
+
+    #[test]
+    fn mana_value_with_x_no_x_shard_adds_x_paid() {
+        // On the stack, cost_x_paid is the announced X value even when the cost
+        // expression has no literal {X} shard.
+        let cost = ManaCost::Cost {
+            shards: vec![ManaCostShard::Red, ManaCostShard::Blue],
+            generic: 1,
+        };
+        assert_eq!(cost.mana_value_with_x(Zone::Stack, Some(5)), 8); // 1R+1U+1 generic = 3, +5 = 8
+        assert_eq!(cost.mana_value_with_x(Zone::Stack, None), 3);
+        assert_eq!(cost.mana_value_with_x(Zone::Graveyard, Some(5)), 3);
     }
 
     #[test]
@@ -1697,5 +3212,77 @@ mod tests {
         let mut colorless_only = ColoredManaCount::default();
         colorless_only.add_unit(&ManaUnit::new(ManaType::Colorless, source, false, vec![]));
         assert!(colorless_only.is_empty());
+    }
+
+    // CR 702.6a: Ronin, Shadow Stalker — the disjunction
+    // `OnlyForAny([OnlyForSpellType("Equipment"), OnlyForTaggedActivation(Equip)])`
+    // must allow equip-tagged activations and Equipment spell casting, but reject
+    // non-equip activated abilities on Equipment permanents.
+    #[test]
+    fn restriction_equip_tagged_allows_equip_activation() {
+        let restriction = ManaRestriction::OnlyForAny(vec![
+            ManaRestriction::OnlyForSpellType("Equipment".to_string()),
+            ManaRestriction::OnlyForTaggedActivation(AbilityTag::Equip),
+        ]);
+        // Equip-tagged activation on an Equipment source: ALLOWED.
+        assert!(restriction.allows_activation(
+            &["Artifact".to_string()],
+            &["Equipment".to_string()],
+            Some(AbilityTag::Equip),
+        ));
+    }
+
+    // CR 702.6a: Non-equip activated ability on an Equipment permanent must be
+    // REJECTED — the restriction is keyword-precise, not source-type-permissive.
+    #[test]
+    fn restriction_equip_tagged_rejects_non_equip_ability_on_equipment() {
+        let restriction = ManaRestriction::OnlyForAny(vec![
+            ManaRestriction::OnlyForSpellType("Equipment".to_string()),
+            ManaRestriction::OnlyForTaggedActivation(AbilityTag::Equip),
+        ]);
+        // Non-equip activation on an Equipment source: REJECTED.
+        assert!(!restriction.allows_activation(
+            &["Artifact".to_string()],
+            &["Equipment".to_string()],
+            None,
+        ));
+        // Non-equip activation with a different tag: also REJECTED.
+        assert!(!restriction.allows_activation(
+            &["Artifact".to_string()],
+            &["Equipment".to_string()],
+            Some(AbilityTag::Boast),
+        ));
+    }
+
+    // CR 702.6a: Equipment spell casting is still allowed by the spell-type branch.
+    #[test]
+    fn restriction_equip_tagged_allows_equipment_spell() {
+        let restriction = ManaRestriction::OnlyForAny(vec![
+            ManaRestriction::OnlyForSpellType("Equipment".to_string()),
+            ManaRestriction::OnlyForTaggedActivation(AbilityTag::Equip),
+        ]);
+        let equipment_spell = SpellMeta {
+            types: vec!["Artifact".to_string()],
+            subtypes: vec!["Equipment".to_string()],
+            keyword_kinds: vec![],
+            cast_from_zone: None,
+            mana_value: None,
+            color_count: None,
+            has_x_in_cost: false,
+            is_face_down: false,
+        };
+        assert!(restriction.allows_spell(&equipment_spell));
+        // Non-Equipment artifact spell: REJECTED.
+        let artifact_spell = SpellMeta {
+            types: vec!["Artifact".to_string()],
+            subtypes: vec![],
+            keyword_kinds: vec![],
+            cast_from_zone: None,
+            mana_value: None,
+            color_count: None,
+            has_x_in_cost: false,
+            is_face_down: false,
+        };
+        assert!(!restriction.allows_spell(&artifact_spell));
     }
 }

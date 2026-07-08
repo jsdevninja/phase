@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Trans, useTranslation } from "react-i18next";
 import type { TFunction } from "i18next";
 
@@ -6,8 +6,14 @@ import { audioManager } from "../../audio/AudioManager.ts";
 import { cacheThemeManifest, clearThemeCache } from "../../audio/audioCache.ts";
 import { BUILT_IN_THEMES, findManifest, validateThemeManifest } from "../../audio/themeRegistry.ts";
 import { PLANESWALKER_THEME } from "../../audio/planeswalkerTheme.ts";
-import { usePreferencesStore } from "../../stores/preferencesStore.ts";
+import {
+  CARD_PREVIEW_HOVER_DELAY_MAX,
+  CARD_PREVIEW_HOVER_DELAY_MIN,
+  CARD_PREVIEW_HOVER_DELAY_STEP,
+  usePreferencesStore,
+} from "../../stores/preferencesStore.ts";
 import { useMultiplayerStore } from "../../stores/multiplayerStore.ts";
+import { useUiStore } from "../../stores/uiStore.ts";
 import {
   ANIMATION_SPEED_DEFAULT,
   ANIMATION_SPEED_MAX,
@@ -23,14 +29,20 @@ import {
 } from "../../animation/types.ts";
 import type {
   ArtChainEntry,
+  CardPreviewMode,
   CardSizePreference,
+  CommandZoneDisplay,
   LogDefaultState,
+  MultiplayerBoardLayout,
+  ZoneCollapseMode,
 } from "../../stores/preferencesStore.ts";
 import type { SupportedLng } from "../../i18n/resources.ts";
 import { LanguageFlag } from "../ui/LanguageFlag.tsx";
 import { BATTLEFIELDS } from "../board/battlefields.ts";
 import { PLAIN_BACKGROUNDS } from "../board/plainBackgrounds.ts";
+import { ConfirmDialog } from "../ui/ConfirmDialog.tsx";
 import { ModalPanelShell } from "../ui/ModalPanelShell";
+import { MenuSelect } from "../ui/MenuSelect";
 import { downloadBackup, importBackupFromFile, type ImportMode } from "../../services/backup.ts";
 import { useCloudSyncStore } from "../../stores/cloudSyncStore.ts";
 import { DiscordIcon, GoogleIcon } from "../ui/ProviderIcons";
@@ -56,8 +68,12 @@ const LANGUAGE_OPTIONS: { value: SupportedLng; label: string }[] = [
 ];
 
 const CARD_SIZES: CardSizePreference[] = ["small", "medium", "large"];
+const COMMAND_ZONE_DISPLAYS: CommandZoneDisplay[] = ["auto", "inline", "compact"];
+const ZONE_COLLAPSE_MODES: ZoneCollapseMode[] = ["auto", "on", "off"];
+const CARD_PREVIEW_MODES: CardPreviewMode[] = ["follow", "side", "shift"];
 const LOG_DEFAULTS: LogDefaultState[] = ["open", "closed"];
 const VFX_QUALITIES: VfxQuality[] = ["full", "reduced", "minimal"];
+const MULTIPLAYER_BOARD_LAYOUTS: MultiplayerBoardLayout[] = ["focused", "split"];
 
 /** Format a speed value as a user-facing label. The slider goes 0→max where
  *  max = instant (skip animations). `0` = slowest, `1` = normal. The endpoint
@@ -111,12 +127,16 @@ const BOARD_BACKGROUND_GROUPS: BoardBackgroundGroup[] = [
   },
 ];
 
+const SETTINGS_MENU_CLASS =
+  "min-h-[44px] rounded-[14px] py-2 text-base sm:min-h-0 sm:text-sm";
+
 export function PreferencesModal({
   onClose,
   initialTab = "gameplay",
   highlight,
 }: PreferencesModalProps) {
   const { t } = useTranslation("settings");
+  const setFlexEditMode = useUiStore((s) => s.setFlexEditMode);
   const boardBackgroundRef = useRef<HTMLDivElement | null>(null);
   const [highlightFlash, setHighlightFlash] = useState(highlight === "board-background");
 
@@ -136,14 +156,22 @@ export function PreferencesModal({
   const language = usePreferencesStore((s) => s.language);
   const setLanguage = usePreferencesStore((s) => s.setLanguage);
   const cardSize = usePreferencesStore((s) => s.cardSize);
+  const commandZoneDisplay = usePreferencesStore((s) => s.commandZoneDisplay);
+  const collapseLands = usePreferencesStore((s) => s.collapseLands);
+  const collapseSupport = usePreferencesStore((s) => s.collapseSupport);
   const logDefaultState = usePreferencesStore((s) => s.logDefaultState);
+  const multiplayerBoardLayout = usePreferencesStore((s) => s.multiplayerBoardLayout);
   const spellPaymentMode = usePreferencesStore((s) => s.spellPaymentMode);
   const boardBackground = usePreferencesStore((s) => s.boardBackground);
   const vfxQuality = usePreferencesStore((s) => s.vfxQuality);
   const animationSpeedMultiplier = usePreferencesStore((s) => s.animationSpeedMultiplier);
   const pacingMultipliers = usePreferencesStore((s) => s.pacingMultipliers);
   const setCardSize = usePreferencesStore((s) => s.setCardSize);
+  const setCommandZoneDisplay = usePreferencesStore((s) => s.setCommandZoneDisplay);
+  const setCollapseLands = usePreferencesStore((s) => s.setCollapseLands);
+  const setCollapseSupport = usePreferencesStore((s) => s.setCollapseSupport);
   const setLogDefaultState = usePreferencesStore((s) => s.setLogDefaultState);
+  const setMultiplayerBoardLayout = usePreferencesStore((s) => s.setMultiplayerBoardLayout);
   const setSpellPaymentMode = usePreferencesStore((s) => s.setSpellPaymentMode);
   const setBoardBackground = usePreferencesStore((s) => s.setBoardBackground);
   const customBackgroundUrl = usePreferencesStore((s) => s.customBackgroundUrl);
@@ -165,6 +193,10 @@ export function PreferencesModal({
   const setShowKeywordStrip = usePreferencesStore((s) => s.setShowKeywordStrip);
   const battlefieldPeekOnHover = usePreferencesStore((s) => s.battlefieldPeekOnHover) ?? true;
   const setBattlefieldPeekOnHover = usePreferencesStore((s) => s.setBattlefieldPeekOnHover);
+  const cardPreviewMode = usePreferencesStore((s) => s.cardPreviewMode) ?? "follow";
+  const setCardPreviewMode = usePreferencesStore((s) => s.setCardPreviewMode);
+  const cardPreviewHoverDelayMs = usePreferencesStore((s) => s.cardPreviewHoverDelayMs) ?? 0;
+  const setCardPreviewHoverDelayMs = usePreferencesStore((s) => s.setCardPreviewHoverDelayMs);
   const artChain = usePreferencesStore((s) => s.artChain);
   const addArtChainEntry = usePreferencesStore((s) => s.addArtChainEntry);
   const removeArtChainEntry = usePreferencesStore((s) => s.removeArtChainEntry);
@@ -182,6 +214,42 @@ export function PreferencesModal({
   const [themeImportUrl, setThemeImportUrl] = useState("");
   const [themeImportStatus, setThemeImportStatus] = useState<"idle" | "loading" | "error">("idle");
   const [themeImportError, setThemeImportError] = useState("");
+
+  const boardBackgroundMenuGroups = useMemo(
+    () =>
+      BOARD_BACKGROUND_GROUPS.map((group) => ({
+        label: t(group.labelKey),
+        items: group.options.map((bg) => ({
+          value: bg.value,
+          label: bg.labelKey ? t(bg.labelKey) : (bg.label ?? bg.value),
+        })),
+      })),
+    [t],
+  );
+  const selectedBoardBackgroundLabel = useMemo(() => {
+    for (const group of boardBackgroundMenuGroups) {
+      const match = group.items.find((item) => item.value === boardBackground);
+      if (match) return match.label;
+    }
+    return boardBackground;
+  }, [boardBackground, boardBackgroundMenuGroups]);
+  const audioThemeItems = useMemo(
+    () => [
+      ...Object.values(BUILT_IN_THEMES).map((theme) => ({
+        value: theme.id,
+        label: theme.name,
+      })),
+      ...customThemeUrls.map((theme) => ({
+        value: theme.id,
+        label: theme.id,
+      })),
+    ],
+    [customThemeUrls],
+  );
+  const selectedAudioThemeLabel = useMemo(
+    () => audioThemeItems.find((item) => item.value === audioThemeId)?.label ?? audioThemeId,
+    [audioThemeId, audioThemeItems],
+  );
 
   const handleThemeChange = useCallback(async (id: string) => {
     setAudioThemeId(id);
@@ -234,26 +302,31 @@ export function PreferencesModal({
       subtitle={t("modal.subtitle")}
       onClose={onClose}
       maxWidthClassName="max-w-5xl"
-      bodyClassName="overflow-y-auto p-4 sm:p-6"
+      bodyClassName="flex min-h-0 flex-1 flex-col overflow-hidden pl-4 pt-4 pr-1.5 pb-8 sm:pl-6 sm:pt-6 sm:pr-2 sm:pb-10"
     >
-      <div className="grid gap-4 md:grid-cols-[200px_minmax(0,1fr)]">
-            <nav className="flex snap-x gap-2 overflow-x-auto pb-1 md:flex-col md:overflow-visible md:pb-0">
-              {SETTINGS_TABS.map((tab) => (
-                <button
-                  key={tab.id}
-                  onClick={() => setActiveTab(tab.id)}
-                  className={`min-h-11 shrink-0 snap-start rounded-[16px] border px-3 py-2.5 text-left text-[11px] font-semibold uppercase tracking-[0.16em] transition-colors md:w-full md:px-4 md:text-xs md:tracking-[0.18em] ${
-                    activeTab === tab.id
-                      ? "border-sky-400/60 bg-sky-500/14 text-sky-100"
-                      : "border-white/8 bg-black/20 text-slate-400 hover:border-white/14 hover:text-slate-100"
-                  }`}
-                >
-                  {t(`tabs.${tab.id}`)}
-                </button>
-              ))}
-            </nav>
+      <div className="flex min-h-0 flex-1 flex-col gap-4 md:min-h-[28rem] md:flex-row md:overflow-hidden">
+            <aside className="flex shrink-0 flex-col md:w-[200px] md:justify-between">
+              <nav className="flex snap-x gap-2 overflow-x-auto pb-1 md:flex-col md:overflow-visible md:pb-0">
+                {SETTINGS_TABS.map((tab) => (
+                  <button
+                    key={tab.id}
+                    onClick={() => setActiveTab(tab.id)}
+                    className={`min-h-11 shrink-0 snap-start rounded-[16px] border px-3 py-2.5 text-left text-[11px] font-semibold uppercase tracking-[0.16em] transition-colors md:w-full md:px-4 md:text-xs md:tracking-[0.18em] ${
+                      activeTab === tab.id
+                        ? "border-sky-400/60 bg-sky-500/14 text-sky-100"
+                        : "border-white/8 bg-black/20 text-slate-400 hover:border-white/14 hover:text-slate-100"
+                    }`}
+                  >
+                    {t(`tabs.${tab.id}`)}
+                  </button>
+                ))}
+              </nav>
+              <div className="hidden shrink-0 border-t border-white/5 pt-6 pb-8 md:block">
+                <ResetAllFooter resetAllPreferences={resetAllPreferences} />
+              </div>
+            </aside>
 
-            <div className="min-w-0">
+            <div className="thin-scrollbar flex min-h-0 min-w-0 flex-1 flex-col gap-4 overflow-y-auto pb-4 pr-3 md:pr-4">
               {activeTab === "gameplay" && (
                 <SettingsSection title={t("gameplay.title")}>
                   <SettingGroup label={t("gameplay.language")}>
@@ -290,6 +363,33 @@ export function PreferencesModal({
                     />
                   </SettingGroup>
 
+                  <SettingGroup label={t("gameplay.commandZone")}>
+                    <SegmentedControl
+                      options={COMMAND_ZONE_DISPLAYS}
+                      value={commandZoneDisplay}
+                      onChange={setCommandZoneDisplay}
+                      renderLabel={(opt) => t(`gameplay.commandZoneOptions.${opt}`)}
+                    />
+                  </SettingGroup>
+
+                  <SettingGroup label={t("gameplay.collapseLands")}>
+                    <SegmentedControl
+                      options={ZONE_COLLAPSE_MODES}
+                      value={collapseLands}
+                      onChange={setCollapseLands}
+                      renderLabel={(opt) => t(`gameplay.collapseZoneOptions.${opt}`)}
+                    />
+                  </SettingGroup>
+
+                  <SettingGroup label={t("gameplay.collapseSupport")}>
+                    <SegmentedControl
+                      options={ZONE_COLLAPSE_MODES}
+                      value={collapseSupport}
+                      onChange={setCollapseSupport}
+                      renderLabel={(opt) => t(`gameplay.collapseZoneOptions.${opt}`)}
+                    />
+                  </SettingGroup>
+
                   <SettingGroup label={t("gameplay.logDefault")}>
                     <SegmentedControl
                       options={LOG_DEFAULTS}
@@ -320,21 +420,16 @@ export function PreferencesModal({
                     }`}
                   >
                     <SettingGroup label={t("gameplay.boardBackground")}>
-                      <select
-                        value={boardBackground}
-                        onChange={(e) => setBoardBackground(e.target.value)}
-                        className="w-full rounded-[14px] border border-white/10 bg-black/18 px-3 py-2 text-sm text-slate-100 focus:border-sky-400/40 focus:outline-none"
-                      >
-                        {BOARD_BACKGROUND_GROUPS.map((group) => (
-                          <optgroup key={group.labelKey} label={t(group.labelKey)}>
-                            {group.options.map((bg) => (
-                              <option key={bg.value} value={bg.value}>
-                                {bg.labelKey ? t(bg.labelKey) : bg.label}
-                              </option>
-                            ))}
-                          </optgroup>
-                        ))}
-                      </select>
+                      <MenuSelect
+                        ariaLabel={t("gameplay.boardBackground")}
+                        label={selectedBoardBackgroundLabel}
+                        selectedValue={boardBackground}
+                        groups={boardBackgroundMenuGroups}
+                        onSelect={setBoardBackground}
+                        menuLayout="dropdown"
+                        wrapperClassName="w-full"
+                        className={SETTINGS_MENU_CLASS}
+                      />
                       {boardBackground === "custom" && (
                         <input
                           type="url"
@@ -384,6 +479,55 @@ export function PreferencesModal({
                     </label>
                   </SettingGroup>
 
+                  <SettingGroup label={t("visual.multiplayerBoardLayout")}>
+                    <SegmentedControl
+                      options={MULTIPLAYER_BOARD_LAYOUTS}
+                      value={multiplayerBoardLayout}
+                      onChange={setMultiplayerBoardLayout}
+                      renderLabel={(opt) => t(`visual.multiplayerBoardLayoutOptions.${opt}`)}
+                    />
+                  </SettingGroup>
+
+                  <SettingGroup label={t("visual.cardPreview")}>
+                    <SegmentedControl
+                      options={CARD_PREVIEW_MODES}
+                      value={cardPreviewMode}
+                      onChange={setCardPreviewMode}
+                      renderLabel={(opt) => t(`visual.cardPreviewOptions.${opt}`)}
+                    />
+                    <p className="mt-1.5 text-xs text-slate-400">
+                      {t(`visual.cardPreviewHint.${cardPreviewMode}`)}
+                    </p>
+                  </SettingGroup>
+
+                  {/* Hover latency only applies to the hover-driven modes; the
+                      "shift" bind-key mode is keypress-triggered, so the control
+                      is mutually exclusive with it and hidden in that mode. */}
+                  {cardPreviewMode !== "shift" && (
+                    <SettingGroup label={t("visual.cardPreviewDelay")}>
+                      <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+                        <input
+                          type="range"
+                          min={CARD_PREVIEW_HOVER_DELAY_MIN}
+                          max={CARD_PREVIEW_HOVER_DELAY_MAX}
+                          step={CARD_PREVIEW_HOVER_DELAY_STEP}
+                          value={cardPreviewHoverDelayMs}
+                          onChange={(e) => setCardPreviewHoverDelayMs(Number(e.target.value))}
+                          aria-label={t("visual.cardPreviewDelay")}
+                          className="flex-1 accent-cyan-500"
+                        />
+                        <span className="font-mono text-xs tabular-nums text-slate-400 sm:w-20 sm:text-right">
+                          {cardPreviewHoverDelayMs === 0
+                            ? t("visual.cardPreviewDelayInstant")
+                            : t("visual.cardPreviewDelayValue", { ms: cardPreviewHoverDelayMs })}
+                        </span>
+                      </div>
+                      <p className="mt-1.5 text-xs text-slate-400">
+                        {t("visual.cardPreviewDelayHint")}
+                      </p>
+                    </SettingGroup>
+                  )}
+
                   <SettingGroup label={t("visual.cardArtPreferences")}>
                     <ArtChainEditor
                       chain={artChain}
@@ -392,18 +536,29 @@ export function PreferencesModal({
                       onMove={moveArtChainEntry}
                     />
                     {artOverrideCount > 0 && (
-                      <button
-                        type="button"
-                        onClick={() => {
-                          if (window.confirm(t("visual.clearArtOverridesConfirm", { count: artOverrideCount }))) {
-                            clearAllArtOverrides();
-                          }
-                        }}
-                        className="mt-2 rounded-[14px] border border-white/10 bg-white/5 px-3 py-1.5 text-xs text-slate-200 transition hover:bg-white/10"
-                      >
-                        {t("visual.clearArtOverrides", { count: artOverrideCount })}
-                      </button>
+                      <ClearArtOverridesButton
+                        count={artOverrideCount}
+                        onClear={clearAllArtOverrides}
+                      />
                     )}
+                  </SettingGroup>
+
+                  <SettingGroup label={t("flexLayout.title")}>
+                    <p className="mb-2 text-xs text-slate-400">
+                      {t("flexLayout.description")}
+                    </p>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        // Launch edit mode and close settings so the board is
+                        // visible; the overlay toolbar owns presets/reset/done.
+                        setFlexEditMode(true);
+                        onClose();
+                      }}
+                      className="rounded-[14px] border border-white/10 bg-white/5 px-3 py-1.5 text-xs text-slate-200 transition hover:bg-white/10"
+                    >
+                      {t("flexLayout.edit")}
+                    </button>
                   </SettingGroup>
                 </SettingsSection>
               )}
@@ -480,18 +635,16 @@ export function PreferencesModal({
 
                 <SettingsSection title={t("audioTheme.title")}>
                   <SettingGroup label={t("audioTheme.theme")}>
-                    <select
-                      value={audioThemeId}
-                      onChange={(e) => handleThemeChange(e.target.value)}
-                      className="w-full rounded-[14px] border border-white/10 bg-black/18 px-3 py-2 text-sm text-slate-100 focus:border-sky-400/40 focus:outline-none"
-                    >
-                      {Object.values(BUILT_IN_THEMES).map((t) => (
-                        <option key={t.id} value={t.id}>{t.name}</option>
-                      ))}
-                      {customThemeUrls.map((t) => (
-                        <option key={t.id} value={t.id}>{t.id}</option>
-                      ))}
-                    </select>
+                    <MenuSelect
+                      ariaLabel={t("audioTheme.theme")}
+                      label={selectedAudioThemeLabel}
+                      selectedValue={audioThemeId}
+                      items={audioThemeItems}
+                      onSelect={handleThemeChange}
+                      menuLayout="dropdown"
+                      wrapperClassName="w-full"
+                      className={SETTINGS_MENU_CLASS}
+                    />
                   </SettingGroup>
 
                   <SettingGroup label={t("audioTheme.importTheme")}>
@@ -565,10 +718,49 @@ export function PreferencesModal({
           <DataSection />
         </>
       )}
+              <div className="border-t border-white/5 py-4 md:hidden">
+                <ResetAllFooter resetAllPreferences={resetAllPreferences} />
+              </div>
             </div>
-            <ResetAllFooter resetAllPreferences={resetAllPreferences} />
           </div>
     </ModalPanelShell>
+  );
+}
+
+function ClearArtOverridesButton({
+  count,
+  onClear,
+}: {
+  count: number;
+  onClear: () => void;
+}) {
+  const { t } = useTranslation("settings");
+  const [confirmOpen, setConfirmOpen] = useState(false);
+
+  const onConfirm = useCallback(() => {
+    onClear();
+    setConfirmOpen(false);
+  }, [onClear]);
+
+  return (
+    <>
+      <button
+        type="button"
+        onClick={() => setConfirmOpen(true)}
+        className="mt-2 rounded-[14px] border border-white/10 bg-white/5 px-3 py-1.5 text-xs text-slate-200 transition hover:bg-white/10"
+      >
+        {t("visual.clearArtOverrides", { count })}
+      </button>
+      <ConfirmDialog
+        open={confirmOpen}
+        title={t("visual.clearArtOverrides", { count })}
+        message={t("visual.clearArtOverridesConfirm", { count })}
+        confirmLabel={t("visual.clearArtOverridesAction")}
+        onConfirm={onConfirm}
+        onCancel={() => setConfirmOpen(false)}
+        tone="danger"
+      />
+    </>
   );
 }
 
@@ -582,22 +774,32 @@ function ResetAllFooter({
   resetAllPreferences: () => void;
 }) {
   const { t } = useTranslation("settings");
-  const onClick = useCallback(() => {
-    if (window.confirm(t("resetAll.confirm"))) {
-      resetAllPreferences();
-    }
-  }, [resetAllPreferences, t]);
+  const [confirmOpen, setConfirmOpen] = useState(false);
+
+  const onConfirm = useCallback(() => {
+    resetAllPreferences();
+    setConfirmOpen(false);
+  }, [resetAllPreferences]);
 
   return (
-    <div className="mt-4 flex justify-end border-t border-white/5 pt-3">
+    <>
       <button
         type="button"
-        onClick={onClick}
+        onClick={() => setConfirmOpen(true)}
         className="text-xs font-medium uppercase tracking-[0.18em] text-slate-500 transition-colors hover:text-rose-300"
       >
         {t("resetAll.button")}
       </button>
-    </div>
+      <ConfirmDialog
+        open={confirmOpen}
+        title={t("resetAll.button")}
+        message={t("resetAll.confirm")}
+        confirmLabel={t("resetAll.confirmAction")}
+        onConfirm={onConfirm}
+        onCancel={() => setConfirmOpen(false)}
+        tone="danger"
+      />
+    </>
   );
 }
 
@@ -783,9 +985,12 @@ function CloudSyncSection() {
 
 function DataSection() {
   const { t } = useTranslation("settings");
+  const telemetryEnabled = usePreferencesStore((s) => s.telemetryEnabled);
+  const setTelemetryEnabled = usePreferencesStore((s) => s.setTelemetryEnabled);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [status, setStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [pendingImportFile, setPendingImportFile] = useState<File | null>(null);
 
   const onExport = useCallback(() => {
     setError(null);
@@ -823,6 +1028,19 @@ function DataSection() {
     [t],
   );
 
+  const dismissImportDialog = useCallback(() => {
+    setPendingImportFile(null);
+  }, []);
+
+  const confirmImport = useCallback(
+    (mode: ImportMode) => {
+      if (!pendingImportFile) return;
+      void onImport(pendingImportFile, mode);
+      setPendingImportFile(null);
+    },
+    [onImport, pendingImportFile],
+  );
+
   return (
     <SettingsSection title={t("data.title")}>
       <p className="text-xs text-slate-400">
@@ -853,14 +1071,35 @@ function DataSection() {
           const file = e.target.files?.[0];
           e.target.value = "";
           if (!file) return;
-          const mode: ImportMode = window.confirm(t("data.importConfirm"))
-            ? "overwrite"
-            : "merge";
-          void onImport(file, mode);
+          setPendingImportFile(file);
         }}
+      />
+      <ConfirmDialog
+        open={pendingImportFile != null}
+        title={t("data.importModeTitle")}
+        message={t("data.importModeMessage")}
+        confirmLabel={t("data.importOverwrite")}
+        secondaryConfirmLabel={t("data.importMerge")}
+        onConfirm={() => confirmImport("overwrite")}
+        onSecondaryConfirm={() => confirmImport("merge")}
+        onCancel={dismissImportDialog}
+        tone="danger"
+        secondaryTone="primary"
       />
       {status && <p className="text-xs text-emerald-400">{status}</p>}
       {error && <p className="text-xs text-rose-400">{error}</p>}
+      <label className="mt-1 flex min-h-11 items-start gap-2">
+        <input
+          type="checkbox"
+          checked={telemetryEnabled}
+          onChange={(e) => setTelemetryEnabled(e.target.checked)}
+          className="mt-1 accent-cyan-500"
+        />
+        <span className="text-sm text-slate-200">
+          {t("data.telemetry")}
+          <span className="mt-0.5 block text-xs text-slate-400">{t("data.telemetryDescription")}</span>
+        </span>
+      </label>
     </SettingsSection>
   );
 }

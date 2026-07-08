@@ -2,14 +2,33 @@ import type { AttackerInfo, CombatState, GameObject, ObjectId, PlayerId } from "
 import { publicName, toCardProps } from "./cardProps";
 import type { CardViewProps } from "./cardProps";
 
-function canGroup(obj: GameObject): boolean {
-  return obj.attachments.length === 0;
+function canGroup(obj: GameObject, ringBearerIds: ReadonlySet<ObjectId>): boolean {
+  // Ring-bearers (CR 701.54) must never be hidden behind a same-named
+  // non-bearer representative in a collapsed/stacked group display — render
+  // them solo so the ring-bearer badge in PermanentCard is always visible.
+  return obj.attachments.length === 0 && !ringBearerIds.has(obj.id);
 }
 
 function groupKey(obj: GameObject): string {
   const kw = obj.keywords.map((k) => typeof k === "string" ? k : JSON.stringify(k)).sort().join(",");
   const colors = [...obj.color].sort().join("");
-  return `${publicName(obj)}|${obj.tapped}|${obj.face_down}|${obj.flipped}|${obj.transformed}|${obj.power}|${obj.toughness}|${obj.loyalty}|${obj.damage_marked}|${obj.has_summoning_sickness}|${obj.class_level ?? ""}|${colors}|${kw}|${JSON.stringify(obj.counters)}`;
+  // counters is a known-shape Partial<Record<CounterType, number>>. Build the
+  // key from sorted entries rather than JSON.stringify — cheaper (no serialize
+  // allocation per permanent on every board rebuild) and order-independent, so
+  // two identical permanents always land in the same group regardless of the
+  // order their counters were applied (the old stringify could split them by
+  // insertion order; this matches the sorted keyword key above).
+  const counters = Object.entries(obj.counters ?? {})
+    .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+    .map(([type, n]) => `${type}:${n}`)
+    .join(",");
+  // Tokens that share a display name (e.g. SOS vs BLC Pest) differ by rules text
+  // and/or preset art — include both so visually distinct tokens never stack.
+  const tokenRules = obj.token_rules_text ?? "";
+  const tokenPreset = obj.token_image_ref?.preset_id ?? "";
+  const isToken = obj.is_token ?? false;
+  const isCommander = obj.is_commander ?? false;
+  return `${publicName(obj)}|${obj.tapped}|${obj.face_down}|${obj.flipped}|${obj.transformed}|${obj.power}|${obj.toughness}|${obj.loyalty}|${obj.damage_marked}|${obj.has_summoning_sickness}|${obj.class_level ?? ""}|${colors}|${kw}|${counters}|${tokenRules}|${tokenPreset}|${isToken}|${isCommander}`;
 }
 
 export interface BattlefieldPartition {
@@ -66,12 +85,17 @@ export function partitionByType(objects: GameObject[]): BattlefieldPartition {
   return { creatures, lands, support, planeswalkers, other };
 }
 
-export function groupByName(objects: GameObject[]): GroupedPermanent[] {
+const NO_RING_BEARERS: ReadonlySet<ObjectId> = new Set();
+
+export function groupByName(
+  objects: GameObject[],
+  ringBearerIds: ReadonlySet<ObjectId> = NO_RING_BEARERS,
+): GroupedPermanent[] {
   const groups = new Map<string, GameObject[]>();
 
   for (const obj of objects) {
-    if (!canGroup(obj)) {
-      // Ungroupable objects (attachments, counters) get their own entry
+    if (!canGroup(obj, ringBearerIds)) {
+      // Ungroupable objects (attachments, ring-bearers) get their own entry
       groups.set(`__solo_${obj.id}`, [obj]);
       continue;
     }

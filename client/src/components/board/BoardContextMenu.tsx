@@ -6,8 +6,12 @@ interface BoardContextMenuProps {
   y: number;
   onClose: () => void;
   onChangeBackground: () => void;
+  onCustomizeLayout: () => void;
   onToggleGameLog: () => void;
   onToggleDebugLog: () => void;
+  /** Open the "Report a card problem" picker. Rendered only when provided
+   *  (live, participating games). */
+  onReportCard?: () => void;
 }
 
 export function BoardContextMenu({
@@ -15,8 +19,10 @@ export function BoardContextMenu({
   y,
   onClose,
   onChangeBackground,
+  onCustomizeLayout,
   onToggleGameLog,
   onToggleDebugLog,
+  onReportCard,
 }: BoardContextMenuProps) {
   const { t } = useTranslation("game");
   const ref = useRef<HTMLDivElement | null>(null);
@@ -69,6 +75,14 @@ export function BoardContextMenu({
         }}
       />
       <MenuItem
+        label={t("board.customizeLayout")}
+        shortcut="Ctrl+Shift+L"
+        onClick={() => {
+          onCustomizeLayout();
+          onClose();
+        }}
+      />
+      <MenuItem
         label={t("board.gameLog")}
         onClick={() => {
           onToggleGameLog();
@@ -83,6 +97,15 @@ export function BoardContextMenu({
           onClose();
         }}
       />
+      {onReportCard && (
+        <MenuItem
+          label={t("board.reportCard")}
+          onClick={() => {
+            onReportCard();
+            onClose();
+          }}
+        />
+      )}
     </div>
   );
 }

@@ -3,9 +3,10 @@ import { useTranslation } from "react-i18next";
 import { scryfallLegalityKey, type ScryfallCard } from "../../services/scryfall";
 import { searchCards } from "../../services/engineRuntime";
 import type { GameFormat } from "../../adapter/types";
-import { FORMAT_REGISTRY } from "../../data/formatRegistry";
+import { DECK_CONSTRUCTION_FORMATS } from "../../data/formatRegistry";
 import { useSetList } from "../../hooks/useSetList";
 import { hasSearchCriteria } from "./searchFilters";
+import { MenuSelect } from "../ui/MenuSelect";
 
 const DEBOUNCE_MS = 300;
 const MANA_COLORS = ["W", "U", "B", "R", "G"] as const;
@@ -32,6 +33,8 @@ const CARD_TYPES = [
   "Land",
   "Planeswalker",
 ];
+const FILTER_MENU_CLASS =
+  "min-h-[44px] rounded-[16px] text-base sm:min-h-0 sm:text-sm";
 
 export type BrowserLegalityFilter = "all" | GameFormat;
 
@@ -63,13 +66,25 @@ export function CardSearch({
   const browserFormats = useMemo<{ value: BrowserLegalityFilter; label: string }[]>(
     () => [
       { value: "all", label: t("search.browseFormat.all") },
-      ...FORMAT_REGISTRY.map(({ format, label }) => ({
+      ...DECK_CONSTRUCTION_FORMATS.map(({ format, label }) => ({
         value: format as BrowserLegalityFilter,
         label,
       })),
     ],
     [t],
   );
+  const typeOptions = useMemo(
+    () => [
+      { value: "", label: t("search.allTypes") },
+      ...CARD_TYPES.map((cardType) => ({ value: cardType, label: cardType })),
+    ],
+    [t],
+  );
+  const selectedTypeLabel =
+    typeOptions.find((opt) => opt.value === filters.type)?.label ?? t("search.allTypes");
+  const selectedBrowseFormatLabel =
+    browserFormats.find((opt) => opt.value === filters.browseFormat)?.label
+    ?? t("search.browseFormat.all");
   const setList = useSetList();
   const availableSets = useMemo(() => {
     if (!setList) return [];
@@ -301,18 +316,16 @@ export function CardSearch({
         ))}
       </div>
 
-      <select
-        value={filters.type}
-        onChange={(e) => handleTypeChange(e.target.value)}
-        className="rounded-[16px] border border-white/10 bg-black/18 px-3 py-1.5 text-sm text-white focus:border-white/20 focus:outline-none"
-      >
-        <option value="">{t("search.allTypes")}</option>
-        {CARD_TYPES.map((cardType) => (
-          <option key={cardType} value={cardType}>
-            {cardType}
-          </option>
-        ))}
-      </select>
+      <MenuSelect
+        ariaLabel={t("search.cardType")}
+        label={selectedTypeLabel}
+        selectedValue={filters.type}
+        items={typeOptions}
+        onSelect={handleTypeChange}
+        menuLayout="dropdown"
+        wrapperClassName="w-full"
+        className={FILTER_MENU_CLASS}
+      />
 
       <div className="flex items-center gap-2">
         <label className="text-xs text-gray-400">{t("search.cmcMax")}</label>
@@ -326,17 +339,16 @@ export function CardSearch({
         />
       </div>
 
-      <select
-        value={filters.browseFormat}
-        onChange={(e) => handleBrowseFormatChange(e.target.value as BrowserLegalityFilter)}
-        className="rounded-[16px] border border-white/10 bg-black/18 px-3 py-1.5 text-sm text-white focus:border-white/20 focus:outline-none"
-      >
-        {browserFormats.map(({ value, label }) => (
-          <option key={value} value={value}>
-            {label}
-          </option>
-        ))}
-      </select>
+      <MenuSelect
+        ariaLabel={t("search.browseFormatFilter")}
+        label={selectedBrowseFormatLabel}
+        selectedValue={filters.browseFormat}
+        items={browserFormats}
+        onSelect={(value) => handleBrowseFormatChange(value as BrowserLegalityFilter)}
+        menuLayout="dropdown"
+        wrapperClassName="w-full"
+        className={FILTER_MENU_CLASS}
+      />
 
       <div className="space-y-2">
         <label className="text-xs text-gray-400">{t("search.sets")}</label>

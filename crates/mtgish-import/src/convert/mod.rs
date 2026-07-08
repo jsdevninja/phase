@@ -1225,6 +1225,7 @@ fn apply_segment_optionality(
                 ability.kind,
                 Effect::PayCost {
                     cost: payment_cost,
+                    scale: None,
                     payer,
                 },
             )
@@ -1320,9 +1321,17 @@ pub(crate) fn build_ability_from_actions(
                 allow_repeat_modes,
                 constraints,
                 mode_costs: Vec::new(),
+                // Mechanical compile-keep-alive for the shared engine ModalChoice
+                // field add; mtgish does not (yet) author pawprint modals.
+                mode_pawprints: Vec::new(),
                 entwine_cost,
                 // CR 700.2a: mtgish modal blocks are controller-chosen.
                 chooser: engine::types::ability::PlayerFilter::Controller,
+                selection: engine::types::ability::TargetSelectionMode::Chosen,
+                // Mechanical compile-keep-alive for the shared engine ModalChoice
+                // field add; mtgish does not (yet) author dynamic "choose up to X"
+                // modals. No logic — field only.
+                dynamic_max_choices: None,
             };
             // Each mode body becomes its own `AbilityDefinition` chain.
             let mut mode_abilities = Vec::with_capacity(modes.len());
@@ -1373,6 +1382,7 @@ pub(crate) fn build_ability_from_actions(
                 kind,
                 Effect::PayCost {
                     cost: payment_cost,
+                    scale: None,
                     payer,
                 },
             )
@@ -1403,6 +1413,7 @@ pub(crate) fn build_ability_from_actions(
             sub.condition = Some(engine::types::ability::AbilityCondition::WhenYouDo);
             let parent_effect = engine::types::ability::Effect::PayCost {
                 cost: payment_cost,
+                scale: None,
                 payer,
             };
             // CR 117.6: `optional = true` on the parent gates `Effect::PayCost`
@@ -2223,41 +2234,31 @@ fn build_two_branch_spell(
     Ok(parent.sub_ability(paid))
 }
 
-/// CR 118.1: Map an activation-time `AbilityCost` to a resolution-time
-/// `PaymentCost`. Reflexive triggers ("you may pay X. when you do, Y")
-/// materialize the cost choice as `Effect::PayCost`. Resource costs map to
-/// dedicated `PaymentCost` leaves; supported non-resource resolution costs
-/// reuse the engine's `AbilityCost` taxonomy through `PaymentCost::AbilityCost`.
+/// CR 118.1: Validate that an activation-time `AbilityCost` is a shape the
+/// resolution-time `Effect::PayCost` authority can pay, returning a clone for
+/// the `cost` field. Reflexive triggers ("you may pay X. when you do, Y")
+/// materialize the cost choice as `Effect::PayCost`. The unified `AbilityCost`
+/// taxonomy is carried directly (cost-payment unification Phase 4 deleted the
+/// parallel `PaymentCost` hierarchy); the supported set is the resolution arms
+/// of the `game::costs` authority.
 fn ability_cost_to_payment_cost(
     cost: &engine::types::ability::AbilityCost,
-) -> ConvResult<engine::types::ability::PaymentCost> {
+) -> ConvResult<engine::types::ability::AbilityCost> {
     use engine::types::ability::AbilityCost as AC;
-    use engine::types::ability::PaymentCost as PC;
-    Ok(match cost {
-        AC::Mana { cost } => PC::Mana { cost: cost.clone() },
-        AC::PayLife { amount } => PC::Life {
-            amount: amount.clone(),
-        },
-        AC::PayEnergy { amount } => PC::Energy {
-            amount: amount.clone(),
-        },
-        AC::PaySpeed { amount } => PC::Speed {
-            amount: amount.clone(),
-        },
-        AC::Discard {
-            random: false,
-            self_ref: false,
-            ..
-        } => PC::AbilityCost { cost: cost.clone() },
-        _ => {
-            return Err(ConversionGap::EnginePrerequisiteMissing {
-                engine_type: "PaymentCost",
-                needed_variant: format!(
-                    "AbilityCost not mappable to resolution-time PaymentCost: {cost:?}"
-                ),
-            });
+    match cost {
+        AC::Mana { .. } | AC::PayLife { .. } | AC::PayEnergy { .. } | AC::PaySpeed { .. } => {
+            Ok(cost.clone())
         }
-    })
+        AC::Discard {
+            selection: engine::types::ability::CardSelectionMode::Chosen,
+            self_scope: engine::types::ability::DiscardSelfScope::FromHand,
+            ..
+        } => Ok(cost.clone()),
+        _ => Err(ConversionGap::EnginePrerequisiteMissing {
+            engine_type: "Effect::PayCost",
+            needed_variant: format!("AbilityCost not payable as a resolution-time cost: {cost:?}"),
+        }),
+    }
 }
 
 /// Convert an mtgish `Cost` to a pure `ManaCost`, strict-failing for
@@ -2834,8 +2835,8 @@ fn creature_type_name(ct: &crate::schema::types::CreatureType) -> String {
 mod tests {
     use super::*;
     use engine::types::ability::{
-        AbilityCondition, Comparator, ContinuousModification, GainLifePlayer, PlayerFilter,
-        QuantityExpr, StaticCondition,
+        AbilityCondition, Comparator, ContinuousModification, PlayerFilter, QuantityExpr,
+        StaticCondition,
     };
     use engine::types::triggers::TriggerMode;
 
@@ -2963,7 +2964,7 @@ mod tests {
                 }],
                 else_effects: vec![Effect::GainLife {
                     amount: QuantityExpr::Fixed { value: 1 },
-                    player: GainLifePlayer::Controller,
+                    player: TargetFilter::Controller,
                 }],
             }),
             player_scope: PlayerFilter::Opponent,

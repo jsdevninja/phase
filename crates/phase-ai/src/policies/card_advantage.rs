@@ -7,6 +7,8 @@ use super::context::PolicyContext;
 use super::registry::{DecisionKind, PolicyId, PolicyReason, PolicyVerdict, TacticalPolicy};
 use crate::deck_profile::DeckArchetype;
 use crate::features::DeckFeatures;
+#[cfg(test)]
+use engine::types::game_state::CastPaymentMode;
 
 pub struct CardAdvantagePolicy;
 
@@ -149,6 +151,8 @@ mod tests {
                 object_id: spell,
                 card_id: CardId(1),
                 targets: Vec::new(),
+
+                payment_mode: CastPaymentMode::Auto,
             },
             metadata: ActionMetadata {
                 actor: Some(PlayerId(0)),
@@ -163,6 +167,7 @@ mod tests {
             config: &config,
             context: &crate::context::AiContext::empty(&config.weights),
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
 
         let score = CardAdvantagePolicy.score(&ctx);
@@ -190,6 +195,7 @@ mod tests {
                 amount: QuantityExpr::Fixed { value: 3 },
                 target: engine::types::ability::TargetFilter::Any,
                 damage_source: None,
+                excess: None,
             },
         ));
 
@@ -205,6 +211,8 @@ mod tests {
                 object_id: spell,
                 card_id: CardId(1),
                 targets: Vec::new(),
+
+                payment_mode: CastPaymentMode::Auto,
             },
             metadata: ActionMetadata {
                 actor: Some(PlayerId(0)),
@@ -219,6 +227,7 @@ mod tests {
             config: &config,
             context: &crate::context::AiContext::empty(&config.weights),
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
 
         let score = CardAdvantagePolicy.score(&ctx);

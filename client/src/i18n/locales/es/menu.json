@@ -39,7 +39,7 @@
     },
     "draft": {
       "title": "Draft",
-      "description": "Quick Draft contra la IA, draft de cube o aloja un pod draft."
+      "description": "Draft Rápido contra la IA, draft de cube o aloja un pod draft."
     },
     "decks": {
       "title": "Mazos",
@@ -49,8 +49,8 @@
       "sponsor": "Patrocinar"
     },
     "preview": {
-      "cta": "Probar la vista previa",
-      "tooltip": "Juega la última versión de vista previa — las cartas y correcciones más recientes llegan aquí antes de cada lanzamiento."
+      "cta": "Probar versión de desarrollo",
+      "tooltip": "Ejecuta la última versión de desarrollo — las cartas y correcciones más recientes llegan aquí antes de cada lanzamiento."
     },
     "coverage": {
       "title": "Abrir el panel de cobertura",
@@ -67,7 +67,31 @@
     "load": {
       "title": "Cargar estado de la partida"
     },
-    "exit": "Salir"
+    "exit": "Salir",
+    "dashboard": {
+      "welcome": "Bienvenido de nuevo",
+      "enter": "Entrar",
+      "continue": "Continúa donde lo dejaste",
+      "resumeDraft": "Reanudar draft",
+      "draftPod": "Pod de draft",
+      "activeDeck": "Mazo activo",
+      "noActiveDeck": "Elige un mazo para empezar",
+      "fromFeeds": "De tus feeds",
+      "feedsEmpty": "Suscríbete a un feed para ver mazos nuevos",
+      "cards": "{{count}} cartas",
+      "mode": {
+        "ai": "contra IA",
+        "online": "En línea",
+        "local": "Local",
+        "p2p-host": "P2P",
+        "p2p-join": "P2P"
+      },
+      "tagline": "Un motor de reglas y cliente de juego de Magic: The Gathering de código abierto",
+      "turn": "Turno {{n}}",
+      "yourTurn": "Tu turno",
+      "opponentTurn": "Turno del rival",
+      "yourLife": "Tú {{life}}"
+    }
   },
   "loadState": {
     "title": "Cargar estado de la partida",
@@ -132,8 +156,11 @@
     "errorInvalidUrl": "Introduce una URL válida de Moxfield o Archidekt.",
     "errorNetworkFailure": "No se pudo contactar con el servicio de importación. Comprueba tu conexión e inténtalo de nuevo.",
     "errorGeneric": "No se pudo importar el mazo.",
+    "errorNoCards": "No se encontraron cartas. Pega un mazo en formato MTGA o .dck.",
     "fileSupports": "Admite formatos .dck, .dec, .txt y MTGA",
-    "chooseFile": "Elegir archivo"
+    "chooseFile": "Elegir archivo",
+    "importedSuccessTitle": "Mazo importado",
+    "importedSuccessDescription": "\"{{name}}\" se añadió a tus mazos."
   },
   "precon": {
     "savePrompt": "Guardar mazo preconstruido como:",
@@ -147,7 +174,9 @@
     "totalCount": "· {{count}} en total",
     "searchPlaceholder": "Buscar por nombre, código de colección o tipo…",
     "allTypes": "Todos ({{count}})",
+    "typeFilter": "Tipo de mazo",
     "loadingCatalog": "Cargando catálogo de mazos…",
+    "loadFailed": "No se pudo cargar el catálogo de mazos preconstruidos. Comprueba tu conexión e inténtalo de nuevo.",
     "noMatch": "Ningún mazo coincide.",
     "selectDeck": "Seleccionar {{name}}",
     "cardCount_one": "{{count}} carta",
@@ -171,7 +200,13 @@
     "unknown": "Desconocidas {{count}}",
     "unknownCardsTitle": "Cartas desconocidas:\n{{cards}}",
     "unsupportedTitle": "No compatibles ({{unique}} únicas, {{copies}} copias):\n{{cards}}",
-    "setIconAlt": "Icono de la colección {{code}}"
+    "setIconAlt": "Icono de la colección {{code}}",
+    "actionsMenu": "Opciones del mazo",
+    "star": "Destacar",
+    "unstar": "Quitar destacado",
+    "moveToFolder": "Mover a carpeta",
+    "unfiled": "Sin clasificar",
+    "newFolder": "Nueva carpeta…"
   },
   "myDecks": {
     "headingManage": "Mis mazos",
@@ -184,6 +219,17 @@
     "manageFeeds": "Gestionar feeds",
     "searchPlaceholder": "Buscar mazos…",
     "formatLabel": "Formato",
+    "sourceFilterLabel": "Fuente del mazo",
+    "sourceFilter": {
+      "all": "Todas las fuentes",
+      "user": "Mis mazos",
+      "feed": "Feeds",
+      "precon": "Precons"
+    },
+    "preconSetFilterLabel": "Colección precon",
+    "preconSetFilterAll": "Todas las colecciones",
+    "preconSetSearchPlaceholder": "Buscar colecciones…",
+    "preconSetNoMatches": "Sin colecciones coincidentes",
     "browseAetherhub": "Explorar mazos de {{format}} en Aetherhub",
     "showAllDecks": "Mostrar todos los mazos",
     "showLegalOnly": "Mostrar solo los legales",
@@ -206,6 +252,7 @@
       "loadingDatabase": "Cargando la base de datos de compatibilidad…",
       "checkingDeck": "Comprobando {{deck}}…",
       "checkedDeck": "Comprobado {{deck}}",
+      "checkingRandom": "Comprobando candidatos de mazo aleatorio…",
       "loadingCoverage": "Cargando cobertura de {{deck}}…",
       "checkingSelected": "Comprobando la compatibilidad del mazo seleccionado…",
       "evaluatingVisible": "Evaluando los mazos visibles…",
@@ -220,13 +267,19 @@
     "sectionMyDecks": "Mis mazos",
     "sectionStarterDecks": "Mazos iniciales",
     "sectionLegalPrecons": "Precon legales",
+    "randomDeckTile": "Mazo aleatorio",
+    "randomDeckTileBusy": "Eligiendo…",
     "importDeckTile": "Importar mazo",
     "preconstructedTile": "Preconstruido",
     "browseAll": "Explorar todos",
     "loadMore": "Cargar más",
     "selectedDeck": "Mazo seleccionado",
     "chooseDeckToContinue": "Elige un mazo para continuar",
-    "filterAll": "Todos"
+    "filterAll": "Todos",
+    "sectionStarred": "Destacados",
+    "sectionUnfiled": "Sin clasificar",
+    "collapseAll": "Contraer todo",
+    "expandAll": "Expandir todo"
   },
   "subscriptions": {
     "emptyTitle": "Sin suscripciones a feeds",
@@ -242,5 +295,54 @@
   },
   "loadGameState": {
     "readFailed": "Error al leer el archivo"
+  },
+  "nav": {
+    "label": "Navegación principal",
+    "home": "Inicio",
+    "play": "Jugar",
+    "online": "En línea",
+    "draft": "Draft",
+    "decks": "Mazos",
+    "alpha": "Alfa",
+    "profile": "Perfil",
+    "settings": "Ajustes",
+    "whatsNew": "Novedades"
+  },
+  "folder": {
+    "actionsMenu": "Opciones de carpeta",
+    "rename": "Renombrar",
+    "delete": "Eliminar",
+    "newFolder": "Nueva carpeta",
+    "newFolderPrompt": "Nombre de la carpeta:",
+    "createButton": "Crear",
+    "renamePrompt": "Renombrar carpeta:",
+    "deleteConfirm": "¿Eliminar la carpeta «{{name}}»? Los mazos pasarán a Sin clasificar.",
+    "emptyHint": "Esta carpeta está vacía.",
+    "unfiledEmptyHint": "No hay mazos sin clasificar."
+  },
+  "whatsNew": {
+    "title": "Novedades",
+    "empty": "No updates yet — check back soon.",
+    "loading": "Loading updates…",
+    "failed": "Couldn't load updates. Check your connection and try again.",
+    "retry": "Try again",
+    "discordLink": "Read on Discord",
+    "unread": "New updates available",
+    "searchPlaceholder": "Search updates…",
+    "noResults": "No updates match your search.",
+    "pageStatus": "Page {{current}} of {{total}}",
+    "prevPage": "Previous",
+    "nextPage": "Next",
+    "showMore": "Show more",
+    "showLess": "Show less",
+    "tag": {
+      "new-cards": "New Cards",
+      "card-fixes": "Card Fixes",
+      "gameplay": "Gameplay",
+      "interface": "Interface",
+      "localization": "Localization",
+      "ai": "AI",
+      "multiplayer": "Multiplayer"
+    }
   }
 }

@@ -27,6 +27,16 @@ fn resolve_object_targets(state: &GameState, ability: &ResolvedAbility) -> Vec<O
     if matches!(filter, TargetFilter::LastCreated) {
         return state.last_created_token_ids.clone();
     }
+    // CR 722.3a: a self-referential "this creature becomes prepared" (e.g.
+    // Stensian Sanguinist's combat-damage delayed trigger) carries no explicit
+    // object target — the subject is the ability's own source.
+    // CR 608.2c: a triggered BecomePrepared bound to the source via ParentTarget
+    // with no explicit target (e.g. Tam landfall) likewise resolves to source_id.
+    if matches!(filter, TargetFilter::SelfRef)
+        || (ability.targets.is_empty() && matches!(filter, TargetFilter::ParentTarget))
+    {
+        return vec![ability.source_id];
+    }
     ability
         .targets
         .iter()
@@ -66,19 +76,7 @@ pub fn resolve_become_prepared(
 ) -> Result<(), EffectError> {
     let target_ids = resolve_object_targets(state, ability);
     for object_id in target_ids {
-        // Biblioplex gate — only creatures with prepare spells can become prepared.
-        if !has_prepare_face(state, object_id) {
-            continue;
-        }
-        let Some(obj) = state.objects.get_mut(&object_id) else {
-            continue;
-        };
-        // Idempotency: no-op if already prepared.
-        if obj.prepared.is_some() {
-            continue;
-        }
-        obj.prepared = Some(PreparedState);
-        events.push(GameEvent::BecamePrepared { object_id });
+        prepare_object(state, object_id, events);
     }
     events.push(GameEvent::EffectResolved {
         kind: EffectKind::BecomePrepared,
@@ -131,6 +129,29 @@ pub fn unprepare_object(state: &mut GameState, object_id: ObjectId, events: &mut
     events.push(GameEvent::BecameUnprepared { object_id });
 }
 
+/// CR 722.3a: Direct-call variant that gives a specific object the prepared
+/// designation, emitting `BecamePrepared` only when the toggle actually fires.
+/// Mirrors [`unprepare_object`] for the opposite direction. Enforces the same
+/// two gates as `resolve_become_prepared`: the object must have a prepare-spell
+/// face ("A permanent can't gain this designation unless it has a prepare
+/// spell") and must not already be prepared (idempotent). Single authority for
+/// the "become prepared" toggle — used by the become-prepared resolver path and
+/// the debug `SetPrepared` action so neither sets the field directly.
+pub fn prepare_object(state: &mut GameState, object_id: ObjectId, events: &mut Vec<GameEvent>) {
+    // Biblioplex gate — only creatures with prepare spells can become prepared.
+    if !has_prepare_face(state, object_id) {
+        return;
+    }
+    let Some(obj) = state.objects.get_mut(&object_id) else {
+        return;
+    };
+    if obj.prepared.is_some() {
+        return;
+    }
+    obj.prepared = Some(PreparedState);
+    events.push(GameEvent::BecamePrepared { object_id });
+}
+
 /// CR 601.2c / CR 722.3c: After pushing a freshly cast prepare/paradigm copy
 /// to the stack, open target selection via `WaitingFor::CopyRetarget` if the
 /// copy's ability requires targets. The copy is not a copy of an
@@ -145,6 +166,7 @@ pub(crate) fn open_copy_target_selection(
     state: &mut GameState,
     copy_id: ObjectId,
     controller: PlayerId,
+    paradigm_remaining_offers: Option<Vec<ObjectId>>,
 ) -> Result<bool, String> {
     // Snapshot the ability from the stack entry we just pushed so we can
     // compute slots without holding a mutable borrow across `build_target_slots`.
@@ -179,7 +201,10 @@ pub(crate) fn open_copy_target_selection(
         player: controller,
         copy_id,
         target_slots,
+        effect_kind: crate::types::ability::EffectKind::CopySpell,
+        effect_source_id: Some(copy_id),
         current_slot: 0,
+        paradigm_remaining_offers,
     };
     Ok(true)
 }
@@ -235,6 +260,7 @@ fn synthesize_prepared_copy_object(
     // Do not re-enter alternative-face casting logic for this synthetic copy.
     copy_obj.back_face = None;
     apply_back_face_to_object(&mut copy_obj, back.clone());
+    copy_obj.casting_permissions.clear();
     copy_obj
         .casting_permissions
         .push(CastingPermission::ExileWithAltCost {
@@ -242,6 +268,12 @@ fn synthesize_prepared_copy_object(
             cast_transformed: false,
             constraint: None,
             granted_to: Some(controller),
+            resolution_cleanup: None,
+            duration: None,
+            graveyard_replacement: None,
+            enters_with_counter: None,
+            enters_with_modifications: Vec::new(),
+            mana_spend_permission: None,
         });
     state.objects.insert(copy_id, copy_obj);
 
@@ -362,13 +394,15 @@ mod tests {
     use crate::game::zones::create_object;
     use crate::parser::oracle_effect::parse_effect;
     use crate::types::ability::{
-        AbilityDefinition, AbilityKind, QuantityExpr, ReplacementDefinition, TargetFilter,
+        AbilityDefinition, AbilityKind, CastingPermission, QuantityExpr, ReplacementDefinition,
+        TargetFilter,
     };
     use crate::types::actions::GameAction;
     use crate::types::card_type::CoreType;
     use crate::types::game_state::{CastingVariant, StackEntry, StackEntryKind};
     use crate::types::identifiers::CardId;
-    use crate::types::mana::{ManaCost, ManaCostShard};
+    use crate::types::mana::{ManaCost, ManaCostShard, ManaType, ManaUnit};
+    use crate::types::phase::Phase;
     use crate::types::player::PlayerId;
     use crate::types::replacements::ReplacementEvent;
     use crate::types::zones::Zone;
@@ -391,6 +425,42 @@ mod tests {
             matches!(effect, Effect::BecomeUnprepared { .. }),
             "expected BecomeUnprepared, got {effect:?}"
         );
+    }
+
+    #[test]
+    fn become_prepared_parent_target_with_empty_targets_prepares_source() {
+        let mut state = GameState::new_two_player(42);
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Tam, Observant Sequencer".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&source).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.back_face = Some(BackFaceForTest::prepare());
+        }
+
+        let ability = ResolvedAbility::new(
+            Effect::BecomePrepared {
+                target: TargetFilter::ParentTarget,
+            },
+            vec![],
+            source,
+            PlayerId(0),
+        );
+        let mut events = Vec::new();
+        resolve_become_prepared(&mut state, &ability, &mut events).unwrap();
+
+        assert!(
+            state.objects[&source].prepared.is_some(),
+            "ParentTarget BecomePrepared with empty targets must prepare the source"
+        );
+        assert!(events.iter().any(
+            |event| matches!(event, GameEvent::BecamePrepared { object_id } if *object_id == source)
+        ));
     }
 
     fn setup_creature(state: &mut GameState) -> ObjectId {
@@ -519,10 +589,13 @@ mod tests {
             ObjectId(999),
             None,
             false,
-            false,
+            crate::types::zones::EtbTapState::Unspecified,
             None,
             &[],
+            None,
             false,
+            None,
+            None,
             &mut events,
         );
 
@@ -613,6 +686,41 @@ mod tests {
         assert!(events2.is_empty());
     }
 
+    #[test]
+    fn prepare_object_flips_and_emits_when_prepare_face_present() {
+        let mut state = GameState::new_two_player(42);
+        let id = setup_creature(&mut state);
+        state.objects.get_mut(&id).unwrap().back_face = Some(BackFaceForTest::prepare());
+
+        let mut events = Vec::new();
+        prepare_object(&mut state, id, &mut events);
+
+        assert!(state.objects[&id].prepared.is_some());
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, GameEvent::BecamePrepared { object_id } if *object_id == id)));
+
+        // Idempotency — second call must not re-emit.
+        let mut events2 = Vec::new();
+        prepare_object(&mut state, id, &mut events2);
+        assert!(events2.is_empty());
+    }
+
+    #[test]
+    fn prepare_object_noop_without_prepare_face() {
+        // CR 722.3a Biblioplex gate — an object with no prepare-spell face
+        // can't gain the prepared designation (matches the debug SetPrepared
+        // path's single-authority guarantee).
+        let mut state = GameState::new_two_player(42);
+        let id = setup_creature(&mut state);
+
+        let mut events = Vec::new();
+        prepare_object(&mut state, id, &mut events);
+
+        assert!(state.objects[&id].prepared.is_none());
+        assert!(events.is_empty());
+    }
+
     // CR 707.10c: `open_copy_target_selection` detects whether the copy's
     // spell ability requires targets and, if so, arms `CopyRetarget` with
     // seeded targets + legal alternatives. Returns false (no-op) for copies
@@ -646,7 +754,7 @@ mod tests {
             },
         });
 
-        let armed = open_copy_target_selection(&mut state, copy_id, PlayerId(0)).unwrap();
+        let armed = open_copy_target_selection(&mut state, copy_id, PlayerId(0), None).unwrap();
         assert!(!armed, "no target slots → no CopyRetarget");
         // WaitingFor should remain unchanged (default Priority here).
         assert!(!matches!(
@@ -688,6 +796,7 @@ mod tests {
                 target: TargetFilter::Typed(TypedFilter::creature()),
                 amount: QuantityExpr::Fixed { value: 2 },
                 damage_source: None,
+                excess: None,
             },
             Vec::new(),
             copy_id,
@@ -713,7 +822,7 @@ mod tests {
             Zone::Stack,
         );
 
-        let armed = open_copy_target_selection(&mut state, copy_id, PlayerId(0)).unwrap();
+        let armed = open_copy_target_selection(&mut state, copy_id, PlayerId(0), None).unwrap();
         assert!(armed, "target slot → arms CopyRetarget");
         match &state.waiting_for {
             WaitingFor::CopyRetarget {
@@ -894,6 +1003,23 @@ mod tests {
         {
             let source = state.objects.get_mut(&source_id).unwrap();
             source.prepared = Some(PreparedState);
+            // CR 722.3c + CR 118.9a: prepared-copy casting must use the
+            // prepare face's mana cost, not any stale free-cast permission that
+            // happened to be stored on the battlefield source before cloning.
+            source
+                .casting_permissions
+                .push(CastingPermission::ExileWithAltCost {
+                    cost: ManaCost::zero(),
+                    cast_transformed: false,
+                    constraint: None,
+                    granted_to: Some(PlayerId(0)),
+                    resolution_cleanup: None,
+                    duration: None,
+                    graveyard_replacement: None,
+                    enters_with_counter: None,
+                    enters_with_modifications: Vec::new(),
+                    mana_spend_permission: None,
+                });
             source.back_face = Some(BackFaceForTest::prepare_with_cost(ManaCost::Cost {
                 shards: vec![ManaCostShard::Red],
                 generic: 1,
@@ -976,6 +1102,64 @@ mod tests {
         assert!(
             state.stack.iter().all(|entry| entry.id != copy_id),
             "cancelled cast must remove stack placeholder for synthesized copy"
+        );
+    }
+
+    #[test]
+    fn prepared_sorcery_not_castable_during_opponents_main_phase() {
+        let mut state = GameState::new_two_player(42);
+        state.active_player = PlayerId(1);
+        state.priority_player = PlayerId(0);
+        state.phase = Phase::PreCombatMain;
+        state.waiting_for = WaitingFor::Priority {
+            player: PlayerId(0),
+        };
+
+        let source_id = setup_creature(&mut state);
+        {
+            let source = state.objects.get_mut(&source_id).unwrap();
+            source.prepared = Some(PreparedState);
+            source.back_face = Some(BackFaceForTest::prepare_with_cost(ManaCost::Cost {
+                shards: vec![ManaCostShard::Red],
+                generic: 0,
+            }));
+        }
+        state.players[0].mana_pool.mana.push(ManaUnit::new(
+            ManaType::Red,
+            ObjectId(0),
+            false,
+            vec![],
+        ));
+
+        assert!(
+            !can_cast_prepared_copy_now(&state, PlayerId(0), source_id),
+            "prepared sorcery must not be castable during the opponent's main phase"
+        );
+    }
+
+    #[test]
+    fn prepared_sorcery_requires_payable_mana_even_at_sorcery_speed() {
+        let mut state = GameState::new_two_player(42);
+        state.active_player = PlayerId(0);
+        state.priority_player = PlayerId(0);
+        state.phase = Phase::PreCombatMain;
+        state.waiting_for = WaitingFor::Priority {
+            player: PlayerId(0),
+        };
+
+        let source_id = setup_creature(&mut state);
+        {
+            let source = state.objects.get_mut(&source_id).unwrap();
+            source.prepared = Some(PreparedState);
+            source.back_face = Some(BackFaceForTest::prepare_with_cost(ManaCost::Cost {
+                shards: vec![ManaCostShard::Red],
+                generic: 1,
+            }));
+        }
+
+        assert!(
+            !can_cast_prepared_copy_now(&state, PlayerId(0), source_id),
+            "prepared copy must not be castable without payable mana"
         );
     }
 

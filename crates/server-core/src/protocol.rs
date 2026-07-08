@@ -12,32 +12,16 @@ use engine::types::player::PlayerId;
 use phase_ai::config::AiDifficulty;
 use serde::{Deserialize, Serialize};
 
-/// Wire-protocol version. Bump when any `ClientMessage` or `ServerMessage`
-/// variant is added, removed, renamed, or has a field type changed. Adding a
-/// new optional field with `#[serde(default)]` does not require a bump.
-///
-/// Note: renaming or removing a variant silently fails at JSON parse time
-/// (clients see "Invalid message: unknown variant") rather than at the
-/// handshake. When making such changes, plan a deprecation window where
-/// both the old and new variants coexist, then bump and remove the old.
-pub const PROTOCOL_VERSION: u32 = 7;
+/// Full game wire protocol version. Kept numerically aligned with the lobby
+/// broker while state/action messages share the same WebSocket protocol enum.
+pub const PROTOCOL_VERSION: u32 = lobby_broker::PROTOCOL_VERSION;
 
-/// Minimum protocol version the server will accept at the hello handshake.
-/// Clients on `MIN_SUPPORTED_PROTOCOL..=PROTOCOL_VERSION` are admitted to the
-/// lobby; older clients are rejected. The window is "current and previous" by
-/// policy — each bump deprecates exactly one version behind, so a release-vs-
-/// preview deployment can coexist in the same lobby server during the rollout.
-///
-/// Derived from `PROTOCOL_VERSION` so a bump automatically rolls the floor.
-/// Use `saturating_sub` so the constant is well-defined when `PROTOCOL_VERSION`
-/// is 0 (range collapses to `0..=0`, no underflow).
-///
-/// Note: admission to the lobby does not guarantee that every game wire
-/// operation is bidirectionally compatible across versions. Per-game cross-
-/// version filtering is a follow-up; until it lands, browsing succeeds but a
-/// v6 client clicking "join" on a v7-hosted game will fail at the seat-message
-/// boundary with an opaque deserialize error.
-pub const MIN_SUPPORTED_PROTOCOL: u32 = PROTOCOL_VERSION.saturating_sub(1);
+/// Minimum protocol version accepted by full game servers. Planechase changed
+/// game-state/action payload shape, so stale clients must not join full games.
+pub const MIN_SUPPORTED_PROTOCOL: u32 = PROTOCOL_VERSION;
+
+/// Minimum protocol version accepted by lobby-only brokers.
+pub const LOBBY_MIN_SUPPORTED_PROTOCOL: u32 = lobby_broker::MIN_SUPPORTED_PROTOCOL;
 
 /// Git short-hash of the build. Emitted by `build.rs`; falls back to `"dev"`
 /// when git isn't available (containers, source tarballs).
@@ -75,7 +59,7 @@ pub struct AiSeatRequest {
 // wire bytes are byte-identical (guarded by tests/lobby_wire_contract.rs).
 pub use lobby_broker::protocol::{DraftLobbyMetadata, LobbyGame};
 
-pub use seat_reducer::types::{DeckChoice, SeatKind, SeatMutation, SeatView};
+pub use seat_reducer::types::{DeckChoice, SeatKind, SeatMutation, SeatTeamInfo, SeatView};
 
 /// Info about a single player slot in a waiting room, sent to all connected players.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -84,10 +68,21 @@ pub struct PlayerSlotInfo {
     pub player_id: u8,
     pub name: String,
     pub kind: SeatKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_info: Option<SeatTeamInfo>,
     #[serde(default)]
     pub reserved: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reservation_expires_at_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RankedPlayerResult {
+    pub player_id: u8,
+    pub rating_before: i32,
+    pub rating_after: i32,
+    pub rating_delta: i32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -150,6 +145,9 @@ pub enum ClientMessage {
         /// without requiring a protocol-version bump.
         #[serde(default = "default_true")]
         start_when_full: bool,
+        /// Enable ranked rating updates for this room.
+        #[serde(default)]
+        ranked: bool,
     },
     JoinGameWithPassword {
         game_code: String,
@@ -231,6 +229,18 @@ pub enum ClientMessage {
     SpectateDraft {
         draft_code: String,
     },
+    /// GH #1507: ask every other human player at the table to approve
+    /// rolling the game back to the state immediately before the requester's
+    /// most recent action. Auto-approves when the requester is the only
+    /// human seat (e.g. solo vs. AI).
+    RequestTakeback,
+    /// Approve or decline the table's pending takeback request. Any single
+    /// decline withdraws the request — rollback requires unanimous approval.
+    RespondTakeback {
+        approve: bool,
+    },
+    /// Withdraw a takeback request the caller themselves made.
+    CancelTakeback,
 }
 
 fn default_player_count() -> u8 {
@@ -253,6 +263,14 @@ pub enum ServerMessage {
         build_commit: String,
         protocol_version: u32,
         mode: ServerMode,
+        /// Public base URL clients should advertise when sharing a join code
+        /// (e.g. `https://x.ngrok-free.app` from an embedded tunnel, or a
+        /// `PUBLIC_URL` reverse proxy). Lets a host connected over `localhost`
+        /// still surface a reachable `<code>@<host>` string. Additive and
+        /// optional: older clients ignore it, older servers omit it. `None` for
+        /// LobbyOnly brokers and for servers with no advertised address.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        public_url: Option<String>,
     },
     GameCreated {
         game_code: String,
@@ -285,6 +303,14 @@ pub enum ServerMessage {
         /// Omitted (None) for hosts (who get it via GameCreated) and reconnects.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         player_token: Option<String>,
+        /// Engine events produced by `start_game` — currently the d20
+        /// first-player contest (`StartingPlayerContest`) event. Populated ONLY
+        /// on the initial post-start broadcast; empty for late joiners and
+        /// reconnects (a reconnecting player must not re-see the contest). The
+        /// contest is public (no `visibility.rs` redaction), so it goes to every
+        /// seat. `serde(default)` keeps this back-compat for older clients.
+        #[serde(default)]
+        events: Vec<GameEvent>,
     },
     StateUpdate {
         state: GameState,
@@ -326,6 +352,10 @@ pub enum ServerMessage {
     GameOver {
         winner: Option<PlayerId>,
         reason: String,
+        /// Present for ranked games where a two-player result produced
+        /// rating changes for both seats.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ranked_result: Option<Vec<RankedPlayerResult>>,
     },
     Error {
         message: String,
@@ -435,6 +465,26 @@ pub enum ServerMessage {
     DraftSpectatorView {
         view: draft_core::view::SpectatorDraftView,
     },
+    /// GH #1507: a human player has requested a takeback. Sent to every
+    /// connected seat (including the requester) so the UI can prompt the
+    /// other human players for approval.
+    TakebackRequested {
+        requester: PlayerId,
+        requester_name: String,
+    },
+    /// The pending takeback request has been resolved, either by unanimous
+    /// approval, a decline, or the requester cancelling it. When
+    /// `approved` is true, a `StateUpdate` carrying the rolled-back state
+    /// is sent to every seat immediately before this message.
+    TakebackResolved {
+        approved: bool,
+        /// The player whose response concluded the request: the decliner,
+        /// or the requester on self-cancel. `None` when every human seat
+        /// approved without a final distinguished responder (e.g. the
+        /// requester was the sole human seat).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resolved_by: Option<PlayerId>,
+    },
 }
 
 #[cfg(test)]
@@ -454,7 +504,7 @@ mod tests {
                 main_deck: vec!["Lightning Bolt".to_string(); 4],
                 sideboard: Vec::new(),
                 commander: Vec::new(),
-                bracket_tier: Default::default(),
+                ..Default::default()
             },
         };
         let json = serde_json::to_string(&msg).unwrap();
@@ -475,7 +525,7 @@ mod tests {
                 main_deck: vec!["Forest".to_string()],
                 sideboard: Vec::new(),
                 commander: Vec::new(),
-                bracket_tier: Default::default(),
+                ..Default::default()
             },
         };
         let json = serde_json::to_string(&msg).unwrap();
@@ -528,13 +578,19 @@ mod tests {
         let msg = ServerMessage::GameOver {
             winner: Some(PlayerId(1)),
             reason: "opponent conceded".to_string(),
+            ranked_result: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         let parsed: ServerMessage = serde_json::from_str(&json).unwrap();
         match parsed {
-            ServerMessage::GameOver { winner, reason } => {
+            ServerMessage::GameOver {
+                winner,
+                reason,
+                ranked_result,
+            } => {
                 assert_eq!(winner, Some(PlayerId(1)));
                 assert_eq!(reason, "opponent conceded");
+                assert!(ranked_result.is_none());
             }
             _ => panic!("wrong variant"),
         }
@@ -570,7 +626,7 @@ mod tests {
                 main_deck: vec!["Forest".to_string()],
                 sideboard: Vec::new(),
                 commander: Vec::new(),
-                bracket_tier: Default::default(),
+                ..Default::default()
             },
             display_name: "Alice".to_string(),
             public: true,
@@ -584,6 +640,7 @@ mod tests {
             host_peer_id: None,
             draft_metadata: None,
             start_when_full: true,
+            ranked: false,
         };
         let json = serde_json::to_string(&msg).unwrap();
         let parsed: ClientMessage = serde_json::from_str(&json).unwrap();
@@ -640,7 +697,7 @@ mod tests {
                 main_deck: vec!["Forest".to_string()],
                 sideboard: Vec::new(),
                 commander: Vec::new(),
-                bracket_tier: Default::default(),
+                ..Default::default()
             },
             display_name: "Bob".to_string(),
             password: None,
@@ -713,6 +770,21 @@ mod tests {
         }
     }
 
+    mod emote_guard_tests {
+        use crate::emote_guard::{guard_emote, MAX_EMOTE_LEN};
+
+        #[test]
+        fn emote_accepts_valid_text() {
+            assert!(guard_emote("GG").is_ok());
+        }
+
+        #[test]
+        fn emote_rejects_oversized_text() {
+            let err = guard_emote(&"a".repeat(MAX_EMOTE_LEN + 1)).unwrap_err();
+            assert!(err.contains("emote"));
+        }
+    }
+
     #[test]
     fn server_message_game_started_with_opponent_name_roundtrips() {
         let state = GameState::new_two_player(42);
@@ -727,6 +799,7 @@ mod tests {
             legal_actions_by_object: HashMap::new(),
             derived: Default::default(),
             player_token: None,
+            events: vec![],
         };
         let json = serde_json::to_string(&msg).unwrap();
         let parsed: ServerMessage = serde_json::from_str(&json).unwrap();
@@ -761,6 +834,7 @@ mod tests {
             legal_actions_by_object: HashMap::new(),
             derived: Default::default(),
             player_token: None,
+            events: vec![],
         };
         let json = serde_json::to_string(&msg).unwrap();
         let parsed: ServerMessage = serde_json::from_str(&json).unwrap();
@@ -795,6 +869,7 @@ mod tests {
                 room_name: None,
                 is_p2p: false,
                 is_sandbox: false,
+                is_ranked: false,
                 draft_metadata: None,
             }],
         };
@@ -827,6 +902,7 @@ mod tests {
                 room_name: None,
                 is_p2p: true,
                 is_sandbox: false,
+                is_ranked: false,
                 draft_metadata: None,
             },
         };
@@ -857,6 +933,7 @@ mod tests {
                 room_name: Some("Board-wipe special".to_string()),
                 is_p2p: false,
                 is_sandbox: false,
+                is_ranked: false,
                 draft_metadata: None,
             },
         };
@@ -1003,7 +1080,7 @@ mod tests {
                 main_deck: vec!["Forest".to_string()],
                 sideboard: Vec::new(),
                 commander: Vec::new(),
-                bracket_tier: Default::default(),
+                ..Default::default()
             },
             display_name: "Host".to_string(),
             public: false,
@@ -1022,6 +1099,7 @@ mod tests {
             host_peer_id: None,
             draft_metadata: None,
             start_when_full: true,
+            ranked: false,
         };
         let json = serde_json::to_string(&msg).unwrap();
         let parsed: ClientMessage = serde_json::from_str(&json).unwrap();
@@ -1044,9 +1122,7 @@ mod tests {
                     difficulty: AiDifficulty::Medium,
                     deck: DeckChoice::DeckList(Box::new(DeckData {
                         main_deck: vec!["Forest".to_string(); 60],
-                        sideboard: Vec::new(),
-                        commander: Vec::new(),
-                        bracket_tier: Default::default(),
+                        ..Default::default()
                     })),
                 },
             },
@@ -1150,7 +1226,8 @@ mod tests {
             server_version: "0.1.11".to_string(),
             build_commit: "abc1234".to_string(),
             protocol_version: PROTOCOL_VERSION,
-            mode: ServerMode::LobbyOnly,
+            mode: ServerMode::Full,
+            public_url: Some("https://x.ngrok-free.app".to_string()),
         };
         let json = serde_json::to_string(&msg).unwrap();
         let parsed: ServerMessage = serde_json::from_str(&json).unwrap();
@@ -1160,14 +1237,32 @@ mod tests {
                 build_commit,
                 protocol_version,
                 mode,
+                public_url,
             } => {
                 assert_eq!(server_version, "0.1.11");
                 assert_eq!(build_commit, "abc1234");
                 assert_eq!(protocol_version, PROTOCOL_VERSION);
-                assert_eq!(mode, ServerMode::LobbyOnly);
+                assert_eq!(mode, ServerMode::Full);
+                assert_eq!(public_url.as_deref(), Some("https://x.ngrok-free.app"));
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn server_hello_omits_public_url_when_none() {
+        // `skip_serializing_if` keeps the wire identical to a server with no
+        // advertised URL — and identical to the lobby-broker ServerHello, which
+        // has no such field (asserted by the lobby wire-contract test).
+        let msg = ServerMessage::ServerHello {
+            server_version: "0.1.11".to_string(),
+            build_commit: "abc1234".to_string(),
+            protocol_version: PROTOCOL_VERSION,
+            mode: ServerMode::LobbyOnly,
+            public_url: None,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(!json.contains("public_url"), "None must be omitted: {json}");
     }
 
     #[test]
@@ -1185,6 +1280,7 @@ mod tests {
             room_name: Some("Spellslingers".to_string()),
             is_p2p: true,
             is_sandbox: false,
+            is_ranked: false,
             draft_metadata: None,
         };
         let json = serde_json::to_string(&game).unwrap();
@@ -1311,7 +1407,7 @@ mod tests {
                 main_deck: vec!["Forest".to_string()],
                 sideboard: Vec::new(),
                 commander: Vec::new(),
-                bracket_tier: Default::default(),
+                ..Default::default()
             },
             display_name: "Alice".to_string(),
             public: true,
@@ -1325,6 +1421,7 @@ mod tests {
             host_peer_id: Some("peer-host-abc".to_string()),
             draft_metadata: None,
             start_when_full: true,
+            ranked: false,
         };
         let json = serde_json::to_string(&msg).unwrap();
         let parsed: ClientMessage = serde_json::from_str(&json).unwrap();
@@ -1709,7 +1806,87 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_7() {
-        assert_eq!(PROTOCOL_VERSION, 7);
+    fn protocol_version_is_13() {
+        assert_eq!(PROTOCOL_VERSION, 13);
+    }
+
+    #[test]
+    fn client_message_request_takeback_roundtrips() {
+        let msg = ClientMessage::RequestTakeback;
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: ClientMessage = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, ClientMessage::RequestTakeback));
+    }
+
+    #[test]
+    fn client_message_respond_takeback_roundtrips() {
+        let msg = ClientMessage::RespondTakeback { approve: false };
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: ClientMessage = serde_json::from_str(&json).unwrap();
+        match parsed {
+            ClientMessage::RespondTakeback { approve } => assert!(!approve),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn client_message_cancel_takeback_roundtrips() {
+        let msg = ClientMessage::CancelTakeback;
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: ClientMessage = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, ClientMessage::CancelTakeback));
+    }
+
+    #[test]
+    fn server_message_takeback_requested_roundtrips() {
+        let msg = ServerMessage::TakebackRequested {
+            requester: PlayerId(1),
+            requester_name: "Alice".to_string(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: ServerMessage = serde_json::from_str(&json).unwrap();
+        match parsed {
+            ServerMessage::TakebackRequested {
+                requester,
+                requester_name,
+            } => {
+                assert_eq!(requester, PlayerId(1));
+                assert_eq!(requester_name, "Alice");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn server_message_takeback_resolved_roundtrips() {
+        let msg = ServerMessage::TakebackResolved {
+            approved: true,
+            resolved_by: Some(PlayerId(0)),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: ServerMessage = serde_json::from_str(&json).unwrap();
+        match parsed {
+            ServerMessage::TakebackResolved {
+                approved,
+                resolved_by,
+            } => {
+                assert!(approved);
+                assert_eq!(resolved_by, Some(PlayerId(0)));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn server_message_takeback_resolved_omits_resolved_by_when_none() {
+        let msg = ServerMessage::TakebackResolved {
+            approved: false,
+            resolved_by: None,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(
+            !json.contains("resolved_by"),
+            "None must be omitted: {json}"
+        );
     }
 }

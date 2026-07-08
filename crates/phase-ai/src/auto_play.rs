@@ -1,14 +1,18 @@
 use std::collections::{HashMap, HashSet};
 
 use engine::game::engine::apply;
+use engine::game::turn_control;
 use engine::types::actions::GameAction;
 use engine::types::events::GameEvent;
 use engine::types::game_state::GameState;
 use engine::types::log::GameLogEntry;
 use engine::types::player::PlayerId;
+use rand::Rng;
+use std::sync::Arc;
 
 use crate::config::AiConfig;
-use crate::search::choose_action;
+use crate::search::choose_action_with_session;
+use crate::session::AiSession;
 
 /// Maximum AI actions before forcing a stop (safety invariant — not CR-derived).
 /// Typical AI sequences (mulligans + full turn) are 30–50 actions.
@@ -38,27 +42,25 @@ pub fn run_ai_actions(
     state: &mut GameState,
     ai_players: &HashSet<PlayerId>,
     ai_configs: &HashMap<PlayerId, AiConfig>,
+    rng: &mut impl Rng,
+    session: &Arc<AiSession>,
 ) -> Vec<AiActionResult> {
     let mut results = Vec::new();
-    let mut rng = rand::rng();
 
     for _ in 0..MAX_AI_ACTIONS_PER_SEQUENCE {
-        // CR 103.5: For simultaneous mulligan states, `acting_player()` returns
-        // None when multiple players are pending. Fall back to the first
-        // AI-controlled pending player so AI-vs-AI auto-play can advance
-        // through the mulligan phase one decision at a time.
-        let actor = match state.waiting_for.acting_player() {
-            Some(p) if ai_players.contains(&p) => p,
-            Some(_) => break, // Single human's turn
-            None => match state
-                .waiting_for
-                .acting_players()
-                .into_iter()
-                .find(|p| ai_players.contains(p))
-            {
-                Some(p) => p,
-                None => break, // No AI player is pending
-            },
+        // CR 723.5: Under turn control (Mindslaver, Emrakul), the authorized
+        // submitter is the controller — not the active player. Only run AI when
+        // that submitter is an AI seat; otherwise wait for the human controller
+        // (issue #1189).
+        let actor = state
+            .waiting_for
+            .acting_players()
+            .into_iter()
+            .map(|player| turn_control::authorized_submitter_for_player(state, player))
+            .find(|player| ai_players.contains(player));
+
+        let Some(actor) = actor else {
+            break;
         };
 
         let config = match ai_configs.get(&actor) {
@@ -69,7 +71,7 @@ pub fn run_ai_actions(
             }
         };
 
-        let action = match choose_action(state, actor, config, &mut rng) {
+        let action = match choose_action_with_session(state, actor, config, rng, session) {
             Some(a) => a,
             None => {
                 tracing::warn!(player = ?actor, "choose_action returned None — stopping AI loop");

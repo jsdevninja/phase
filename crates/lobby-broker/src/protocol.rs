@@ -21,6 +21,27 @@ use engine::types::format::{FormatConfig, GameFormat};
 use engine::types::match_config::MatchConfig;
 use serde::{Deserialize, Serialize};
 
+/// Wire-protocol version shared by the native server, client, and Cloudflare
+/// lobby Worker. Bump when any `ClientMessage` or `ServerMessage` variant is
+/// added, removed, renamed, or has a field type changed. Adding a new optional
+/// field with `#[serde(default)]` does not require a bump.
+///
+/// Note: renaming or removing a variant silently fails at JSON parse time
+/// (clients see "Invalid message: unknown variant") rather than at the
+/// handshake. When making such changes, plan a deprecation window where
+/// both the old and new variants coexist, then bump and remove the old.
+///
+/// 13 — `WaitingFor::MulliganBottomCards` removed from the full-game state
+///      payload; mulligan bottoming folded into a
+///      `MulliganDecisionPhase::BottomCards` sub-phase on
+///      `WaitingFor::MulliganDecision`.
+pub const PROTOCOL_VERSION: u32 = 13;
+
+/// Minimum protocol version accepted by lobby-only brokers at the hello
+/// handshake. Lobby traffic has a one-version rollout window; full game servers
+/// may choose a stricter floor when state/action payloads change.
+pub const MIN_SUPPORTED_PROTOCOL: u32 = PROTOCOL_VERSION.saturating_sub(1);
+
 /// Public-lobby view of a single registered game. Populated by the server,
 /// never by clients. Field shape mirrors the pre-extraction
 /// `server_core::protocol::LobbyGame` exactly for wire compatibility.
@@ -65,6 +86,9 @@ pub struct LobbyGame {
     /// `format_config.allow_debug_actions`.
     #[serde(default)]
     pub is_sandbox: bool,
+    /// True when the room is configured as ranked.
+    #[serde(default)]
+    pub is_ranked: bool,
     /// When present, this lobby entry is a draft pod rather than a
     /// constructed-play room.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -126,6 +150,8 @@ pub enum LobbyClientMessage {
         draft_metadata: Option<DraftLobbyMetadata>,
         #[serde(default = "default_true")]
         start_when_full: bool,
+        #[serde(default)]
+        ranked: bool,
     },
     JoinGameWithPassword {
         game_code: String,
@@ -264,8 +290,10 @@ pub enum ParsedFrame {
     /// A recognized lobby message. Boxed because `LobbyClientMessage` is far
     /// larger than the string variants (clippy `large_enum_variant`).
     Message(Box<LobbyClientMessage>),
-    /// The frame was malformed JSON or a recognized tag whose `data` failed to
-    /// deserialize. Carries the serde error string for the `Error` reply.
+    /// The frame was malformed JSON, a recognized tag whose `data` failed to
+    /// deserialize, or a well-formed frame whose field values exceeded the
+    /// bounds in [`crate::validation`]. Carries a human-readable reason for the
+    /// `Error` reply.
     Malformed(String),
     /// The frame's `type` is not a known lobby tag. The shell routes this to
     /// the same reject path as a mode-disabled message.
@@ -314,7 +342,10 @@ pub fn parse_lobby_client_message(text: &str) -> ParsedFrame {
         data_json
     );
     match serde_json::from_str::<LobbyClientMessage>(&reconstructed) {
-        Ok(msg) => ParsedFrame::Message(Box::new(msg)),
+        Ok(msg) => match crate::validation::validate_lobby_message(&msg) {
+            Ok(()) => ParsedFrame::Message(Box::new(msg)),
+            Err(reason) => ParsedFrame::Malformed(reason),
+        },
         Err(e) => ParsedFrame::Malformed(e.to_string()),
     }
 }
@@ -375,6 +406,20 @@ mod tests {
         let frame = r#"{"type":"Ping","data":{"timestamp":"not a number"}}"#;
         assert!(matches!(
             parse_lobby_client_message(frame),
+            ParsedFrame::Malformed(_)
+        ));
+    }
+
+    #[test]
+    fn well_formed_frame_with_out_of_bounds_field_routes_to_malformed() {
+        // Valid JSON and a known tag, but the display name exceeds the bound,
+        // so validation rejects it at the parse boundary.
+        let long_name = "a".repeat(21);
+        let frame = format!(
+            r#"{{"type":"CreateGameWithSettings","data":{{"deck":{{"main_deck":[]}},"display_name":"{long_name}","public":true,"password":null,"timer_seconds":null}}}}"#
+        );
+        assert!(matches!(
+            parse_lobby_client_message(&frame),
             ParsedFrame::Malformed(_)
         ));
     }

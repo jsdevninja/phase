@@ -2,12 +2,13 @@ use serde::{Deserialize, Serialize};
 
 use super::counter::CounterType;
 
-use super::ability::{AbilityTag, EffectKind, TargetRef};
+use super::ability::{AbilityTag, CostPaidObjectSnapshot, EffectKind, TargetRef};
 use super::game_state::ZoneChangeRecord;
 use super::identifiers::{CardId, ObjectId};
 use super::mana::ManaType;
 use super::phase::Phase;
 use super::player::{PlayerCounterKind, PlayerId};
+use super::stickers::StickerKind;
 use super::zones::Zone;
 
 /// CR 121.1: Default `nth_in_step` for `CardDrawn` events deserialized from
@@ -45,6 +46,20 @@ pub enum ManaTapState {
     FromTapTriggersResolved,
 }
 
+/// CR 602.2 + CR 606.2: Discriminates how an activated ability was activated so
+/// that "Whenever you activate a loyalty ability" triggers (CR 606.2) can be told
+/// apart from ordinary activated abilities (CR 602.2) while both share the single
+/// `GameEvent::AbilityActivated` event family. A loyalty ability is an activated
+/// ability of a planeswalker paid for by adding or removing loyalty counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum ActivatedAbilityKind {
+    /// CR 602.2: An ordinary activated ability.
+    #[default]
+    Normal,
+    /// CR 606.1 + CR 606.2: A loyalty ability of a planeswalker.
+    Loyalty,
+}
+
 impl ManaTapState {
     /// True when the mana was produced by tapping a source, regardless of
     /// whether the coupled triggered mana abilities have been resolved yet.
@@ -79,6 +94,8 @@ pub enum BendingType {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PlayerActionKind {
+    /// A player accepted a resolution-time optional effect.
+    AcceptedOptionalEffect,
     SearchedLibrary,
     Scry,
     Surveil,
@@ -87,6 +104,8 @@ pub enum PlayerActionKind {
     ShuffledLibrary,
     /// CR 701.34a: A player proliferated.
     Proliferate,
+    /// CR 701.16a: A player investigated (created a Clue token).
+    Investigate,
 }
 
 /// CR 701.30d: Result of a clash — whether the controller won, lost, or tied.
@@ -95,6 +114,45 @@ pub enum ClashResult {
     Won,
     Lost,
     Tied,
+}
+
+impl ClashResult {
+    /// CR 701.30d: A clash's `result` is stated from the clash controller's
+    /// perspective (the player who initiated the clash). Re-express it from
+    /// `player`'s perspective, returning `None` if `player` did not participate.
+    /// The controller sees `self`; the opponent sees the mirror (Won ⇄ Lost, Tied
+    /// unchanged).
+    ///
+    /// Single source of truth shared by resolution-time "if you won" gating
+    /// (`event_outcome_was_won_by_controller`) and trigger MATCHING
+    /// (`match_clash`'s `clash_result` gate) so both agree on who won.
+    pub fn for_player(
+        self,
+        clash_controller: PlayerId,
+        opponent: PlayerId,
+        player: PlayerId,
+    ) -> Option<ClashResult> {
+        if player == clash_controller {
+            Some(self)
+        } else if player == opponent {
+            Some(match self {
+                ClashResult::Won => ClashResult::Lost,
+                ClashResult::Lost => ClashResult::Won,
+                ClashResult::Tied => ClashResult::Tied,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+/// CR 103.1 / CR 706: one round of the starting-player d20 roll-off.
+/// `rolls` are in seat order; round 1 contains every seat, and each later
+/// round contains exactly the previous round's tied-max group (CR 103.1
+/// reroll). The high roller of the final round becomes the starting player.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContestRound {
+    pub rolls: Vec<(PlayerId, u8)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -115,6 +173,32 @@ pub enum GameEvent {
         card_id: CardId,
         controller: PlayerId,
         object_id: ObjectId, // CR 601.2a: The spell object on the stack
+    },
+    /// CR 702.140c + CR 730.2: A mutating creature spell merged with a target
+    /// creature, forming a mutated permanent. Emitted by
+    /// `merge::merge_object_onto`. `merged_id` is the surviving permanent's
+    /// `ObjectId` (the target creature's, kept per CR 730.2c); `merging_id` is the
+    /// component card/token that merged onto it; `controller` is the merging
+    /// spell's controller. "Whenever this creature mutates" triggers (CR 702.140d)
+    /// listen here — downstream condition handling is deferred (no Phase-1 card
+    /// needs it), but the event is observable now.
+    Mutated {
+        merged_id: ObjectId,
+        merging_id: ObjectId,
+        controller: PlayerId,
+    },
+    /// Unstable Host/Augment: a card with augment combined with a Host
+    /// creature, forming a merged permanent. Emitted by `augment.rs`.
+    /// `merged_id` is the surviving permanent's `ObjectId` (the Host
+    /// creature's continuity id); `augmenting_id` is the augment component that
+    /// merged onto it; `controller` is the player who performed the combine.
+    ///
+    /// Distinct from `Mutated`: Augment reuses merge-like bookkeeping but is a
+    /// separate mechanic and must not satisfy `TriggerMode::Mutates`.
+    Augmented {
+        merged_id: ObjectId,
+        augmenting_id: ObjectId,
+        controller: PlayerId,
     },
     /// CR 707.10: A spell was copied onto the stack. A copy of a spell isn't
     /// cast, so this is a distinct event from `SpellCast` — copy-sensitive
@@ -149,6 +233,14 @@ pub enum GameEvent {
         /// ability's effect (Burning-Tree Shaman, Flamescroll Celebrant).
         player_id: PlayerId,
         source_id: ObjectId,
+        /// CR 606.2: Distinguishes loyalty-ability activations (planeswalker
+        /// abilities paid with loyalty counters) from ordinary activated
+        /// abilities so the "Whenever you activate a loyalty ability" trigger
+        /// class can match without a separate event. `#[serde(default)]` keeps
+        /// older serialized `AbilityActivated` events (which predate this field)
+        /// deserializing as `Normal`.
+        #[serde(default)]
+        kind: ActivatedAbilityKind,
     },
     /// CR 603.6a: Enters-the-battlefield and zone-change triggers fire on this
     /// event. `from` is `None` when an object is created directly in a zone
@@ -223,6 +315,41 @@ pub enum GameEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         caused_by: Option<ObjectId>,
     },
+    /// CR 701.43a + CR 701.43d: A creature was exerted as it attacked. Fires the
+    /// linked `TriggerMode::Exerted` "when you do" trigger (Combat Celebrant,
+    /// Glory-Bound Initiate, ...).
+    CreatureExerted {
+        object_id: ObjectId,
+    },
+    /// CR 702.154c: A creature enlisted another creature as it attacked. Fires
+    /// the linked `TriggerMode::Enlisted` "when you do" trigger and carries the
+    /// tapped creature's LKI snapshot for CR 608.2h resolution.
+    CreatureEnlisted {
+        attacker: ObjectId,
+        tapped: ObjectId,
+        tapped_snapshot: Box<CostPaidObjectSnapshot>,
+    },
+    /// CR 701.47c: An amass instruction chose an Army creature. This event is
+    /// observational; the resolving ability carries the authoritative
+    /// `amassed_army_object` snapshot for later CR 701.47c references.
+    ArmyAmassed {
+        object_id: ObjectId,
+        source_id: ObjectId,
+        controller: PlayerId,
+    },
+    /// CR 702.143a: A player foretold a card from their hand.
+    Foretold {
+        player_id: PlayerId,
+        object_id: ObjectId,
+    },
+    /// CR 702.143d: a card in exile became foretold via an effect (e.g. The
+    /// Foretold Soldier "exile it face down. It becomes foretold."). Distinct
+    /// from the CR 702.143a foretell special action — it does NOT fire
+    /// "whenever you foretell" triggers (CR 702.143c reserves "foretell" for
+    /// the special action).
+    BecameForetold {
+        object_id: ObjectId,
+    },
     PlayerLost {
         player_id: PlayerId,
     },
@@ -290,12 +417,30 @@ pub enum GameEvent {
     Discarded {
         player_id: PlayerId,
         object_id: ObjectId,
+        /// CR 603.2 + CR 109.5: The spell/ability that caused this discard, if any
+        /// (effect- or cost-driven discards). `None` for a player's own
+        /// turn-based / hand-size discards. Carried from `ProposedEvent::Discard`
+        /// so triggers like "when a spell or ability an opponent controls causes
+        /// you to discard this card" can resolve the cause's controller.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_id: Option<ObjectId>,
     },
     DamageCleared {
         object_id: ObjectId,
     },
     GameOver {
         winner: Option<PlayerId>,
+    },
+    /// CR 732.2: A mandatory auto-resolution sequence hit the engine's resource
+    /// ceiling without settling — a net-progress loop the engine cannot
+    /// shortcut (CR 732.2 resolves these by a player-declared iteration count
+    /// the engine can't infer). Resolution is paused and priority returned to
+    /// the active player. NOT a draw: distinct from CR 104.4b, which requires a
+    /// *repeating* state (a true loop is detected separately and ends the game).
+    /// `involved` carries the in-flight cascade's distinct stack-source ids for
+    /// diagnostics only — never read by game logic.
+    ResolutionHalted {
+        involved: Vec<ObjectId>,
     },
     DamageDealt {
         source_id: ObjectId,
@@ -316,11 +461,22 @@ pub enum GameEvent {
     SpellCountered {
         object_id: ObjectId,
         countered_by: ObjectId,
+        /// CR 109.5: "you control" on counter triggers refers to the countering
+        /// spell or ability's controller, not necessarily the source object's
+        /// current controller.
+        countered_by_controller: PlayerId,
     },
     CounterAdded {
         object_id: ObjectId,
         counter_type: CounterType,
         count: u32,
+    },
+    /// Digital-only Alchemy (no CR entry): a card's intensity increased by
+    /// `amount`. Emitted per affected card so consumers (triggers that watch for
+    /// intensifying, frontend animation) can see exactly which cards changed.
+    ObjectIntensified {
+        object_id: ObjectId,
+        amount: u32,
     },
     /// CR 702.100b: A creature evolved because one or more +1/+1 counters were
     /// put on it as a result of its evolve ability resolving.
@@ -335,6 +491,12 @@ pub enum GameEvent {
     TokenCreated {
         object_id: ObjectId,
         name: String,
+        /// CR 111.1: the object id of the ability/spell that created this token
+        /// (the creating effect's `source_id`). Lets consumers attribute a token
+        /// to its creator — e.g. "destroy all OTHER creatures" sparing only the
+        /// tokens the resolving spell itself made, distinct from tokens a
+        /// replacement effect produced during the same resolution.
+        source_id: ObjectId,
     },
     /// Digital-only: A card was conjured from outside the game into a zone.
     ObjectConjured {
@@ -347,6 +509,12 @@ pub enum GameEvent {
     PermanentSacrificed {
         object_id: ObjectId,
         player_id: PlayerId,
+    },
+    /// CR 613.1b: A continuous effect changed an object's controller in layer 2.
+    ControllerChanged {
+        object_id: ObjectId,
+        old_controller: PlayerId,
+        new_controller: PlayerId,
     },
     EffectResolved {
         kind: EffectKind,
@@ -368,6 +536,15 @@ pub enum GameEvent {
     BlockersDeclared {
         assignments: Vec<(ObjectId, ObjectId)>,
     },
+    /// CR 509.3c: An effect made an attacking creature become blocked, and it was
+    /// an unblocked creature at that time — the precondition for "becomes blocked"
+    /// triggers to fire from an effect-block.
+    /// CR 509.3d: A "becomes blocked BY A CREATURE" trigger, and any blocker-side
+    /// "whenever ~ blocks" trigger, must NOT fire from an effect-block — this event
+    /// is distinct from BlockersDeclared precisely so those matchers ignore it.
+    AttackerBecameBlockedByEffect {
+        attacker: ObjectId,
+    },
     /// CR 508.1h + CR 509.1d: The aggregate combat tax was paid; the declaration
     /// proceeds with every declared creature intact.
     CombatTaxPaid {
@@ -384,7 +561,7 @@ pub enum GameEvent {
         target: TargetRef,
         source_id: ObjectId,
     },
-    /// CR 702.122d: A Vehicle's crew ability resolved.
+    /// CR 702.122e: A Vehicle's crew ability resolved.
     /// Carries creature list for trigger conditions that reference "creatures that crewed it".
     VehicleCrewed {
         vehicle_id: ObjectId,
@@ -417,10 +594,23 @@ pub enum GameEvent {
     Transformed {
         object_id: ObjectId,
     },
+    /// Digital-only Specialize: a permanent became a color-specific specialized face.
+    Specialized {
+        object_id: ObjectId,
+        color: crate::types::mana::ManaColor,
+    },
     DayNightChanged {
         new_state: String,
     },
     TurnedFaceUp {
+        object_id: ObjectId,
+    },
+    /// CR 701.27b: A face-up permanent was turned face down by a resolving effect
+    /// (Cyber Conversion). Distinct from `Transformed` — turning face down and
+    /// transforming are different game actions, so a "whenever a permanent is
+    /// turned face down" trigger must observe THIS event, not `Transformed`.
+    /// Drives the game log and the public-state/frontend re-render.
+    TurnedFaceDown {
         object_id: ObjectId,
     },
     CardsRevealed {
@@ -431,7 +621,29 @@ pub enum GameEvent {
     },
     CombatDamageDealtToPlayer {
         player_id: PlayerId,
-        source_ids: Vec<ObjectId>,
+        /// CR 120.1 + CR 510.2: Per-source combat damage amounts for this
+        /// specific combat damage step. Using step-local amounts instead of a
+        /// bare `Vec<ObjectId>` prevents double-strike / extra-combat inflation
+        /// in `matching_damage_done_once_by_controller_event`: each
+        /// `apply_combat_damage` call produces exactly one event per player with
+        /// the amounts from that step only.
+        ///
+        /// Migration note: this field replaces the former `source_ids:
+        /// Vec<ObjectId>`. `#[serde(default)]` keeps deserialization of older
+        /// persisted state infallible, but an old-format event (a game persisted
+        /// mid-combat-damage-trigger by a pre-rename binary and restored after an
+        /// upgrade) decodes to an empty set — the legacy `source_ids` array is
+        /// dropped. This is acceptable: the event is transient (produced and
+        /// consumed within one combat-damage step), the window is the rare
+        /// mid-trigger save across a server upgrade, and it degrades to "no
+        /// matching sources" rather than crashing. The old format carried no
+        /// amounts, so no migration shim could recover `total_damage` regardless.
+        #[serde(default)]
+        source_amounts: Vec<(ObjectId, u32)>,
+        /// CR 120.1: Total actual damage dealt to this player in this combat
+        /// damage step — the sum of all `source_amounts` entries.
+        #[serde(default)]
+        total_damage: u32,
     },
     PlayerEliminated {
         player_id: PlayerId,
@@ -447,12 +659,27 @@ pub enum GameEvent {
         player_id: PlayerId,
         action: PlayerActionKind,
     },
+    /// Engine-authored diagnostic for top-card predicate
+    /// guesses. This is intentionally a log/debug event rather than rules input:
+    /// `ChooseOption` remains the authoritative action, while this records
+    /// which predicate AI or a human guessed.
+    CardPredicateGuessMade {
+        player_id: PlayerId,
+        source_id: Option<ObjectId>,
+        choice: String,
+    },
     /// CR 701.19a: Regeneration shield — consumed on use, expires at cleanup.
     Regenerated {
         object_id: ObjectId,
     },
     /// CR 701.60a: A creature was suspected.
     CreatureSuspected {
+        object_id: ObjectId,
+    },
+    /// CR 701.60a: A creature is no longer suspected — the un-designation
+    /// transition. Emitted only when the toggle actually flips (idempotent
+    /// resolver). Mirrors `BecameUnprepared`.
+    CreatureNoLongerSuspected {
         object_id: ObjectId,
     },
     /// CR 701.35a: A permanent was detained — until the detaining player's next
@@ -491,11 +718,25 @@ pub enum GameEvent {
     CityBlessingGained {
         player_id: PlayerId,
     },
-    /// CR 706: A die was rolled.
+    /// CR 706: A die was rolled. `result` is `None` when the roll has no numeric
+    /// face value — the symbolic planar die (CR 901.9d / CR 706.7): the
+    /// `RolledDie` trigger still fires, but numeric-result consumers ignore it.
     DieRolled {
         player_id: PlayerId,
         sides: u8,
-        result: u8,
+        result: Option<u8>,
+    },
+    /// CR 103.1 / CR 706: The game-1 starting-player roll-off, emitted as one
+    /// authoritative structured event so the contest can be rendered round by
+    /// round (including tie rerolls) with no downstream re-derivation. `rounds`
+    /// preserves the round boundaries the engine computes; `winner` is the
+    /// engine's authoritative starting player (unique max of the final round, or
+    /// the lowest-seat fallback when tied at the reroll cap). Replaces the prior
+    /// flat per-roll `DieRolled` batch on the starting-player contest path; in-game
+    /// die rolls still emit `DieRolled`.
+    StartingPlayerContest {
+        rounds: Vec<ContestRound>,
+        winner: PlayerId,
     },
     /// CR 705: A coin was flipped.
     CoinFlipped {
@@ -530,9 +771,74 @@ pub enum GameEvent {
         player_id: PlayerId,
         dungeon: crate::game::dungeon::DungeonId,
     },
-    /// CR 725: A player took the initiative.
+    /// CR 701.31 / CR 901.11: The planar controller planeswalked — the active
+    /// plane/phenomenon (`from`) is put on the bottom of the planar deck face
+    /// down and the new top card (`to`) is turned face up.
+    Planeswalked {
+        player_id: PlayerId,
+        from: Option<ObjectId>,
+        to: Option<ObjectId>,
+    },
+    /// CR 311.7 / CR 901.9b: Chaos ensued — the active plane's chaos-triggered
+    /// ability triggers.
+    ChaosEnsued {
+        plane_id: ObjectId,
+    },
+    /// CR 901.9: The planar die was rolled, landing on the given face.
+    PlanarDieRolled {
+        player_id: PlayerId,
+        face: crate::game::planechase::PlanarDieFace,
+    },
+    /// CR 904.9 / CR 701.32b: A scheme was set in motion (turned face up in the
+    /// command zone). Fires "When you set this scheme in motion" (SetInMotion).
+    SchemeSetInMotion {
+        player_id: PlayerId,
+        scheme_id: ObjectId,
+    },
+    /// CR 701.33b / CR 904.10: A scheme was abandoned (turned face down and put
+    /// on the bottom of its owner's scheme deck).
+    SchemeAbandoned {
+        player_id: PlayerId,
+        scheme_id: ObjectId,
+    },
+    /// CR 726.2: A player took the initiative.
     InitiativeTaken {
         player_id: PlayerId,
+    },
+    /// CR 701.51c: An Attraction was opened onto the battlefield.
+    AttractionOpened {
+        player_id: PlayerId,
+        object_id: ObjectId,
+    },
+    /// Unstable Contraptions: a Contraption was assembled from a player's
+    /// supplementary Contraption deck onto a sprocket.
+    ContraptionAssembled {
+        player_id: PlayerId,
+        object_id: ObjectId,
+        sprocket: u8,
+    },
+    StickerPlaced {
+        player_id: PlayerId,
+        object_id: ObjectId,
+        kind: StickerKind,
+    },
+    /// CR 701.52: The active player rolled to visit their Attractions.
+    AttractionsRolledToVisit {
+        player_id: PlayerId,
+        roll: u8,
+    },
+    /// CR 701.52a + CR 702.159a: A specific Attraction was visited this roll.
+    AttractionVisited {
+        player_id: PlayerId,
+        roll: u8,
+        attraction_id: ObjectId,
+    },
+    /// Unstable Contraptions: a specific Contraption on a sprocket was
+    /// cranked. `TriggerMode::CrankContraption` listens to this event.
+    ContraptionCranked {
+        player_id: PlayerId,
+        sprocket: u8,
+        contraption_id: ObjectId,
     },
     /// Avatar crossover: A firebending ability resolved and produced mana.
     Firebend {
@@ -697,6 +1003,42 @@ mod tests {
     }
 
     #[test]
+    fn ability_activated_kind_defaults_to_normal_for_legacy_state() {
+        // CR 606.2: an older serialized `AbilityActivated` event predates the
+        // `kind` field. `#[serde(default)]` must deserialize it as `Normal`,
+        // never failing or silently treating it as `Loyalty`.
+        let legacy = serde_json::json!({
+            "type": "AbilityActivated",
+            "data": { "player_id": 0, "source_id": 7 }
+        });
+        let event: GameEvent = serde_json::from_value(legacy).unwrap();
+        match event {
+            GameEvent::AbilityActivated { kind, .. } => {
+                assert_eq!(kind, ActivatedAbilityKind::Normal);
+            }
+            other => panic!("expected AbilityActivated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ability_activated_kind_round_trips() {
+        // CR 606.2: the discriminator survives serialization.
+        for kind in [ActivatedAbilityKind::Normal, ActivatedAbilityKind::Loyalty] {
+            let event = GameEvent::AbilityActivated {
+                player_id: PlayerId(1),
+                source_id: ObjectId(9),
+                kind,
+            };
+            let json = serde_json::to_value(&event).unwrap();
+            let back: GameEvent = serde_json::from_value(json).unwrap();
+            match back {
+                GameEvent::AbilityActivated { kind: k, .. } => assert_eq!(k, kind),
+                other => panic!("expected AbilityActivated, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn zone_changed_serializes_all_fields() {
         let event = GameEvent::ZoneChanged {
             object_id: ObjectId(5),
@@ -762,7 +1104,8 @@ mod tests {
     fn combat_damage_dealt_to_player_roundtrips() {
         let event = GameEvent::CombatDamageDealtToPlayer {
             player_id: PlayerId(1),
-            source_ids: vec![ObjectId(10), ObjectId(11)],
+            source_amounts: vec![(ObjectId(10), 3), (ObjectId(11), 4)],
+            total_damage: 7,
         };
         let serialized = serde_json::to_string(&event).unwrap();
         let deserialized: GameEvent = serde_json::from_str(&serialized).unwrap();

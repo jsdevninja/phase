@@ -1,4 +1,4 @@
-use crate::types::ability::TargetRef;
+use crate::types::ability::{Effect, EffectKind, QuantityExpr, TargetRef};
 use crate::types::card_type::CoreType;
 use crate::types::events::GameEvent;
 use crate::types::game_state::{GameState, PublicStateDirty, WaitingFor};
@@ -7,30 +7,85 @@ use crate::types::player::PlayerId;
 use crate::types::zones::Zone;
 
 use super::derived::derive_display_state;
-use super::layers::evaluate_layers;
+use super::layers::flush_layers;
 use super::turn_control;
 
-/// Finalize outward-facing game state before it leaves the engine boundary.
+/// Finalize rules-visible game state at an engine action boundary.
 ///
 /// This is the single authoritative place that synchronizes `priority_player`
-/// from `waiting_for`, evaluates layers when dirty, and derives display-only
-/// state used by the frontend.
-pub fn finalize_public_state(state: &mut GameState) {
+/// from `waiting_for` and evaluates layers when dirty. Display-only derivation
+/// is split into [`finalize_display_state`] so engine-owned fast-forward loops
+/// can keep rules state current while batching expensive display recomputes.
+pub fn finalize_rules_state(state: &mut GameState) {
     // CR 614.12a + CR 615.5: Backward-compat for the 2026-05-09 audit M4
     // post-replacement-continuation slot fold. Idempotent on already-migrated
     // states; cheap on every other invocation.
     state.migrate_post_replacement_continuation();
+    normalize_legacy_attach_waiting_for(state);
     sync_priority_player_from_waiting_for(state);
-    if state.layers_dirty {
-        evaluate_layers(state);
-    }
+    flush_layers(state);
+}
+
+/// Finalize display-only cached state before exposing state to consumers.
+pub fn finalize_display_state(state: &mut GameState) {
     derive_display_state(state);
     clear_public_state_dirty(state);
 }
 
+/// Finalize outward-facing game state before it leaves the engine boundary.
+pub fn finalize_public_state(state: &mut GameState) {
+    finalize_rules_state(state);
+    finalize_display_state(state);
+}
+
 pub fn sync_waiting_for(state: &mut GameState, waiting_for: &WaitingFor) {
     state.waiting_for = waiting_for.clone();
+    normalize_legacy_attach_waiting_for(state);
     sync_priority_player_from_waiting_for(state);
+}
+
+fn normalize_legacy_attach_waiting_for(state: &mut GameState) {
+    let WaitingFor::EffectZoneChoice {
+        effect_kind: EffectKind::Attach,
+        count: 1,
+        min_count: 1,
+        up_to: false,
+        cards,
+        ..
+    } = &state.waiting_for
+    else {
+        return;
+    };
+
+    let Some(cont) = state.pending_continuation.as_ref() else {
+        return;
+    };
+    if !matches!(&cont.chain.effect, Effect::Attach { .. }) || !cont.chain.targeting_is_optional() {
+        return;
+    }
+
+    let normalized_count = cont
+        .chain
+        .multi_target
+        .as_ref()
+        .map(|spec| match &spec.max {
+            Some(QuantityExpr::Fixed { value }) if *value >= 0 => *value as usize,
+            Some(_) | None => cards.len(),
+        })
+        .unwrap_or(1)
+        .min(cards.len().max(1));
+
+    if let WaitingFor::EffectZoneChoice {
+        count,
+        min_count,
+        up_to,
+        ..
+    } = &mut state.waiting_for
+    {
+        *count = normalized_count;
+        *min_count = 0;
+        *up_to = true;
+    }
 }
 
 fn sync_priority_player_from_waiting_for(state: &mut GameState) {
@@ -106,14 +161,26 @@ fn mark_object_dirty_with_mana(state: &mut GameState, object_id: ObjectId) {
 pub fn mark_public_state_from_events(state: &mut GameState, events: &[GameEvent]) {
     // GATE 1 — static/continuous ripple.
     // CR 611.1 + CR 613.1: A continuous effect can modify any object's
-    // characteristics across the whole board; if layers were re-evaluated this
-    // action (`layers_dirty`), display state for the entire board is potentially
-    // stale, so recompute all of it. This single check covers anthems,
-    // type-changers, keyword-granters, CDAs, control changes, P/T setters, and
-    // every transient continuous effect — they all set `layers_dirty`.
-    if state.layers_dirty {
-        mark_public_state_all_dirty(state);
-        return;
+    // characteristics across the whole board; if a FULL layer re-evaluation is
+    // pending this action, display state for the entire board is potentially
+    // stale, so recompute all of it. This covers anthems, type-changers,
+    // keyword-granters, CDAs, control changes, P/T setters, and every transient
+    // continuous effect — they all request a full layer flush.
+    //
+    // An `EnteredObjects` request is an incremental layer flush that only
+    // re-derives the entering objects (see `flush_layers`); it does NOT ripple
+    // board-wide, so it falls through to GATE 2. `finalize_public_state` runs
+    // `flush_layers` immediately after this function, and the incremental path
+    // marks each entered object (and the battlefield display) dirty itself, so
+    // the entered objects' display is recomputed. The entry's own
+    // `ZoneChanged` event is also handled by GATE 2 below.
+    match &state.layers_dirty {
+        crate::types::game_state::LayersDirty::Full => {
+            mark_public_state_all_dirty(state);
+            return;
+        }
+        crate::types::game_state::LayersDirty::Clean
+        | crate::types::game_state::LayersDirty::EnteredObjects(_) => {}
     }
 
     // GATE 2 — per-event targeted marking. `layers_dirty` was NOT set, so no
@@ -169,6 +236,23 @@ pub fn mark_public_state_from_events(state: &mut GameState, events: &[GameEvent]
                 mark_public_state_object_dirty(state, *object_id);
                 mark_mana_display_dirty(state);
             }
+            // CR 701.43a: exerting adds a CantUntap transient (which sets
+            // layers_dirty → Gate 1); mark the exerted object directly so its
+            // display reflects the exert even on the layers-clean path.
+            GameEvent::CreatureExerted { object_id }
+            | GameEvent::Foretold { object_id, .. }
+            | GameEvent::BecameForetold { object_id } => {
+                mark_public_state_object_dirty(state, *object_id);
+            }
+            GameEvent::CreatureEnlisted {
+                attacker, tapped, ..
+            } => {
+                mark_public_state_object_dirty(state, *attacker);
+                mark_public_state_object_dirty(state, *tapped);
+            }
+            GameEvent::ArmyAmassed { object_id, .. } => {
+                mark_public_state_object_dirty(state, *object_id);
+            }
             GameEvent::ManaAdded { player_id, .. }
             | GameEvent::ManaPoolEmptied { player_id, .. }
             | GameEvent::ManaRecolored { player_id, .. } => {
@@ -188,8 +272,24 @@ pub fn mark_public_state_from_events(state: &mut GameState, events: &[GameEvent]
                 mark_public_state_player_dirty(state, *player_id);
                 mark_mana_display_dirty(state);
             }
+            // CR 702.140c + CR 730.2: a merge changes the surviving permanent's
+            // displayed characteristics. `merge_object_onto` already marks
+            // `layers_dirty` (Gate 1 caught it), but mark the merged object here
+            // too so this arm is sound even if a future caller skips the full mark.
+            GameEvent::Mutated { merged_id, .. } => {
+                mark_object_dirty_with_mana(state, *merged_id);
+                mark_battlefield_display_dirty(state);
+            }
+            // Unstable Host/Augment combine uses the same merged-permanent
+            // display surface as mutate, but it is a distinct game event.
+            GameEvent::Augmented { merged_id, .. } => {
+                mark_object_dirty_with_mana(state, *merged_id);
+                mark_battlefield_display_dirty(state);
+            }
             GameEvent::CounterAdded { object_id, .. }
+            | GameEvent::ObjectIntensified { object_id, .. }
             | GameEvent::CounterRemoved { object_id, .. }
+            | GameEvent::ControllerChanged { object_id, .. }
             | GameEvent::Evolved { object_id } => {
                 // +1/+1 counters set `layers_dirty` (counters.rs) → Gate 1 caught
                 // them; this arm fires only for counters that did not touch
@@ -235,6 +335,7 @@ pub fn mark_public_state_from_events(state: &mut GameState, events: &[GameEvent]
             | GameEvent::Discarded {
                 player_id,
                 object_id,
+                ..
             }
             | GameEvent::Cycled {
                 player_id,
@@ -259,6 +360,11 @@ pub fn mark_public_state_from_events(state: &mut GameState, events: &[GameEvent]
             GameEvent::MonarchChanged { player_id }
             | GameEvent::CityBlessingGained { player_id }
             | GameEvent::InitiativeTaken { player_id }
+            | GameEvent::AttractionOpened { player_id, .. }
+            | GameEvent::ContraptionAssembled { player_id, .. }
+            | GameEvent::AttractionsRolledToVisit { player_id, .. }
+            | GameEvent::AttractionVisited { player_id, .. }
+            | GameEvent::ContraptionCranked { player_id, .. }
             | GameEvent::RingTemptsYou { player_id } => {
                 mark_public_state_player_dirty(state, *player_id);
             }
@@ -271,7 +377,11 @@ pub fn mark_public_state_from_events(state: &mut GameState, events: &[GameEvent]
             // Transform changes copiable values (Layer 1) and can flip statics
             // on/off; conservatively all-dirty.
             | GameEvent::Transformed { .. }
-            | GameEvent::TurnedFaceUp { .. } => {
+            | GameEvent::Specialized { .. }
+            | GameEvent::TurnedFaceUp { .. }
+            // Turning a permanent face down resets its copiable values to a 2/2
+            // face-down body (Layer 1) and changes its visibility; recompute.
+            | GameEvent::TurnedFaceDown { .. } => {
                 mark_public_state_all_dirty(state);
                 return;
             }
@@ -301,11 +411,14 @@ pub fn mark_public_state_from_events(state: &mut GameState, events: &[GameEvent]
             | GameEvent::StackPushed { .. }
             | GameEvent::StackResolved { .. }
             | GameEvent::GameOver { .. }
+            // CR 732.2: a halted-resolution notification dirties no display state.
+            | GameEvent::ResolutionHalted { .. }
             | GameEvent::SpellCountered { .. }
             | GameEvent::EffectResolved { .. }
             | GameEvent::Unattached { .. }
             | GameEvent::AttackersDeclared { .. }
             | GameEvent::BlockersDeclared { .. }
+            | GameEvent::AttackerBecameBlockedByEffect { .. }
             | GameEvent::CombatTaxPaid { .. }
             | GameEvent::CombatTaxDeclined { .. }
             | GameEvent::BecomesTarget { .. }
@@ -321,16 +434,29 @@ pub fn mark_public_state_from_events(state: &mut GameState, events: &[GameEvent]
             | GameEvent::PlayerPerformedAction { .. }
             | GameEvent::Regenerated { .. }
             | GameEvent::CreatureSuspected { .. }
+            | GameEvent::CreatureNoLongerSuspected { .. }
             | GameEvent::BecamePrepared { .. }
             | GameEvent::BecameUnprepared { .. }
             | GameEvent::CaseSolved { .. }
             | GameEvent::ClassLevelGained { .. }
             | GameEvent::DieRolled { .. }
             | GameEvent::CoinFlipped { .. }
+            // CR 103.1: starting-player contest carries no public-state delta;
+            // it is rendered from the structured event log, not derived state.
+            | GameEvent::StartingPlayerContest { .. }
             | GameEvent::RoomEntered { .. }
             | GameEvent::RoomDoorUnlocked { .. }
             | GameEvent::BecomesPlotted { .. }
             | GameEvent::DungeonCompleted { .. }
+            // Planechase events: the planar deck / controller are authoritative
+            // state serialized directly; they carry no per-object display delta.
+            | GameEvent::Planeswalked { .. }
+            | GameEvent::ChaosEnsued { .. }
+            | GameEvent::PlanarDieRolled { .. }
+            // Archenemy events: the scheme deck / archenemy are authoritative
+            // state serialized directly; they carry no per-object display delta.
+            | GameEvent::SchemeSetInMotion { .. }
+            | GameEvent::SchemeAbandoned { .. }
             | GameEvent::Firebend { .. }
             | GameEvent::Airbend { .. }
             | GameEvent::Earthbend { .. }
@@ -345,9 +471,11 @@ pub fn mark_public_state_from_events(state: &mut GameState, events: &[GameEvent]
             | GameEvent::VoteResolved { .. }
             | GameEvent::PowerToughnessChanged { .. }
             | GameEvent::CascadeMissed { .. }
+            | GameEvent::CardPredicateGuessMade { .. }
             | GameEvent::DebugActionUsed { .. }
             | GameEvent::DebugPermissionGranted { .. }
-            | GameEvent::DebugPermissionRevoked { .. } => {}
+            | GameEvent::DebugPermissionRevoked { .. }
+            | GameEvent::StickerPlaced { .. } => {}
         }
     }
 }
@@ -363,6 +491,7 @@ pub fn clear_public_state_dirty(state: &mut GameState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::game_state::{CastOfferKind, PendingContinuation};
     use crate::types::identifiers::ObjectId;
 
     #[test]
@@ -372,10 +501,13 @@ mod tests {
 
         sync_waiting_for(
             &mut state,
-            &WaitingFor::DiscoverChoice {
+            &WaitingFor::CastOffer {
                 player: PlayerId(0),
-                hit_card: ObjectId(10),
-                exiled_misses: Vec::new(),
+                kind: CastOfferKind::Discover {
+                    hit_card: ObjectId(10),
+                    exiled_misses: Vec::new(),
+                    discover_value: 0,
+                },
             },
         );
 
@@ -386,10 +518,13 @@ mod tests {
     fn finalize_public_state_updates_priority_player_for_resolution_choices() {
         let mut state = GameState::new_two_player(42);
         state.priority_player = PlayerId(1);
-        state.waiting_for = WaitingFor::DiscoverChoice {
+        state.waiting_for = WaitingFor::CastOffer {
             player: PlayerId(0),
-            hit_card: ObjectId(10),
-            exiled_misses: Vec::new(),
+            kind: CastOfferKind::Discover {
+                hit_card: ObjectId(10),
+                exiled_misses: Vec::new(),
+                discover_value: 0,
+            },
         };
 
         finalize_public_state(&mut state);
@@ -409,6 +544,68 @@ mod tests {
         finalize_public_state(&mut state);
 
         assert_eq!(state.priority_player, PlayerId(0));
+    }
+
+    #[test]
+    fn finalize_rules_state_normalizes_legacy_optional_attach_choice() {
+        let mut state = GameState::new_two_player(42);
+        let mut ability = ResolvedAbility::new(
+            Effect::Attach {
+                attachment: TargetFilter::Typed(
+                    crate::types::ability::TypedFilter::default()
+                        .subtype("Equipment".to_string())
+                        .controller(crate::types::ability::ControllerRef::You),
+                ),
+                target: TargetFilter::TriggeringSource,
+            },
+            vec![],
+            ObjectId(19),
+            PlayerId(0),
+        );
+        ability.multi_target = Some(crate::types::ability::MultiTargetSpec::unlimited(0));
+        state.pending_continuation = Some(PendingContinuation::new(Box::new(ability)));
+        state.waiting_for = WaitingFor::EffectZoneChoice {
+            enters_modified_if: None,
+            player: PlayerId(0),
+            cards: vec![ObjectId(5), ObjectId(11)],
+            count: 1,
+            min_count: 1,
+            up_to: false,
+            source_id: ObjectId(19),
+            effect_kind: EffectKind::Attach,
+            zone: Zone::Battlefield,
+            destination: None,
+            enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+            enter_transformed: false,
+            enters_under_player: None,
+            enters_attacking: false,
+            owner_library: false,
+            track_exiled_by_source: false,
+            face_down_profile: None,
+            enter_with_counters: vec![],
+            conditional_enter_with_counters: vec![],
+            count_param: 0,
+            library_position: None,
+            is_cost_payment: false,
+        };
+
+        finalize_rules_state(&mut state);
+
+        match state.waiting_for {
+            WaitingFor::EffectZoneChoice {
+                count,
+                min_count,
+                up_to,
+                effect_kind,
+                ..
+            } => {
+                assert_eq!(effect_kind, EffectKind::Attach);
+                assert_eq!(count, 2);
+                assert_eq!(min_count, 0);
+                assert!(up_to);
+            }
+            other => panic!("expected normalized Attach choice, got {other:?}"),
+        }
     }
 
     // ── Event-driven dirty-marking (perf fix) ────────────────────────────────
@@ -490,11 +687,14 @@ mod tests {
         // before classifying — exactly the state `apply()` reaches when layers
         // are not pending.
         assert!(
-            state.layers_dirty,
+            state.layers_dirty.is_dirty(),
             "real copy resolver must set layers_dirty"
         );
         evaluate_layers(&mut state);
-        assert!(!state.layers_dirty, "evaluate_layers clears layers_dirty");
+        assert!(
+            !state.layers_dirty.is_dirty(),
+            "evaluate_layers clears layers_dirty"
+        );
 
         clear_public_state_dirty(&mut state);
         mark_public_state_from_events(&mut state, &events);
@@ -515,31 +715,72 @@ mod tests {
         assert!(!dirty.all_players_dirty, "no player-wide change occurred");
     }
 
-    /// CORRECTNESS-FALLBACK: a real battlefield entry leaves `layers_dirty` set
-    /// (the resolver sets it because a static-bearing object or board static
-    /// could newly apply — Section 4 suppression is not in scope here), so
-    /// Gate 1 escalates to a full all-dirty recompute.
+    /// A real battlefield entry now leaves `layers_dirty` in the
+    /// `EnteredObjects` state (the resolver requests an incremental re-derive of
+    /// just the entering token). Gate 1 must NOT escalate to all-dirty for that
+    /// case — it falls through to Gate 2 targeted marking, and the subsequent
+    /// `flush_layers` incremental path produces the same display as a full
+    /// recompute (asserted via the differential test below).
     #[test]
-    fn battlefield_entry_with_layers_pending_escalates_to_all_dirty() {
+    fn battlefield_entry_with_layers_pending_stays_targeted() {
         let mut state = GameState::new_two_player(42);
+        // Settle layers to Clean first: a fresh state initializes `Full`, which
+        // would absorb the entry's `mark_entered` (Full subsumes EnteredObjects).
+        // The real engine reaches this site with layers already flushed.
+        flush_layers(&mut state);
         let (_source_id, events) = resolve_real_copy_token(&mut state);
 
         assert!(
-            state.layers_dirty,
-            "real entry must leave layers pending (Gate 1 input)"
+            matches!(
+                state.layers_dirty,
+                crate::types::game_state::LayersDirty::EnteredObjects(_)
+            ),
+            "real entry must request an incremental layer re-derive (Gate 1 input)"
         );
 
         clear_public_state_dirty(&mut state);
         mark_public_state_from_events(&mut state, &events);
 
         assert!(
-            state.public_state_dirty.all_objects_dirty,
-            "Gate 1 must escalate to all-objects when layers_dirty is set"
+            !state.public_state_dirty.all_objects_dirty,
+            "Gate 1 must NOT escalate to all-objects for an incremental entry"
         );
+    }
+
+    /// EnteredObjects-path display == full-recompute display. Drives the real
+    /// incremental `flush_layers` path through `finalize_public_state` and
+    /// compares per-object display fields against a forced all-dirty
+    /// full-evaluate finalize on the same pre-flush state.
+    #[test]
+    fn incremental_entry_display_matches_full_recompute() {
+        let mut base = GameState::new_two_player(42);
+        // Settle layers to Clean so the entry below requests EnteredObjects
+        // (a fresh state's initial Full would subsume it).
+        flush_layers(&mut base);
+        let (_src, events) = resolve_real_copy_token(&mut base);
         assert!(
-            state.public_state_dirty.all_players_dirty,
-            "Gate 1 must escalate to all-players when layers_dirty is set"
+            matches!(
+                base.layers_dirty,
+                crate::types::game_state::LayersDirty::EnteredObjects(_)
+            ),
+            "entry must request incremental re-derive"
         );
+
+        // Incremental path: targeted marking + finalize (runs flush_layers
+        // incremental).
+        let mut incremental = base.clone();
+        clear_public_state_dirty(&mut incremental);
+        mark_public_state_from_events(&mut incremental, &events);
+        finalize_public_state(&mut incremental);
+
+        // Full path: force a full layer flush + all-dirty recompute on the same
+        // pre-flush state.
+        let mut forced = base.clone();
+        forced.layers_dirty = crate::types::game_state::LayersDirty::Full;
+        mark_public_state_all_dirty(&mut forced);
+        finalize_public_state(&mut forced);
+
+        assert_display_state_eq(&incremental, &forced, "incremental copy entry");
     }
 
     /// DIFFERENTIAL: targeted marking + finalize produces per-object/per-player
@@ -552,7 +793,7 @@ mod tests {
         let mut base = GameState::new_two_player(42);
         let (_src, events) = resolve_real_copy_token(&mut base);
         evaluate_layers(&mut base);
-        base.layers_dirty = false;
+        base.layers_dirty = crate::types::game_state::LayersDirty::Clean;
 
         let mut targeted = base.clone();
         clear_public_state_dirty(&mut targeted);

@@ -4,12 +4,17 @@
 use engine::ai_support::candidate_actions;
 use engine::game::scenario::{GameScenario, P0};
 use engine::game::zones::create_object;
-use engine::types::ability::{AbilityCost, Effect, QuantityExpr, ResolvedAbility, TargetFilter};
+use engine::types::ability::{
+    AbilityCost, Effect, EffectScope, PtValue, QuantityExpr, ResolvedAbility, TapStateChange,
+    TargetFilter,
+};
 use engine::types::actions::GameAction;
 use engine::types::card_type::CoreType;
 use engine::types::counter::CounterType;
 use engine::types::events::{BendingType, GameEvent};
-use engine::types::game_state::{CastingVariant, ConvokeMode, GameState, PendingCast, WaitingFor};
+use engine::types::game_state::{
+    CastPaymentMode, CastingVariant, ConvokeMode, GameState, PendingCast, WaitingFor,
+};
 use engine::types::identifiers::{CardId, ObjectId};
 use engine::types::keywords::Keyword;
 use engine::types::mana::{
@@ -89,8 +94,8 @@ fn test_generic_animate_does_not_register_earthbend() {
 
     let ability = ResolvedAbility::new(
         Effect::Animate {
-            power: Some(4),
-            toughness: Some(4),
+            power: Some(PtValue::Fixed(4)),
+            toughness: Some(PtValue::Fixed(4)),
             types: vec!["Creature".to_string()],
             remove_types: vec![],
             target: TargetFilter::None,
@@ -230,6 +235,7 @@ fn test_mana_payment_finalization() {
             amount: QuantityExpr::Fixed { value: 3 },
             target: TargetFilter::Any,
             damage_source: None,
+            excess: None,
         },
         vec![],
         spell_id,
@@ -827,10 +833,13 @@ fn test_search_changezone_shuffle_continuation_completes() {
             owner_library: false,
             enter_transformed: false,
             enters_under: None,
-            enter_tapped: true,
+            enter_tapped: engine::types::zones::EtbTapState::Tapped,
             enters_attacking: false,
             up_to: false,
             enter_with_counters: vec![],
+            conditional_enter_with_counters: vec![],
+            face_down_profile: None,
+            enters_modified_if: None,
         },
         sub_ability: Some(Box::new(shuffle_ability)),
         ..ResolvedAbility::new(
@@ -841,10 +850,13 @@ fn test_search_changezone_shuffle_continuation_completes() {
                 owner_library: false,
                 enter_transformed: false,
                 enters_under: None,
-                enter_tapped: true,
+                enter_tapped: engine::types::zones::EtbTapState::Tapped,
                 enters_attacking: false,
                 up_to: false,
                 enter_with_counters: vec![],
+                conditional_enter_with_counters: vec![],
+                face_down_profile: None,
+                enters_modified_if: None,
             },
             vec![],
             source_id,
@@ -866,6 +878,7 @@ fn test_search_changezone_shuffle_continuation_completes() {
             target_player: None,
             selection_constraint: engine::types::ability::SearchSelectionConstraint::None,
             split: None,
+            source_zones: vec![engine::types::zones::Zone::Library],
         },
         sub_ability: Some(Box::new(change_zone_ability)),
         ..ResolvedAbility::new(
@@ -882,6 +895,7 @@ fn test_search_changezone_shuffle_continuation_completes() {
                 target_player: None,
                 selection_constraint: engine::types::ability::SearchSelectionConstraint::None,
                 split: None,
+                source_zones: vec![engine::types::zones::Zone::Library],
             },
             vec![],
             source_id,
@@ -904,6 +918,7 @@ fn test_search_changezone_shuffle_continuation_completes() {
             description: None,
             source_name: String::new(),
             subject_match_count: None,
+            die_result: None,
         },
     };
     stack::push_to_stack(&mut state, entry, &mut vec![]);
@@ -1158,10 +1173,13 @@ fn test_earthbender_ascension_etb_completes_with_landfall() {
             owner_library: false,
             enter_transformed: false,
             enters_under: None,
-            enter_tapped: true,
+            enter_tapped: engine::types::zones::EtbTapState::Tapped,
             enters_attacking: false,
             up_to: false,
             enter_with_counters: vec![],
+            conditional_enter_with_counters: vec![],
+            face_down_profile: None,
+            enters_modified_if: None,
         },
         sub_ability: Some(Box::new(shuffle_ability)),
         ..ResolvedAbility::new(
@@ -1172,10 +1190,13 @@ fn test_earthbender_ascension_etb_completes_with_landfall() {
                 owner_library: false,
                 enter_transformed: false,
                 enters_under: None,
-                enter_tapped: true,
+                enter_tapped: engine::types::zones::EtbTapState::Tapped,
                 enters_attacking: false,
                 up_to: false,
                 enter_with_counters: vec![],
+                conditional_enter_with_counters: vec![],
+                face_down_profile: None,
+                enters_modified_if: None,
             },
             vec![],
             enchantment_id,
@@ -1197,6 +1218,7 @@ fn test_earthbender_ascension_etb_completes_with_landfall() {
             target_player: None,
             selection_constraint: engine::types::ability::SearchSelectionConstraint::None,
             split: None,
+            source_zones: vec![engine::types::zones::Zone::Library],
         },
         sub_ability: Some(Box::new(change_zone_ability)),
         ..ResolvedAbility::new(
@@ -1213,6 +1235,7 @@ fn test_earthbender_ascension_etb_completes_with_landfall() {
                 target_player: None,
                 selection_constraint: engine::types::ability::SearchSelectionConstraint::None,
                 split: None,
+                source_zones: vec![engine::types::zones::Zone::Library],
             },
             vec![],
             enchantment_id,
@@ -1222,8 +1245,8 @@ fn test_earthbender_ascension_etb_completes_with_landfall() {
 
     let animate_ability = ResolvedAbility {
         effect: Effect::Animate {
-            power: Some(2),
-            toughness: Some(2),
+            power: Some(PtValue::Fixed(2)),
+            toughness: Some(PtValue::Fixed(2)),
             types: vec!["Creature".to_string()],
             remove_types: vec![],
             target: TargetFilter::Typed(engine::types::ability::TypedFilter {
@@ -1237,8 +1260,8 @@ fn test_earthbender_ascension_etb_completes_with_landfall() {
         sub_ability: Some(Box::new(search_ability)),
         ..ResolvedAbility::new(
             Effect::Animate {
-                power: Some(2),
-                toughness: Some(2),
+                power: Some(PtValue::Fixed(2)),
+                toughness: Some(PtValue::Fixed(2)),
                 types: vec!["Creature".to_string()],
                 remove_types: vec![],
                 target: TargetFilter::Typed(engine::types::ability::TypedFilter {
@@ -1269,6 +1292,7 @@ fn test_earthbender_ascension_etb_completes_with_landfall() {
             description: None,
             source_name: String::new(),
             subject_match_count: None,
+            die_result: None,
         },
     };
     stack::push_to_stack(&mut state, entry, &mut vec![]);
@@ -1778,8 +1802,10 @@ fn shock_land_replacement() -> engine::types::ability::ReplacementDefinition {
     );
     let tap_self = AbilityDefinition::new(
         AbilityKind::Spell,
-        Effect::Tap {
+        Effect::SetTapState {
             target: TargetFilter::SelfRef,
+            scope: EffectScope::Single,
+            state: TapStateChange::Tap,
         },
     );
     ReplacementDefinition::new(ReplacementEvent::Moved)
@@ -1830,11 +1856,13 @@ fn earthbend_return_skips_shock_land_pay_life_prompt() {
         from: Zone::Graveyard,
         to: Zone::Battlefield,
         cause: None,
+        attach_to: None,
         enter_tapped: EtbTapState::Tapped,
         enter_with_counters: Vec::new(),
         controller_override: Some(P0),
         enter_transformed: false,
         applied: std::collections::HashSet::new(),
+        face_down_profile: None,
     };
 
     let mut events = Vec::new();
@@ -1903,11 +1931,13 @@ fn plain_shock_land_etb_still_prompts_for_life_payment() {
         from: Zone::Hand,
         to: Zone::Battlefield,
         cause: None,
+        attach_to: None,
         enter_tapped: EtbTapState::Unspecified,
         enter_with_counters: Vec::new(),
         controller_override: None,
         enter_transformed: false,
         applied: std::collections::HashSet::new(),
+        face_down_profile: None,
     };
 
     let mut events = Vec::new();
@@ -1969,10 +1999,13 @@ fn build_earthbend_ability(
             owner_library: false,
             enter_transformed: false,
             enters_under: Some(ControllerRef::You),
-            enter_tapped: true,
+            enter_tapped: engine::types::zones::EtbTapState::Tapped,
             enters_attacking: false,
             up_to: false,
             enter_with_counters: vec![],
+            conditional_enter_with_counters: vec![],
+            face_down_profile: None,
+            enters_modified_if: None,
         },
     );
 
@@ -2021,8 +2054,8 @@ fn build_earthbend_ability(
 
     let mut animate = ResolvedAbility::new(
         Effect::Animate {
-            power: Some(0),
-            toughness: Some(0),
+            power: Some(PtValue::Fixed(0)),
+            toughness: Some(PtValue::Fixed(0)),
             types: vec!["Creature".to_string()],
             remove_types: vec![],
             target: animate_target,
@@ -2064,6 +2097,7 @@ fn cast_synthetic_earthbend(
             description: None,
             source_name: String::new(),
             subject_match_count: None,
+            die_result: None,
         },
     };
     stack::push_to_stack(state, entry, &mut vec![]);
@@ -2231,7 +2265,12 @@ fn earthbended_land_returns_tapped_after_exile() {
             origin: Some(Zone::Battlefield),
             destination: Zone::Exile,
             target: TargetFilter::SpecificObject { id: land_id },
-            enter_tapped: false,
+            enters_under: None,
+            enter_tapped: engine::types::zones::EtbTapState::Unspecified,
+            enter_with_counters: vec![],
+            face_down_profile: None,
+            library_position: None,
+            random_order: false,
         },
         vec![TargetRef::Object(land_id)],
         exile_source,
@@ -2251,6 +2290,7 @@ fn earthbended_land_returns_tapped_after_exile() {
             description: None,
             source_name: String::new(),
             subject_match_count: None,
+            die_result: None,
         },
     };
     stack::push_to_stack(runner.state_mut(), entry, &mut vec![]);
@@ -2281,22 +2321,11 @@ fn earthbended_land_returns_tapped_after_exile() {
 /// This is the closest analog to what the user reported in #313.
 #[test]
 fn earthbending_lesson_returned_tapped_after_dies_e2e() {
-    use std::path::Path;
-    use std::sync::OnceLock;
-
-    use engine::database::card_db::CardDatabase;
     use engine::game::engine::apply_as_current;
     use engine::game::scenario_db::GameScenarioDbExt;
     use engine::types::card_type::Supertype;
 
-    fn load_db() -> Option<&'static CardDatabase> {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../client/public/card-data.json");
-        if !path.exists() {
-            return None;
-        }
-        static DB: OnceLock<CardDatabase> = OnceLock::new();
-        Some(DB.get_or_init(|| CardDatabase::from_export(&path).expect("export should load")))
-    }
+    use crate::support::shared_card_db as load_db;
 
     let Some(db) = load_db() else {
         return;
@@ -2345,6 +2374,8 @@ fn earthbending_lesson_returned_tapped_after_dies_e2e() {
             object_id: lesson_id,
             card_id,
             targets: vec![mountain_id],
+
+            payment_mode: CastPaymentMode::Auto,
         },
     )
     .expect("cast Earthbending Lesson");
@@ -2475,7 +2506,7 @@ fn earthbend_registers_dies_or_exiled_delayed_trigger_on_target() {
         } => {
             assert_eq!(*destination, Zone::Battlefield);
             assert!(
-                *enter_tapped,
+                enter_tapped.is_tapped(),
                 "Inner ChangeZone must carry enter_tapped=true"
             );
             assert_eq!(

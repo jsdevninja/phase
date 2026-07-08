@@ -15,10 +15,23 @@ use nom::combinator::value;
 use nom::Parser;
 
 use super::error::OracleResult;
-use crate::types::ability::{ControllerRef, TargetFilter, TypeFilter, TypedFilter};
+use super::target::parse_supertype_prefix;
+use crate::parser::oracle_target::parse_without_keyword_suffix;
+use crate::parser::oracle_util::parse_subtype;
+use crate::types::ability::{
+    AttachmentKind, ControllerRef, FilterProp, TargetFilter, TypeFilter, TypedFilter,
+};
+use crate::types::card_type::{noncreature_subtype_set, SubtypeSet};
 
-/// CR 702.5a: One enchantable core-type or land-subtype token. Driven by
-/// `value()` + `alt()` so additional types slot in as one-line extensions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EnchantTypeLeg {
+    pub(crate) type_filter: TypeFilter,
+    pub(crate) properties: Vec<FilterProp>,
+}
+
+/// CR 702.5a: One enchantable core-type or supported subtype token. Core
+/// types and established basic-land subtype legs stay as literal nom arms;
+/// artifact subtypes delegate to the canonical subtype classifier below.
 ///
 /// Basic land subtypes (Forest, Plains, Island, Swamp, Mountain) are included
 /// per CR 205.3i — basic land types are the canonical Aura targets for
@@ -29,8 +42,12 @@ use crate::types::ability::{ControllerRef, TargetFilter, TypeFilter, TypedFilter
 pub(crate) fn parse_enchant_type_leg(input: &str) -> OracleResult<'_, TypeFilter> {
     alt((
         value(TypeFilter::Creature, tag("creature")),
-        value(TypeFilter::Land, tag("land")),
         value(TypeFilter::Artifact, tag("artifact")),
+        // CR 205.3g + CR 702.5a: Artifact subtype legs use the canonical
+        // subtype registry. This must precede `land` so `Lander` is not
+        // short-matched as the core Land type.
+        parse_artifact_subtype_enchant_leg,
+        value(TypeFilter::Land, tag("land")),
         value(TypeFilter::Enchantment, tag("enchantment")),
         value(TypeFilter::Planeswalker, tag("planeswalker")),
         value(TypeFilter::Permanent, tag("permanent")),
@@ -47,6 +64,49 @@ pub(crate) fn parse_enchant_type_leg(input: &str) -> OracleResult<'_, TypeFilter
         value(TypeFilter::Subtype("Mountain".to_string()), tag("mountain")),
     ))
     .parse(input)
+}
+
+fn parse_artifact_subtype_enchant_leg(input: &str) -> OracleResult<'_, TypeFilter> {
+    let Some((subtype, consumed)) = parse_subtype(input) else {
+        return Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Fail,
+        )));
+    };
+
+    if !matches!(
+        noncreature_subtype_set(&subtype),
+        Some(SubtypeSet::Artifact)
+    ) {
+        return Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Fail,
+        )));
+    }
+
+    Ok((&input[consumed..], TypeFilter::Subtype(subtype)))
+}
+
+/// CR 205.4a + CR 702.5a: An Enchant type leg may carry a supertype adjective
+/// such as "snow land", "basic land", or "legendary creature". Reuse the
+/// shared target-phrase supertype recognizer so Aura legality gets the same
+/// `HasSupertype` property as ordinary target phrases.
+pub(crate) fn parse_enchant_qualified_type_leg(input: &str) -> OracleResult<'_, EnchantTypeLeg> {
+    use nom::combinator::opt;
+
+    let (input, supertype) = opt(parse_supertype_prefix).parse(input)?;
+    let (input, type_filter) = parse_enchant_type_leg(input)?;
+    let properties = supertype
+        .map(|value| FilterProp::HasSupertype { value })
+        .into_iter()
+        .collect();
+    Ok((
+        input,
+        EnchantTypeLeg {
+            type_filter,
+            properties,
+        },
+    ))
 }
 
 /// Separator between enchant list legs. Covers serial-comma (", or "/", and "),
@@ -68,13 +128,16 @@ pub(crate) fn parse_enchant_list_sep(input: &str) -> OracleResult<'_, ()> {
 
 /// Parse a leg list with serial-comma or bare-conjunction separators.
 /// Returns the list in source order.
-pub(crate) fn parse_enchant_type_list(input: &str) -> OracleResult<'_, Vec<TypeFilter>> {
+pub(crate) fn parse_enchant_type_list(input: &str) -> OracleResult<'_, Vec<EnchantTypeLeg>> {
     use nom::multi::many0;
     use nom::sequence::preceded;
 
-    let (input, first) = parse_enchant_type_leg(input)?;
-    let (input, rest) =
-        many0(preceded(parse_enchant_list_sep, parse_enchant_type_leg)).parse(input)?;
+    let (input, first) = parse_enchant_qualified_type_leg(input)?;
+    let (input, rest) = many0(preceded(
+        parse_enchant_list_sep,
+        parse_enchant_qualified_type_leg,
+    ))
+    .parse(input)?;
     let mut legs = Vec::with_capacity(rest.len() + 1);
     legs.push(first);
     legs.extend(rest);
@@ -90,6 +153,42 @@ pub(crate) fn parse_enchant_controller_suffix(input: &str) -> OracleResult<'_, C
         value(ControllerRef::Opponent, tag(" opponent controls")),
     ))
     .parse(input)
+}
+
+/// CR 303.4 + CR 702.5a + CR 301.5: Optional trailing attachment qualifier on an
+/// "Enchant <type>" line — "with another Aura attached to it" (Daybreak Coronet)
+/// further restricts the legal target set to objects that already carry an
+/// attachment of the named kind. "Another" is material once SBA attachment
+/// legality rechecks the Aura already attached to its host, so preserve it as a
+/// source-exclusion axis on the `HasAttachment` filter prop. The leading space
+/// ensures the qualifier only matches after a preceding type leg (never as a
+/// standalone clause).
+pub(crate) fn parse_enchant_attachment_qualifier(input: &str) -> OracleResult<'_, FilterProp> {
+    let (input, _) = tag(" with ").parse(input)?;
+    let (input, exclude_source) = alt((
+        value(true, tag("another ")),
+        value(false, tag("an ")),
+        value(false, tag("a ")),
+    ))
+    .parse(input)?;
+    let (input, kind) = alt((
+        value(AttachmentKind::Aura, tag("aura")),
+        value(AttachmentKind::Equipment, tag("equipment")),
+    ))
+    .parse(input)?;
+    let (input, _) = tag(" attached to it").parse(input)?;
+    Ok((
+        input,
+        FilterProp::HasAttachment {
+            kind,
+            controller: None,
+            exclude_source: if exclude_source {
+                crate::types::ability::SourceExclusion::Exclude
+            } else {
+                crate::types::ability::SourceExclusion::Include
+            },
+        },
+    ))
 }
 
 /// CR 702.5d: "Enchant player" / "Enchant opponent" — the player-axis Aura.
@@ -122,13 +221,122 @@ pub(crate) fn parse_enchant_target_full(input: &str) -> OracleResult<'_, TargetF
 
     let (input, type_legs) = parse_enchant_type_list(input)?;
     let (input, controller) = opt(parse_enchant_controller_suffix).parse(input)?;
+    let (input, attachment) = opt(parse_enchant_attachment_qualifier).parse(input)?;
+    let (input, without_keyword) = parse_enchant_without_keyword_suffix(input)?;
 
-    let mut typed = TypedFilter {
-        type_filters: type_legs,
-        ..TypedFilter::default()
-    };
-    if let Some(c) = controller {
-        typed.controller = Some(c);
+    let mut filters = Vec::with_capacity(type_legs.len());
+    for leg in type_legs {
+        let mut typed = TypedFilter::new(leg.type_filter);
+        if let Some(c) = controller.clone() {
+            typed = typed.controller(c);
+        }
+
+        let mut properties = leg.properties;
+        if let Some(prop) = attachment.clone() {
+            properties.push(prop);
+        }
+        properties.extend(without_keyword.iter().cloned());
+        if !properties.is_empty() {
+            typed = typed.properties(properties);
+        }
+
+        filters.push(TargetFilter::Typed(typed));
     }
-    Ok((input, TargetFilter::Typed(typed)))
+
+    let filter = if filters.len() == 1 {
+        filters.pop().unwrap()
+    } else {
+        TargetFilter::Or { filters }
+    };
+    Ok((input, filter))
+}
+
+/// CR 702.5a + CR 702.9: Optional trailing "without [keyword]" qualifier on an
+/// enchant line (Trapped in the Tower, Roots). Delegates to the shared target
+/// suffix authority so Aura legal-target sets match `parse_type_phrase`.
+fn parse_enchant_without_keyword_suffix(input: &str) -> OracleResult<'_, Vec<FilterProp>> {
+    match parse_without_keyword_suffix(input) {
+        Some((props, consumed)) => Ok((&input[consumed..], props)),
+        None => Ok((input, Vec::new())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::keywords::Keyword;
+
+    /// CR 702.5a + CR 702.9: Trapped in the Tower — "Enchant creature without flying".
+    #[test]
+    fn parse_enchant_target_creature_without_flying() {
+        let (rest, filter) =
+            parse_enchant_target_full("creature without flying").expect("must parse");
+        assert!(rest.is_empty(), "remainder: '{rest}'");
+        let TargetFilter::Typed(tf) = filter else {
+            panic!("expected Typed filter, got {filter:?}");
+        };
+        assert!(tf.type_filters.contains(&TypeFilter::Creature));
+        assert!(
+            tf.properties.iter().any(
+                |p| matches!(p, FilterProp::WithoutKeyword { value } if *value == Keyword::Flying)
+            ),
+            "expected WithoutKeyword(Flying), got {:?}",
+            tf.properties
+        );
+    }
+
+    /// CR 205.4a + CR 702.5a: On Thin Ice-style supertype-qualified Aura
+    /// targets must preserve both the head type and the supertype restriction.
+    #[test]
+    fn parse_enchant_target_snow_land_you_control() {
+        use crate::types::card_type::Supertype;
+
+        let (rest, filter) =
+            parse_enchant_target_full("snow land you control").expect("must parse");
+        assert!(rest.is_empty(), "remainder: '{rest}'");
+        let TargetFilter::Typed(tf) = filter else {
+            panic!("expected Typed filter, got {filter:?}");
+        };
+        assert_eq!(tf.type_filters, vec![TypeFilter::Land]);
+        assert_eq!(tf.controller, Some(ControllerRef::You));
+        assert!(tf.properties.contains(&FilterProp::HasSupertype {
+            value: Supertype::Snow
+        }));
+    }
+
+    /// CR 205.4a + CR 702.5a: Multi-leg inline Enchant phrases must keep a
+    /// qualified leg's supertype property scoped to that leg.
+    #[test]
+    fn parse_enchant_target_multi_leg_keeps_supertype_per_leg() {
+        use crate::types::card_type::Supertype;
+
+        let (rest, filter) =
+            parse_enchant_target_full("legendary creature or planeswalker").expect("must parse");
+        assert!(rest.is_empty(), "remainder: '{rest}'");
+        let TargetFilter::Or { filters } = filter else {
+            panic!("expected Or filter, got {filter:?}");
+        };
+        assert_eq!(filters.len(), 2);
+
+        let TargetFilter::Typed(first) = &filters[0] else {
+            panic!("expected first Typed leg");
+        };
+        assert_eq!(first.type_filters, vec![TypeFilter::Creature]);
+        assert!(first.properties.contains(&FilterProp::HasSupertype {
+            value: Supertype::Legendary
+        }));
+
+        let TargetFilter::Typed(second) = &filters[1] else {
+            panic!("expected second Typed leg");
+        };
+        assert_eq!(second.type_filters, vec![TypeFilter::Planeswalker]);
+        assert!(
+            !second
+                .properties
+                .iter()
+                .any(|prop| matches!(prop, FilterProp::HasSupertype { .. })),
+            "supertype leaked to sibling leg: {:?}",
+            second.properties
+        );
+    }
 }

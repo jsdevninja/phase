@@ -1,7 +1,12 @@
 import { AnimatePresence, motion } from "framer-motion";
 import { type RefObject, useCallback, useEffect, useRef, useState } from "react";
 
-import type { StepEffect } from "../../animation/types.ts";
+import {
+  DAMAGE_FLURRY_SOURCE_SAMPLE_LIMIT,
+  impactDelayMsForAnimationEvent,
+  isPlayerDamageAnimationEvent,
+  type StepEffect,
+} from "../../animation/types.ts";
 import { getCardColors } from "../../animation/wubrgColors.ts";
 import { currentSnapshot } from "../../hooks/useGameDispatch.ts";
 import { fetchCardImageUrl } from "../../services/scryfall.ts";
@@ -72,11 +77,26 @@ let shatterIdCounter = 0;
 let castArcIdCounter = 0;
 let millRevealIdCounter = 0;
 
+/**
+ * Resolve the rendered card element for an object id. Collapsed identical-
+ * permanent groups (GroupedPermanent collapsed mode) render only their
+ * representative card, which carries `data-grouped-ids` listing every id it
+ * stands in for — so a non-rendered swarm member falls back to that
+ * representative instead of resolving to nothing (no slam, no impact FX).
+ */
+function findCardElement(objectId: number): HTMLElement | null {
+  return (
+    document.querySelector<HTMLElement>(`[data-object-id="${objectId}"]`) ??
+    document.querySelector<HTMLElement>(`[data-grouped-ids~="${objectId}"]`)
+  );
+}
+
 export function AnimationOverlay({ containerRef }: AnimationOverlayProps) {
   const activeStep = useAnimationStore((s) => s.activeStep);
   const advanceStep = useAnimationStore((s) => s.advanceStep);
   const getPosition = useAnimationStore((s) => s.getPosition);
   const particleRef = useRef<ParticleCanvasHandle>(null);
+  const stepTimeoutsRef = useRef<ReturnType<typeof setTimeout>[]>([]);
   const [activeFloats, setActiveFloats] = useState<ActiveFloat[]>([]);
   const [activeDeathClones, setActiveDeathClones] = useState<DeathClone[]>([]);
   const [activeVignette, setActiveVignette] = useState<{
@@ -92,10 +112,13 @@ export function AnimationOverlay({ containerRef }: AnimationOverlayProps) {
 
   const getObjectPosition = useCallback(
     (objectId: number): { x: number; y: number } | null => {
-      // Check snapshot first (pre-dispatch positions), then live registry
-      const snapshotRect = currentSnapshot.get(objectId);
-      const registryRect = getPosition(objectId);
-      const rect = snapshotRect ?? registryRect;
+      // Fallback chain: pre-dispatch snapshot, then live registry, then the
+      // group representative for a collapsed swarm member that has no node of
+      // its own (resolved live via data-grouped-ids — see findCardElement).
+      const rect =
+        currentSnapshot.get(objectId) ??
+        getPosition(objectId) ??
+        findCardElement(objectId)?.getBoundingClientRect();
       if (!rect) return null;
       return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
     },
@@ -116,11 +139,55 @@ export function AnimationOverlay({ containerRef }: AnimationOverlayProps) {
     [],
   );
 
+  const scheduleStepTimeout = useCallback((callback: () => void, delay: number) => {
+    const timeout = setTimeout(() => {
+      stepTimeoutsRef.current = stepTimeoutsRef.current.filter((id) => id !== timeout);
+      callback();
+    }, delay);
+    stepTimeoutsRef.current.push(timeout);
+  }, []);
+
   const processEffect = useCallback(
     (effect: StepEffect, stepEffects: StepEffect[]) => {
       const { event } = effect;
 
       switch (event.type) {
+        case "GroupedDamageFlurry": {
+          const { player_id, source_ids, total_damage, hit_count } = event.data;
+          const to = getPlayerHudPosition(player_id);
+          const fromPoints = source_ids
+            .slice(0, DAMAGE_FLURRY_SOURCE_SAMPLE_LIMIT)
+            .map((sourceId) => getObjectPosition(sourceId))
+            .filter((position): position is { x: number; y: number } => position != null);
+          const origins = fromPoints.length > 0 ? fromPoints : [to];
+          const impactDelay = impactDelayMsForAnimationEvent(event) * speedMultiplier;
+
+          if (vfxQuality !== "minimal") {
+            particleRef.current?.damageFlurry(origins, to, hit_count, total_damage, impactDelay);
+          }
+
+          scheduleStepTimeout(() => {
+            audioManager.playSfx("DamageDealt");
+            const id = ++floatIdCounter;
+            setActiveFloats((prev) => [
+              ...prev,
+              { id, value: -total_damage, position: to, color: "#ef4444" },
+            ]);
+
+            if (vfxQuality !== "minimal") {
+              particleRef.current?.playerDamage(to.x, to.y, total_damage);
+              setActiveVignette({ damageAmount: total_damage });
+              scheduleStepTimeout(() => setActiveVignette(null), 500 * speedMultiplier);
+            }
+
+            if (vfxQuality === "full" && containerRef.current) {
+              const intensity = total_damage >= 20 ? "heavy" : total_damage >= 10 ? "medium" : "light";
+              applyScreenShake(containerRef.current, intensity, speedMultiplier);
+            }
+          }, impactDelay);
+          break;
+        }
+
         case "DamageDealt": {
           const { source_id, target, amount } = event.data;
           let pos = { x: window.innerWidth / 2, y: window.innerHeight / 2 };
@@ -147,12 +214,11 @@ export function AnimationOverlay({ containerRef }: AnimationOverlayProps) {
                 (e.event.data.target as { Object: number }).Object === source_id,
             );
 
-            if (!isPairedReturn) {
-              const sourceEl = document.querySelector<HTMLElement>(
-                `[data-object-id="${source_id}"]`,
-              );
-              if (sourceEl) {
-                applyCardSlam(sourceEl, pos.x, pos.y, speedMultiplier, () => {
+            // Resolve via the group representative when this attacker is a
+            // non-rendered member of a collapsed swarm (findCardElement).
+            const sourceEl = isPairedReturn ? null : findCardElement(source_id);
+            const slammed = sourceEl
+              ? applyCardSlam(sourceEl, pos.x, pos.y, speedMultiplier, () => {
                   // Impact effects: SFX, shockwave, floating number, screen shake
                   audioManager.playSfx("DamageDealt");
                   particleRef.current?.slamImpact(pos.x, pos.y, amount);
@@ -167,48 +233,50 @@ export function AnimationOverlay({ containerRef }: AnimationOverlayProps) {
                     const intensity = amount >= 7 ? "heavy" : amount >= 4 ? "medium" : "light";
                     applyScreenShake(containerRef.current, intensity, speedMultiplier);
                   }
-                });
-                break;
-              }
-            }
+                })
+              : false;
 
-            // Paired return or source element not found: just show floating damage + immediate SFX
-            audioManager.playSfx("DamageDealt");
-            const floatId = ++floatIdCounter;
-            setActiveFloats((prev) => [
-              ...prev,
-              { id: floatId, value: -amount, position: pos, color: "#ef4444" },
-            ]);
+            if (!slammed) {
+              // Paired return, missing source element, or representative already
+              // mid-slam: show the floating damage number (+ SFX) without a slam.
+              audioManager.playSfx("DamageDealt");
+              const floatId = ++floatIdCounter;
+              setActiveFloats((prev) => [
+                ...prev,
+                { id: floatId, value: -amount, position: pos, color: "#ef4444" },
+              ]);
+            }
             break;
           }
 
           // Creature-to-player: card slam at the player HUD
           {
-            const sourceEl = document.querySelector<HTMLElement>(
-              `[data-object-id="${source_id}"]`,
-            );
-            if (sourceEl && vfxQuality !== "minimal") {
-              applyCardSlam(sourceEl, pos.x, pos.y, speedMultiplier, () => {
-                audioManager.playSfx("DamageDealt");
-                particleRef.current?.playerDamage(pos.x, pos.y, amount);
+            // Resolve via the group representative for a collapsed swarm member.
+            const sourceEl = vfxQuality !== "minimal" ? findCardElement(source_id) : null;
+            const slammed = sourceEl
+              ? applyCardSlam(sourceEl, pos.x, pos.y, speedMultiplier, () => {
+                  audioManager.playSfx("DamageDealt");
+                  particleRef.current?.playerDamage(pos.x, pos.y, amount);
 
-                const fid = ++floatIdCounter;
-                setActiveFloats((prev) => [
-                  ...prev,
-                  { id: fid, value: -amount, position: pos, color: "#ef4444" },
-                ]);
+                  const fid = ++floatIdCounter;
+                  setActiveFloats((prev) => [
+                    ...prev,
+                    { id: fid, value: -amount, position: pos, color: "#ef4444" },
+                  ]);
 
-                if (vfxQuality === "full" && containerRef.current) {
-                  const intensity = amount >= 7 ? "heavy" : amount >= 4 ? "medium" : "light";
-                  applyScreenShake(containerRef.current, intensity, speedMultiplier);
-                }
+                  if (vfxQuality === "full" && containerRef.current) {
+                    const intensity = amount >= 7 ? "heavy" : amount >= 4 ? "medium" : "light";
+                    applyScreenShake(containerRef.current, intensity, speedMultiplier);
+                  }
 
-                if (isPlayerTarget) {
-                  setActiveVignette({ damageAmount: amount });
-                  setTimeout(() => setActiveVignette(null), 500 * speedMultiplier);
-                }
-              });
-            } else {
+                  if (isPlayerTarget) {
+                    setActiveVignette({ damageAmount: amount });
+                    setTimeout(() => setActiveVignette(null), 500 * speedMultiplier);
+                  }
+                })
+              : false;
+
+            if (!slammed) {
               audioManager.playSfx("DamageDealt");
               const fid = ++floatIdCounter;
               setActiveFloats((prev) => [
@@ -226,24 +294,33 @@ export function AnimationOverlay({ containerRef }: AnimationOverlayProps) {
           // Skip floating number when DamageDealt already covers this player
           // in the same step (avoids duplicate floating numbers)
           const hasDamageDealt = stepEffects.some(
-            (e) =>
-              e.event.type === "DamageDealt" &&
-              "Player" in e.event.data.target &&
-              e.event.data.target.Player === player_id,
+            (e) => isPlayerDamageAnimationEvent(e.event, player_id),
           );
-
-          if (!hasDamageDealt) {
+          const groupedDamageEvent = effect.displayOnly
+            ? stepEffects.find((e) => e.event.type === "GroupedDamageFlurry")
+            : undefined;
+          const showLifeChange = () => {
             const { x, y } = getPlayerHudPosition(player_id);
-            const id = ++floatIdCounter;
-            setActiveFloats((prev) => [
-              ...prev,
-              { id, value: amount, position: { x, y }, color: amount > 0 ? "#22c55e" : "#ef4444" },
-            ]);
-          }
+            if (!hasDamageDealt) {
+              const id = ++floatIdCounter;
+              setActiveFloats((prev) => [
+                ...prev,
+                { id, value: amount, position: { x, y }, color: amount > 0 ? "#22c55e" : "#ef4444" },
+              ]);
+            }
 
-          if (amount > 0 && vfxQuality !== "minimal") {
-            const { x, y } = getPlayerHudPosition(player_id);
-            particleRef.current?.healEffect(x, y, amount);
+            if (amount > 0 && vfxQuality !== "minimal") {
+              particleRef.current?.healEffect(x, y, amount);
+            }
+          };
+
+          if (groupedDamageEvent) {
+            scheduleStepTimeout(
+              showLifeChange,
+              impactDelayMsForAnimationEvent(groupedDamageEvent.event) * speedMultiplier,
+            );
+          } else {
+            showLifeChange();
           }
           break;
         }
@@ -404,6 +481,7 @@ export function AnimationOverlay({ containerRef }: AnimationOverlayProps) {
       vfxQuality,
       speedMultiplier,
       containerRef,
+      scheduleStepTimeout,
     ],
   );
 
@@ -418,6 +496,9 @@ export function AnimationOverlay({ containerRef }: AnimationOverlayProps) {
     const timer = setTimeout(advanceStep, activeStep.duration * speedMultiplier);
     return () => {
       clearTimeout(timer);
+      for (const stepTimeout of stepTimeoutsRef.current) clearTimeout(stepTimeout);
+      stepTimeoutsRef.current = [];
+      setActiveVignette(null);
     };
   }, [activeStep, advanceStep, processEffect, speedMultiplier]);
 

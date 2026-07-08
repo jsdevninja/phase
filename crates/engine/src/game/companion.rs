@@ -50,11 +50,11 @@ pub fn validate_companion_condition(
     match condition {
         CompanionCondition::EvenManaValues => main_deck
             .iter()
-            .all(|entry| is_land(&entry.card) || entry.card.mana_cost.mana_value() % 2 == 0),
+            .all(|entry| is_land(&entry.card) || entry.off_stack_mana_value() % 2 == 0),
 
         CompanionCondition::OddManaValues => main_deck
             .iter()
-            .all(|entry| is_land(&entry.card) || entry.card.mana_cost.mana_value() % 2 == 1),
+            .all(|entry| is_land(&entry.card) || entry.off_stack_mana_value() % 2 == 1),
 
         CompanionCondition::NoRepeatedManaSymbols => main_deck
             .iter()
@@ -76,12 +76,12 @@ pub fn validate_companion_condition(
 
         CompanionCondition::MinManaValue(min) => main_deck
             .iter()
-            .all(|entry| is_land(&entry.card) || entry.card.mana_cost.mana_value() >= *min),
+            .all(|entry| is_land(&entry.card) || entry.off_stack_mana_value() >= *min),
 
         CompanionCondition::MaxPermanentManaValue(max) => main_deck.iter().all(|entry| {
             !is_permanent(&entry.card)
                 || is_land(&entry.card)
-                || entry.card.mana_cost.mana_value() <= *max
+                || entry.off_stack_mana_value() <= *max
         }),
 
         CompanionCondition::Singleton => {
@@ -381,12 +381,16 @@ pub fn handle_companion_to_hand(
     }
 
     // Validate and deduct mana
-    let player_data = &mut state.players[player.0 as usize];
-    if !player_data.mana_pool.spend_generic(COMPANION_COST) {
-        return Err("Not enough mana to pay companion cost ({3})".to_string());
+    {
+        let player_data = &mut state.players[player.0 as usize];
+        if !player_data.mana_pool.spend_generic(COMPANION_COST) {
+            return Err("Not enough mana to pay companion cost ({3})".to_string());
+        }
     }
+    state.layers_dirty.mark_full();
 
     // Take the companion card data and mark as used
+    let player_data = &mut state.players[player.0 as usize];
     let card_face = player_data
         .companion
         .as_ref()

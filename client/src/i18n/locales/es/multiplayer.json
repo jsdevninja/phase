@@ -4,6 +4,16 @@
     "message": "Tu oponente será declarado ganador.",
     "concede": "Conceder"
   },
+  "takebackDialog": {
+    "requestedTitle": "{{name}} solicita una repetición",
+    "requestedMessage": "¿Volver al momento justo antes de su última acción?",
+    "ownTitle": "Repetición solicitada",
+    "ownMessage": "Esperando que los demás jugadores aprueben volver a antes de tu última acción.",
+    "approve": "Aprobar",
+    "decline": "Rechazar",
+    "cancel": "Cancelar solicitud",
+    "declinedToast": "Solicitud de repetición rechazada"
+  },
   "connectionDot": {
     "connected": "Conectado",
     "connecting": "Conectando...",
@@ -38,14 +48,14 @@
     "openSettings": "Abrir ajustes"
   },
   "sideboardModal": {
-    "game": "Juego {{number}}",
-    "title": "Sideboard",
-    "matchScore": "Marcador de la serie {{p0}}-{{p1}}{{draws}}. Mueve cartas entre el mazo principal y el sideboard, luego envía.",
+    "game": "Partida {{number}}",
+    "title": "Banquillo",
+    "matchScore": "Marcador de la serie {{p0}}-{{p1}}{{draws}}. Mueve cartas entre el mazo principal y el banquillo, luego envía.",
     "draws_one": " ({{count}} empate)",
     "draws_other": " ({{count}} empates)",
     "main": "Principal ({{count}}/{{total}})",
-    "sideboard": "Sideboard ({{count}})",
-    "moveFromSideboard": "Mueve cartas del sideboard.",
+    "sideboard": "Banquillo ({{count}})",
+    "moveFromSideboard": "Mueve cartas del banquillo.",
     "moveFromMain": "Mueve cartas del mazo principal.",
     "matchesRegistered": "El mazo principal coincide con el tamaño registrado ({{total}}).",
     "submitDisabled": "El mazo principal tiene {{count}} / {{total}} — envío deshabilitado.",
@@ -81,20 +91,26 @@
     "waitTimeHours": "hace {{count}}h",
     "buildMismatchTitle": "El anfitrión usa la versión {{version}} ({{commit}}) — tu versión es diferente. Actualiza para ponerte al día.",
     "gameFull": "Esta partida está llena.",
+    "youAreHosting": "Estás alojando esta partida.",
+    "hosting": "Alojando",
     "sandboxConfirm": "Esta es una partida de Sandbox. Los jugadores con permiso de depuración pueden manipular directamente el estado de la partida. ¿Continuar?",
     "draftBadgeTitle": "Draft {{kind}} — {{setCode}}",
     "draftBadge": "Draft {{setCode}}",
     "p2pBadgeTitle": "Partida punto a punto (el anfitrión ejecuta el motor)",
     "sandboxBadgeTitle": "Esta partida permite acciones de depuración. Úsala para pruebas — no es una partida competitiva.",
+    "rankedBadgeTitle": "Sala clasificatoria",
+    "rankedBadge": "CLASIF.",
     "anonymous": "Anónimo",
     "by": "de {{name}}",
-    "passwordProtected": "Protegida con contraseña"
+    "passwordProtected": "Protegida con contraseña",
+    "join": "Unirse"
   },
   "serverPicker": {
     "title": "Servidor",
     "subtitle": "Elige una región o conéctate a una instancia autoalojada.",
     "noneLabel": "Ninguno (solo P2P)",
     "directCodes": "códigos directos",
+    "official": "Oficial",
     "selfHosted": "Autoalojado",
     "customUrlPlaceholder": "wss://tu-servidor.ejemplo/ws",
     "test": "Probar",
@@ -151,7 +167,8 @@
     "hostGame": "Hospedar partida",
     "hostP2PGame": "Hospedar partida P2P",
     "passwordRequired": "Contraseña requerida",
-    "passwordPlaceholder": "Introduce la contraseña"
+    "passwordPlaceholder": "Introduce la contraseña",
+    "watch": "Watch"
   },
   "hostSetup": {
     "hostDirectMatch": "Hospedar partida directa",
@@ -179,6 +196,7 @@
     "human": "Humano",
     "waitingForPlayer": "Esperando jugador",
     "startWhenFull": "Empezar cuando esté llena",
+    "ranked": "Clasificatoria",
     "listInLobby": "Listar en la sala de espera",
     "sandboxMode": "Modo Sandbox — permitir acciones de depuración",
     "sandboxModeHelp": "El anfitrión puede manipular directamente el estado de la partida (mover cartas, cambiar vidas, modificar contadores) y otorgar permiso de depuración a otros jugadores. Úsalo para pruebas o juego de sandbox — no para partidas competitivas. Este ajuste no se puede cambiar una vez iniciada la partida.",

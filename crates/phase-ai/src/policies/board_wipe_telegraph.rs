@@ -13,6 +13,8 @@ use crate::config::ThreatAwareness;
 use crate::deck_profile::DeckArchetype;
 use crate::features::DeckFeatures;
 use crate::threat_profile::castable_probabilities;
+#[cfg(test)]
+use engine::types::game_state::CastPaymentMode;
 
 pub struct BoardWipeTelegraphPolicy;
 
@@ -251,6 +253,8 @@ mod tests {
                 object_id: spell,
                 card_id: CardId(50),
                 targets: Vec::new(),
+
+                payment_mode: CastPaymentMode::Auto,
             },
             metadata: ActionMetadata {
                 actor: Some(PlayerId(0)),
@@ -265,6 +269,7 @@ mod tests {
             config: &config,
             context: &crate::context::AiContext::empty(&config.weights),
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
 
         let score = BoardWipeTelegraphPolicy.score(&ctx);
@@ -332,6 +337,8 @@ mod tests {
                 object_id: spell,
                 card_id: CardId(50),
                 targets: Vec::new(),
+
+                payment_mode: CastPaymentMode::Auto,
             },
             metadata: ActionMetadata {
                 actor: Some(PlayerId(0)),
@@ -346,6 +353,7 @@ mod tests {
             config: &config,
             context: &crate::context::AiContext::empty(&config.weights),
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
 
         let score = BoardWipeTelegraphPolicy.score(&ctx);
@@ -426,6 +434,8 @@ mod tests {
                 object_id: spell,
                 card_id: CardId(50),
                 targets: Vec::new(),
+
+                payment_mode: CastPaymentMode::Auto,
             },
             metadata: ActionMetadata {
                 actor: Some(PlayerId(0)),
@@ -440,6 +450,7 @@ mod tests {
             config: &config,
             context: &crate::context::AiContext::empty(&config.weights),
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
         let base_score = BoardWipeTelegraphPolicy.score(&base_ctx);
 
@@ -465,6 +476,7 @@ mod tests {
             config: &config,
             context: &context_with_tokens,
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
         let amp_score = BoardWipeTelegraphPolicy.score(&amp_ctx);
 

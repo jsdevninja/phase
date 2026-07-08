@@ -73,8 +73,11 @@ fn narrow_core_type(filter: &Option<TargetFilter>) -> Option<CoreType> {
         TypeFilter::Planeswalker => Some(CoreType::Planeswalker),
         TypeFilter::Battle => Some(CoreType::Battle),
         // Non-narrow filter shapes — broad emission carries the trigger.
+        // CR 308.1: Kindred is a non-permanent supplemental type, never a
+        // narrowing battlefield-trigger card type.
         TypeFilter::Instant
         | TypeFilter::Sorcery
+        | TypeFilter::Kindred
         | TypeFilter::Permanent
         | TypeFilter::Card
         | TypeFilter::Any
@@ -124,6 +127,16 @@ pub(crate) fn keys_from_trigger_def(def: &TriggerDefinition) -> (Keys, bool) {
                     push(TriggerEventKey::LeaveBattlefield(narrow));
                 }
                 (Some(Zone::Battlefield), _) => push(TriggerEventKey::LeaveBattlefield(narrow)),
+                // CR 603.6c: destination=Graveyard with unrestricted origin
+                // ("from anywhere") must match both battlefield→graveyard and
+                // non-battlefield→graveyard events. Add the battlefield fast-path
+                // keys, but keep unclassified routing for library/hand/stack
+                // origins because there is no generic "to graveyard" event key.
+                (None, Some(Zone::Graveyard)) => {
+                    push(TriggerEventKey::Dies(narrow));
+                    push(TriggerEventKey::LeaveBattlefield(narrow));
+                    return (keys, true);
+                }
                 _ => {
                     // Non-battlefield zone change (e.g. cast-from-graveyard
                     // observers). Route to unclassified — these are rare and
@@ -153,7 +166,7 @@ pub(crate) fn keys_from_trigger_def(def: &TriggerDefinition) -> (Keys, bool) {
         | TriggerMode::DamageReceived
         | TriggerMode::ExcessDamage
         | TriggerMode::ExcessDamageAll => push(TriggerEventKey::DealsDamage),
-        TriggerMode::DamagePreventedOnce => push(TriggerEventKey::DamagePrevented),
+        TriggerMode::DamagePreventedOnce => return (keys, true),
 
         // --- Spells / abilities ---
         TriggerMode::SpellCast | TriggerMode::SpellCastOrCopy | TriggerMode::SpellCopy => {
@@ -165,24 +178,33 @@ pub(crate) fn keys_from_trigger_def(def: &TriggerDefinition) -> (Keys, bool) {
         | TriggerMode::SpellAbilityCast
         | TriggerMode::SpellAbilityCopy
         | TriggerMode::AbilityActivated
+        | TriggerMode::LoyaltyAbilityActivated
         | TriggerMode::NinjutsuActivated
         | TriggerMode::KeywordAbilityActivated(_) => push(TriggerEventKey::AbilityOrCopyActivated),
         TriggerMode::Countered => {
             // CR 701.6: counter-targeting filter is dynamic; rare.
             return (keys, true);
         }
+        // CR 702.55c: Haunt payoff triggers live on a card in the EXILE zone and
+        // fire via the off-zone scan, never through this battlefield-scoped
+        // index. Route to `unclassified` so the index stays exhaustive without
+        // claiming a battlefield bucket these triggers can never occupy.
+        TriggerMode::HauntedCreatureDies => return (keys, true),
 
         // --- Combat ---
         TriggerMode::Attacks
         | TriggerMode::AttackersDeclared
         | TriggerMode::YouAttack
-        | TriggerMode::AttackersDeclaredOneTarget
-        | TriggerMode::AttackerBlocked
+        | TriggerMode::AttackersDeclaredOneTarget => push(TriggerEventKey::Attacks),
+        TriggerMode::AttackerBlocked
         | TriggerMode::AttackerBlockedOnce
         | TriggerMode::AttackerBlockedByCreature
         | TriggerMode::AttackerUnblocked
-        | TriggerMode::AttackerUnblockedOnce => push(TriggerEventKey::Attacks),
-        TriggerMode::Blocks | TriggerMode::BlockersDeclared | TriggerMode::BecomesBlocked => {
+        | TriggerMode::AttackerUnblockedOnce
+        | TriggerMode::YouAttackUnblocked
+        | TriggerMode::Blocks
+        | TriggerMode::BlockersDeclared
+        | TriggerMode::BecomesBlocked => {
             push(TriggerEventKey::Blocks);
         }
 
@@ -190,8 +212,10 @@ pub(crate) fn keys_from_trigger_def(def: &TriggerDefinition) -> (Keys, bool) {
         TriggerMode::CounterAdded
         | TriggerMode::CounterAddedOnce
         | TriggerMode::CounterAddedAll
-        | TriggerMode::CounterPlayerAddedAll
         | TriggerMode::CounterTypeAddedAll => push(TriggerEventKey::CounterAdded),
+        // CR 107.14: "Whenever you get one or more {E}" — energy uses the
+        // player-counter event key, not the object-counter key.
+        TriggerMode::CounterPlayerAddedAll => push(TriggerEventKey::PlayerCounterChanged),
         TriggerMode::CounterRemoved | TriggerMode::CounterRemovedOnce => {
             push(TriggerEventKey::CounterRemoved);
         }
@@ -236,7 +260,8 @@ pub(crate) fn keys_from_trigger_def(def: &TriggerDefinition) -> (Keys, bool) {
         TriggerMode::LifeGained
         | TriggerMode::LifeLost
         | TriggerMode::LifeLostAll
-        | TriggerMode::PayLife => push(TriggerEventKey::LifeChanged),
+        | TriggerMode::LifeChanged => push(TriggerEventKey::LifeChanged),
+        TriggerMode::PayLife => return (keys, true),
         // CR 702.24a (cumulative upkeep) + CR 702.30 (echo): both synthesized
         // with `def.phase = Some(Upkeep)`, both matchers dispatch on
         // `PhaseChanged { phase }`.
@@ -263,9 +288,10 @@ pub(crate) fn keys_from_trigger_def(def: &TriggerDefinition) -> (Keys, bool) {
             // unrecognized (CR 603.2b fallback). Stay safe via unclassified.
             None => return (keys, true),
         },
-        TriggerMode::PhaseIn | TriggerMode::PhaseOut | TriggerMode::PhaseOutAll => {
-            return (keys, true);
-        }
+        // CR 702.26c: Phasing triggers fire when a permanent phases in.
+        TriggerMode::PhaseIn => push(TriggerEventKey::PhaseIn),
+        // CR 702.26b: Phasing triggers fire when a permanent phases out.
+        TriggerMode::PhaseOut | TriggerMode::PhaseOutAll => push(TriggerEventKey::PhaseOut),
         TriggerMode::TurnBegin => push(TriggerEventKey::TurnStarted),
         TriggerMode::NewGame => return (keys, true),
 
@@ -273,6 +299,10 @@ pub(crate) fn keys_from_trigger_def(def: &TriggerDefinition) -> (Keys, bool) {
         TriggerMode::BecomeMonarch | TriggerMode::TakesInitiative => {
             push(TriggerEventKey::MonarchOrInitiative);
         }
+
+        // CR 701.52a + CR 702.159a: Visit abilities on Attractions.
+        TriggerMode::VisitAttraction => push(TriggerEventKey::VisitAttraction),
+        TriggerMode::Specializes => push(TriggerEventKey::Specializes),
 
         // --- Game state ---
         TriggerMode::LosesGame => push(TriggerEventKey::PlayerLost),
@@ -285,6 +315,12 @@ pub(crate) fn keys_from_trigger_def(def: &TriggerDefinition) -> (Keys, bool) {
         // CR 305.1: LandPlayed event is global (few battlefield triggers
         // listen). Route to unclassified — cost is one consult per such card.
         TriggerMode::LandPlayed => return (keys, true),
+
+        // CR 601.1a + CR 701.18b: "play a card" fires on a SpellCast OR a LandPlayed event
+        // (`match_play_card`). Because it spans two distinct event keys, route
+        // to unclassified so the trigger is consulted for both — narrowing to a
+        // single TriggerEventKey would silently drop one of the two events.
+        TriggerMode::PlayCard => return (keys, true),
 
         // --- Equipment / aura ---
         TriggerMode::Attached | TriggerMode::Unattach => push(TriggerEventKey::AttachmentChanged),
@@ -328,7 +364,8 @@ pub(crate) fn keys_from_trigger_def(def: &TriggerDefinition) -> (Keys, bool) {
         | TriggerMode::PlayerPerformedAction
         | TriggerMode::SearchedLibrary
         | TriggerMode::CollectEvidence
-        | TriggerMode::CommitCrime => push(TriggerEventKey::PlayerActionPerformed),
+        | TriggerMode::CommitCrime
+        | TriggerMode::Investigated => push(TriggerEventKey::PlayerActionPerformed),
 
         // --- Combat events ---
         TriggerMode::Fight | TriggerMode::FightOnce => push(TriggerEventKey::Fight),
@@ -338,7 +375,6 @@ pub(crate) fn keys_from_trigger_def(def: &TriggerDefinition) -> (Keys, bool) {
         | TriggerMode::ClaimPrize
         | TriggerMode::CrankContraption
         | TriggerMode::Devoured
-        | TriggerMode::Discover
         | TriggerMode::Forage
         | TriggerMode::FullyUnlock
         | TriggerMode::GiveGift
@@ -346,16 +382,13 @@ pub(crate) fn keys_from_trigger_def(def: &TriggerDefinition) -> (Keys, bool) {
         | TriggerMode::Mutates
         | TriggerMode::SeekAll
         | TriggerMode::SetInMotion
-        | TriggerMode::Specializes
         | TriggerMode::Stationed
         | TriggerMode::Trains
         | TriggerMode::UnlockDoor
-        | TriggerMode::VisitAttraction
         | TriggerMode::BecomesCrewed
         | TriggerMode::BecomesPlotted
         | TriggerMode::BecomesSaddled
         | TriggerMode::Championed
-        | TriggerMode::Exerted
         | TriggerMode::Crewed
         | TriggerMode::Crews
         | TriggerMode::Saddled
@@ -363,14 +396,16 @@ pub(crate) fn keys_from_trigger_def(def: &TriggerDefinition) -> (Keys, bool) {
         | TriggerMode::SaddlesOrCrews
         | TriggerMode::Cycled
         | TriggerMode::CycledOrDiscarded
-        | TriggerMode::Exploited
-        | TriggerMode::Enlisted
-        | TriggerMode::Foretell
-        | TriggerMode::Investigated
-        | TriggerMode::Adapt => return (keys, true),
+        | TriggerMode::Exploited => return (keys, true),
 
         // --- Triggered mechanics with dedicated event keys ---
         TriggerMode::Explored => push(TriggerEventKey::Explored),
+        TriggerMode::Discover => push(TriggerEventKey::DiscoverResolved),
+        TriggerMode::Adapt => push(TriggerEventKey::AdaptResolved),
+        TriggerMode::Connives => push(TriggerEventKey::ConniveResolved),
+        TriggerMode::Exerted => push(TriggerEventKey::Exerted),
+        TriggerMode::Enlisted => push(TriggerEventKey::Enlisted),
+        TriggerMode::Foretell => push(TriggerEventKey::Foretold),
         TriggerMode::ManifestDread => push(TriggerEventKey::ManifestDreadResolved),
 
         // --- Catch-all matchers — fires on every event, must always be
@@ -381,6 +416,10 @@ pub(crate) fn keys_from_trigger_def(def: &TriggerDefinition) -> (Keys, bool) {
         TriggerMode::EntersOrAttacks => {
             push(TriggerEventKey::EnterBattlefield(narrow));
             push(TriggerEventKey::Attacks);
+        }
+        // CR 702.55c: Haunt creature ETB half fires on entering the battlefield.
+        TriggerMode::EntersOrHauntedCreatureDies => {
+            push(TriggerEventKey::EnterBattlefield(narrow));
         }
         TriggerMode::AttacksOrBlocks => {
             push(TriggerEventKey::Attacks);
@@ -410,7 +449,7 @@ pub(crate) fn keys_from_trigger_def(def: &TriggerDefinition) -> (Keys, bool) {
 /// consult time. Exhaustive `match` on `GameEvent` — adding a new variant is
 /// a compile error until classified. The nested `EffectResolved { kind }`
 /// dispatch on `EffectKind` is similarly exhaustive (no `_` arm).
-fn keys_from_event(event: &GameEvent, state: &GameState) -> Keys {
+pub(crate) fn keys_from_event(event: &GameEvent, state: &GameState) -> Keys {
     let mut out: Keys = SmallVec::new();
     let mut push = |k: TriggerEventKey| {
         if !out.contains(&k) {
@@ -419,10 +458,20 @@ fn keys_from_event(event: &GameEvent, state: &GameState) -> Keys {
     };
 
     match event {
-        GameEvent::GameStarted => {}
+        // CR 732.2: a halted-resolution notification produces no trigger keys.
+        GameEvent::GameStarted | GameEvent::ResolutionHalted { .. } => {}
         GameEvent::TurnStarted { .. } => push(TriggerEventKey::TurnStarted),
         GameEvent::PhaseChanged { phase } => push(TriggerEventKey::BeginningOfPhase(*phase)),
         GameEvent::PriorityPassed { .. } => {}
+        GameEvent::StickerPlaced { .. } => {}
+        GameEvent::CreatureExerted { .. } => push(TriggerEventKey::Exerted),
+        GameEvent::CreatureEnlisted { .. } => push(TriggerEventKey::Enlisted),
+        GameEvent::ArmyAmassed { .. } => {}
+        GameEvent::Foretold { .. } => push(TriggerEventKey::Foretold),
+        // CR 702.143c: "becomes foretold" via an effect is NOT the foretell
+        // special action, so it produces no trigger key (a "whenever you
+        // foretell a card" trigger must not fire).
+        GameEvent::BecameForetold { .. } => {}
         GameEvent::SpellCast { object_id, .. } => {
             push(TriggerEventKey::SpellCast(None));
             if let Some(obj) = state.objects.get(object_id) {
@@ -453,12 +502,23 @@ fn keys_from_event(event: &GameEvent, state: &GameState) -> Keys {
         GameEvent::XValueChosen { .. } => {}
         GameEvent::AbilityActivated { .. } => push(TriggerEventKey::AbilityOrCopyActivated),
         GameEvent::ZoneChanged {
-            from, to, record, ..
+            from,
+            to,
+            record,
+            object_id,
         } => {
             // CR 603.6a: ETB. Emit broad + per-core-type narrow.
             if *to == Zone::Battlefield {
                 push(TriggerEventKey::EnterBattlefield(None));
-                for ct in &record.core_types {
+                // Use the live object's post-layer core_types if available (e.g., after
+                // Ashaya's layer effect adds the Land type). Fall back to the record's
+                // pre-layer types if the object is not in state.objects.
+                let core_types = if let Some(obj) = state.objects.get(object_id) {
+                    &obj.card_types.core_types
+                } else {
+                    &record.core_types
+                };
+                for ct in core_types {
                     push(TriggerEventKey::EnterBattlefield(Some(*ct)));
                 }
             }
@@ -489,6 +549,7 @@ fn keys_from_event(event: &GameEvent, state: &GameState) -> Keys {
             }
         }
         GameEvent::LifeChanged { .. } => push(TriggerEventKey::LifeChanged),
+        GameEvent::ControllerChanged { .. } => push(TriggerEventKey::ChangesController),
         GameEvent::ManaAdded { .. } => push(TriggerEventKey::ManaProduced),
         GameEvent::TappedForMana { .. } => {
             push(TriggerEventKey::ManaProduced);
@@ -505,10 +566,11 @@ fn keys_from_event(event: &GameEvent, state: &GameState) -> Keys {
             push(TriggerEventKey::CardsDrawn);
         }
         GameEvent::PermanentUntapped { .. } => push(TriggerEventKey::Untaps),
-        GameEvent::PermanentPhasedOut { .. }
-        | GameEvent::PermanentPhasedIn { .. }
-        | GameEvent::PlayerPhasedOut { .. }
-        | GameEvent::PlayerPhasedIn { .. } => {}
+        // CR 702.26c: Phasing triggers fire when a permanent phases in.
+        GameEvent::PermanentPhasedIn { .. } => push(TriggerEventKey::PhaseIn),
+        // CR 702.26b: Phasing triggers fire when a permanent phases out.
+        GameEvent::PermanentPhasedOut { .. } => push(TriggerEventKey::PhaseOut),
+        GameEvent::PlayerPhasedOut { .. } | GameEvent::PlayerPhasedIn { .. } => {}
         GameEvent::LandPlayed { .. } => {}
         GameEvent::StackPushed { .. } | GameEvent::StackResolved { .. } => {}
         GameEvent::Discarded { .. } => push(TriggerEventKey::Discarded),
@@ -521,6 +583,7 @@ fn keys_from_event(event: &GameEvent, state: &GameState) -> Keys {
         GameEvent::SpellCountered { .. } => {}
         GameEvent::CounterAdded { .. } => push(TriggerEventKey::CounterAdded),
         GameEvent::Evolved { .. } => {}
+        GameEvent::ObjectIntensified { .. } => {}
         GameEvent::CounterRemoved { .. } => push(TriggerEventKey::CounterRemoved),
         GameEvent::TokenCreated { .. } | GameEvent::ObjectConjured { .. } => {
             push(TriggerEventKey::TokenCreated);
@@ -531,13 +594,18 @@ fn keys_from_event(event: &GameEvent, state: &GameState) -> Keys {
         GameEvent::Unattached { .. } => push(TriggerEventKey::AttachmentChanged),
         GameEvent::AttackersDeclared { .. } => push(TriggerEventKey::Attacks),
         GameEvent::BlockersDeclared { .. } => push(TriggerEventKey::Blocks),
+        // CR 509.3c: an effect-driven "becomes blocked" is a Blocks-key event so
+        // "whenever ~ becomes blocked" triggers are indexed for it.
+        GameEvent::AttackerBecameBlockedByEffect { .. } => push(TriggerEventKey::Blocks),
         GameEvent::CombatTaxPaid { .. } | GameEvent::CombatTaxDeclined { .. } => {}
         GameEvent::BecomesTarget { .. } => push(TriggerEventKey::BecomesTarget),
         GameEvent::VehicleCrewed { .. }
         | GameEvent::Stationed { .. }
         | GameEvent::Saddled { .. } => {}
         GameEvent::ReplacementApplied { .. } => {}
-        GameEvent::Transformed { .. } | GameEvent::TurnedFaceUp { .. } => {
+        GameEvent::Transformed { .. }
+        | GameEvent::TurnedFaceUp { .. }
+        | GameEvent::TurnedFaceDown { .. } => {
             push(TriggerEventKey::FaceOrTransform);
         }
         GameEvent::DayNightChanged { .. } => push(TriggerEventKey::DayNightChanged),
@@ -547,6 +615,7 @@ fn keys_from_event(event: &GameEvent, state: &GameState) -> Keys {
         GameEvent::PlayerPerformedAction { .. } => push(TriggerEventKey::PlayerActionPerformed),
         GameEvent::Regenerated { .. }
         | GameEvent::CreatureSuspected { .. }
+        | GameEvent::CreatureNoLongerSuspected { .. }
         | GameEvent::Detained { .. }
         | GameEvent::BecamePrepared { .. }
         | GameEvent::BecameUnprepared { .. } => {}
@@ -555,6 +624,8 @@ fn keys_from_event(event: &GameEvent, state: &GameState) -> Keys {
         }
         GameEvent::MonarchChanged { .. } => push(TriggerEventKey::MonarchOrInitiative),
         GameEvent::CityBlessingGained { .. } => {}
+        // CR 103.1: setup determination, not a CR 706 die-roll trigger source.
+        GameEvent::StartingPlayerContest { .. } => {}
         GameEvent::DieRolled { .. } | GameEvent::CoinFlipped { .. } => {
             push(TriggerEventKey::DieOrCoin);
         }
@@ -562,8 +633,31 @@ fn keys_from_event(event: &GameEvent, state: &GameState) -> Keys {
         GameEvent::RoomEntered { .. } | GameEvent::DungeonCompleted { .. } => {
             push(TriggerEventKey::DungeonOrClassOrCase);
         }
+        // Planechase trigger modes (PlaneswalkedFrom/To, ChaosEnsues) route to the
+        // always-checked unclassified bucket in `keys_from_trigger_def`, so these
+        // events need no dedicated index key — their matchers are always consulted.
+        GameEvent::Planeswalked { .. }
+        | GameEvent::ChaosEnsued { .. }
+        | GameEvent::PlanarDieRolled { .. } => {}
+        // Archenemy trigger modes (SetInMotion/Abandoned) route to the
+        // always-checked unclassified bucket in `keys_from_trigger_def`, so these
+        // events need no dedicated index key — their matchers are always consulted.
+        GameEvent::SchemeSetInMotion { .. } | GameEvent::SchemeAbandoned { .. } => {}
         GameEvent::RoomDoorUnlocked { .. } | GameEvent::BecomesPlotted { .. } => {}
         GameEvent::InitiativeTaken { .. } => push(TriggerEventKey::MonarchOrInitiative),
+        GameEvent::AttractionOpened { .. }
+        | GameEvent::AttractionsRolledToVisit { .. }
+        | GameEvent::ContraptionAssembled { .. }
+        | GameEvent::ContraptionCranked { .. } => {}
+        GameEvent::AttractionVisited { .. } => push(TriggerEventKey::VisitAttraction),
+        GameEvent::Specialized { .. } => push(TriggerEventKey::Specializes),
+        // CR 702.140c-d: `TriggerMode::Mutates` is routed to the always-checked
+        // unclassified bucket (see `keys_from_trigger_def`), so the `Mutated`
+        // event needs no dedicated index key — `match_mutates` is always consulted.
+        GameEvent::Mutated { .. } => {}
+        // Unstable Host/Augment combine is a distinct mechanic and has no
+        // dedicated trigger mode today.
+        GameEvent::Augmented { .. } => {}
         GameEvent::Firebend { .. }
         | GameEvent::Airbend { .. }
         | GameEvent::Earthbend { .. }
@@ -583,6 +677,7 @@ fn keys_from_event(event: &GameEvent, state: &GameState) -> Keys {
         }
         GameEvent::PowerToughnessChanged { .. } => {}
         GameEvent::CascadeMissed { .. }
+        | GameEvent::CardPredicateGuessMade { .. }
         | GameEvent::DebugActionUsed { .. }
         | GameEvent::DebugPermissionGranted { .. }
         | GameEvent::DebugPermissionRevoked { .. } => {}
@@ -606,13 +701,19 @@ fn keys_from_effect_kind(kind: EffectKind, push: &mut impl FnMut(TriggerEventKey
             push(TriggerEventKey::AttachmentChanged);
         }
         EffectKind::Reveal => push(TriggerEventKey::Revealed),
-        EffectKind::GainControl => push(TriggerEventKey::ChangesController),
+        EffectKind::GainControl | EffectKind::GainControlAll => {
+            push(TriggerEventKey::ChangesController)
+        }
         EffectKind::Fight => push(TriggerEventKey::Fight),
         EffectKind::Explore => push(TriggerEventKey::Explored),
+        EffectKind::Discover => push(TriggerEventKey::DiscoverResolved),
+        EffectKind::Adapt => push(TriggerEventKey::AdaptResolved),
+        EffectKind::Connive => push(TriggerEventKey::ConniveResolved),
         EffectKind::Renown => push(TriggerEventKey::Renowned),
         EffectKind::Monstrosity => push(TriggerEventKey::BecomesMonstrous),
         EffectKind::ManifestDread => push(TriggerEventKey::ManifestDreadResolved),
         EffectKind::DayTimeChange => push(TriggerEventKey::DayNightChanged),
+        EffectKind::PutSticker | EffectKind::ApplySticker => {}
         // All other variants: not dispatched on by any production
         // EffectResolved matcher (verified against `trigger_matchers.rs` 1-3216).
         // Explicit `&[]`-equivalent arms — a future contributor who adds a
@@ -621,6 +722,9 @@ fn keys_from_effect_kind(kind: EffectKind, push: &mut impl FnMut(TriggerEventKey
         EffectKind::StartYourEngines
         | EffectKind::ChangeSpeed
         | EffectKind::DealDamage
+        | EffectKind::ApplyPostReplacementDamage
+        | EffectKind::EachDealsDamageEqualToPower
+        | EffectKind::EachSourceDealsDamage
         | EffectKind::Draw
         | EffectKind::Pump
         | EffectKind::PairWith
@@ -632,7 +736,6 @@ fn keys_from_effect_kind(kind: EffectKind, push: &mut impl FnMut(TriggerEventKey
         | EffectKind::LoseLife
         | EffectKind::Tap
         | EffectKind::Untap
-        | EffectKind::AddCounter
         | EffectKind::RemoveCounter
         | EffectKind::Sacrifice
         | EffectKind::DiscardCard
@@ -657,16 +760,28 @@ fn keys_from_effect_kind(kind: EffectKind, push: &mut impl FnMut(TriggerEventKey
         | EffectKind::Tribute
         | EffectKind::TimeTravel
         | EffectKind::BecomeMonarch
+        | EffectKind::NoOp
         | EffectKind::Proliferate
+        | EffectKind::ProliferateTarget
+        | EffectKind::EndTheTurn
+        | EffectKind::EndCombatPhase
         | EffectKind::Populate
         | EffectKind::Clash
+        | EffectKind::Behold
         | EffectKind::Vote
         | EffectKind::SeparateIntoPiles
         | EffectKind::SwitchPT
         | EffectKind::CopySpell
+        | EffectKind::EpicCopy
         | EffectKind::CopyTokenOf
+        | EffectKind::CreateTokenCopyFromPool
         | EffectKind::Myriad
+        | EffectKind::Encore
+        | EffectKind::Meld
+        | EffectKind::ExileHaunting
+        | EffectKind::HideawayConceal
         | EffectKind::BecomeCopy
+        | EffectKind::GainActivatedAbilitiesOfTarget
         | EffectKind::ChooseCard
         | EffectKind::PutCounter
         | EffectKind::PutCounterAll
@@ -687,12 +802,14 @@ fn keys_from_effect_kind(kind: EffectKind, push: &mut impl FnMut(TriggerEventKey
         | EffectKind::ExileTop
         | EffectKind::TargetOnly
         | EffectKind::Choose
+        | EffectKind::OpponentGuess
         | EffectKind::ChooseDamageSource
         | EffectKind::Suspect
-        | EffectKind::Connive
+        | EffectKind::Unsuspect
         | EffectKind::PhaseOut
         | EffectKind::PhaseIn
         | EffectKind::ForceBlock
+        | EffectKind::ForceAttack
         | EffectKind::SolveCase
         | EffectKind::BecomePrepared
         | EffectKind::BecomeUnprepared
@@ -703,12 +820,18 @@ fn keys_from_effect_kind(kind: EffectKind, push: &mut impl FnMut(TriggerEventKey
         | EffectKind::ReduceNextSpellCost
         | EffectKind::GrantNextSpellAbility
         | EffectKind::AddPendingETBCounters
+        | EffectKind::AddPendingEntersModifications
         | EffectKind::CreateEmblem
         | EffectKind::PayCost
         | EffectKind::CastFromZone
+        | EffectKind::FreeCastFromZones
+        | EffectKind::ExileResolvingSpellInsteadOfGraveyard
         | EffectKind::PreventDamage
         | EffectKind::CreateDamageReplacement
+        | EffectKind::CreateDrawReplacement
+        | EffectKind::CreatePlaneswalkReplacement
         | EffectKind::Regenerate
+        | EffectKind::RemoveAllDamage
         | EffectKind::LoseTheGame
         | EffectKind::WinTheGame
         | EffectKind::RollDie
@@ -719,19 +842,34 @@ fn keys_from_effect_kind(kind: EffectKind, push: &mut impl FnMut(TriggerEventKey
         | EffectKind::VentureIntoDungeon
         | EffectKind::VentureInto
         | EffectKind::TakeTheInitiative
+        | EffectKind::Planeswalk
+        | EffectKind::ChaosEnsues
+        // Redistribute emits LifeChanged handled by that event's own arm; no
+        // EffectResolved-dispatching matcher. No-op here.
+        | EffectKind::RedistributeLifeTotals
+        | EffectKind::ReverseTurnOrder
+        | EffectKind::OpenAttractions
+        | EffectKind::RollToVisitAttractions
         | EffectKind::ProcessRadCounters
         | EffectKind::GrantCastingPermission
         | EffectKind::ChooseFromZone
+        | EffectKind::RememberCard
         | EffectKind::ChooseObjectsIntoTrackedSet
+        // CR 608.2d + CR 122.1: counter-kind choice / consume — the actual
+        // counter placement fires `GameEvent::CounterAdded`, so no matcher
+        // dispatches on these `EffectResolved` kinds directly.
+        | EffectKind::ChooseCounterKind
+        | EffectKind::PutChosenCounter
         | EffectKind::ChooseAndSacrificeRest
+        | EffectKind::EachPlayerCopyChosen
         | EffectKind::Exploit
         | EffectKind::GainEnergy
         | EffectKind::GivePlayerCounter
         | EffectKind::LoseAllPlayerCounters
         | EffectKind::ExileFromTopUntil
         | EffectKind::RevealUntil
-        | EffectKind::Discover
         | EffectKind::Cascade
+        | EffectKind::Ripple
         | EffectKind::MiracleCast
         | EffectKind::MadnessCast
         | EffectKind::PutAtLibraryPosition
@@ -741,13 +879,16 @@ fn keys_from_effect_kind(kind: EffectKind, push: &mut impl FnMut(TriggerEventKey
         | EffectKind::Goad
         | EffectKind::GoadAll
         | EffectKind::Detain
+        // CR 709.5h-i unlock/fully-unlock triggers fire on the
+        // `RoomDoorUnlocked` event, not on this `EffectResolved` kind.
+        | EffectKind::SetRoomDoorLock
         | EffectKind::ExchangeControl
         | EffectKind::ChangeTargets
         | EffectKind::Incubate
         | EffectKind::Amass
         | EffectKind::Bolster
-        | EffectKind::Adapt
         | EffectKind::Manifest
+        | EffectKind::Cloak
         | EffectKind::ExtraTurn
         | EffectKind::GrantExtraLoyaltyActivations
         | EffectKind::SkipNextTurn
@@ -757,6 +898,7 @@ fn keys_from_effect_kind(kind: EffectKind, push: &mut impl FnMut(TriggerEventKey
         | EffectKind::RuntimeHandled
         | EffectKind::Learn
         | EffectKind::Forage
+        | EffectKind::Harness
         | EffectKind::CollectEvidence
         | EffectKind::Endure
         | EffectKind::BlightEffect
@@ -765,21 +907,50 @@ fn keys_from_effect_kind(kind: EffectKind, push: &mut impl FnMut(TriggerEventKey
         | EffectKind::SetDayNight
         | EffectKind::GiveControl
         | EffectKind::RemoveFromCombat
+        // CR 509.3c: the "becomes blocked" trigger from an effect-block is keyed
+        // off the `AttackerBecameBlockedByEffect` GameEvent (see the event→key
+        // map above), not off `EffectResolved`, so this kind emits no key here.
+        | EffectKind::BecomeBlocked
         | EffectKind::Conjure
+        | EffectKind::Intensify
+        | EffectKind::ApplyPerpetual
+        | EffectKind::DraftFromSpellbook
         | EffectKind::ChooseOneOf
+        | EffectKind::ChooseCounterAdjustment
+        | EffectKind::Specialize
         | EffectKind::Unimplemented
         | EffectKind::Crew
         | EffectKind::Station
         | EffectKind::Saddle
+        // CR 702.171b: the BecomeSaddled effect fires the saddled trigger via the
+        // separately-emitted `GameEvent::Saddled`, mirroring the keyword `Saddle`
+        // action; its own `EffectResolved` dispatches no trigger key.
+        | EffectKind::BecomeSaddled
         | EffectKind::Transform
         | EffectKind::TurnFaceUp
+        // CR 701.27b: a turned-face-down permanent fires any face-down trigger
+        // via the dedicated `GameEvent::TurnedFaceDown`, not via this effect's
+        // `EffectResolved`. No-op here, mirroring `TurnFaceUp`.
+        | EffectKind::TurnFaceDown
         // Added on origin/main after this branch point. No production
         // EffectResolved-dispatching matcher consumes either: cast-copy fires
         // on cast events (CastCopyOfCard, Mizzix's Mastery), and life/P-T
         // exchange emits LifeChanged/PowerToughnessChanged handled by their own
         // event arms (ExchangeLifeWithStat). No-op here.
         | EffectKind::CastCopyOfCard
-        | EffectKind::ExchangeLifeWithStat => {}
+        | EffectKind::ExchangeLifeWithStat
+        | EffectKind::ExchangeLifeTotals
+        // Heist/HeistExile have no production EffectResolved-dispatching matcher.
+        | EffectKind::Heist
+        | EffectKind::HeistExile
+        | EffectKind::CombineHost
+        | EffectKind::ChooseAugmentAndCombineWithHost
+        | EffectKind::AssembleContraptions
+        | EffectKind::AssembleContraptionsFromRollDifference
+        | EffectKind::CrankContraptions
+        | EffectKind::ReassembleContraption
+        | EffectKind::AssembleContraptionOnSprocket
+        | EffectKind::ReassembleContraptionOnSprocket => {}
     }
 }
 
@@ -806,6 +977,24 @@ pub fn has_synthetic_keyword_trigger_for(obj: &GameObject) -> bool {
                 | Keyword::Firebending(_)
         )
     })
+}
+
+/// CR 603.6a: Re-register one permanent's trigger definitions in the derived
+/// index after they are applied outside the ETB pipeline (scenario seeding,
+/// card-db rehydration, Oracle-text overlays, etc.).
+pub fn reindex_object_triggers(state: &mut GameState, object_id: ObjectId) {
+    let Some(obj) = state.objects.get(&object_id) else {
+        return;
+    };
+    if obj.zone != Zone::Battlefield || obj.is_phased_out() {
+        state.trigger_index.remove(object_id);
+        return;
+    }
+    let defs: SmallVec<[TriggerDefinition; 4]> =
+        obj.trigger_definitions.as_slice().iter().cloned().collect();
+    let synthetic = has_synthetic_keyword_trigger_for(obj);
+    state.trigger_index.remove(object_id);
+    state.trigger_index.add(object_id, &defs, synthetic);
 }
 
 impl TriggerIndex {
@@ -895,12 +1084,22 @@ pub fn candidates_for_event(state: &GameState, event: &GameEvent) -> SmallVec<[O
         }
     }
     // CR 702.26b: a phased-out permanent is treated as though it doesn't exist,
-    // so it never triggers. The legacy battlefield scan dropped these via
-    // `battlefield_phased_in_ids`; the index does not track phase status
-    // (phasing is not a zone change and does not touch the trigger index), so
-    // the filter must be reapplied here. Unknown ids are kept defensively and
-    // handled by the caller's per-candidate lookup.
-    out.retain(|id| state.objects.get(id).is_none_or(|obj| !obj.is_phased_out()));
+    // so it normally cannot trigger. The event source is the one exception for
+    // its own "phases out" trigger: the event is emitted after the status flip,
+    // and collection applies the matching definition-level carve-out.
+    let phase_out_source = match event {
+        GameEvent::PermanentPhasedOut { object_id, .. } => Some(*object_id),
+        _ => None,
+    };
+    if let Some(object_id) = phase_out_source {
+        out.push(object_id);
+    }
+    out.retain(|id| {
+        state
+            .objects
+            .get(id)
+            .is_none_or(|obj| !obj.is_phased_out() || phase_out_source == Some(*id))
+    });
     out.sort_unstable_by_key(|id| id.0);
     out.dedup();
     out
@@ -910,6 +1109,7 @@ pub fn candidates_for_event(state: &GameState, event: &GameEvent) -> SmallVec<[O
 mod tests {
     use super::*;
     use crate::types::ability::{TargetFilter, TypedFilter};
+    use crate::types::game_state::ZoneChangeRecord;
     use crate::types::triggers::TriggerEventKey;
 
     fn etb_creature_def() -> TriggerDefinition {
@@ -962,5 +1162,82 @@ mod tests {
         assert!(keys.contains(&TriggerEventKey::BeginningOfPhase(
             crate::types::phase::Phase::Upkeep
         )));
+    }
+
+    #[test]
+    fn phase_in_uses_narrow_trigger_key_for_def_and_event() {
+        let def = TriggerDefinition::new(TriggerMode::PhaseIn);
+        let (keys, route) = keys_from_trigger_def(&def);
+        assert!(keys.contains(&TriggerEventKey::PhaseIn));
+        assert!(!route);
+
+        let state = GameState::new_two_player(42);
+        let event_keys = keys_from_event(
+            &GameEvent::PermanentPhasedIn {
+                object_id: crate::types::identifiers::ObjectId(1),
+            },
+            &state,
+        );
+        assert!(event_keys.contains(&TriggerEventKey::PhaseIn));
+    }
+
+    #[test]
+    fn phase_out_uses_narrow_trigger_key_for_def_and_event() {
+        let def = TriggerDefinition::new(TriggerMode::PhaseOut);
+        let (keys, route) = keys_from_trigger_def(&def);
+        assert!(keys.contains(&TriggerEventKey::PhaseOut));
+        assert!(!route);
+
+        let state = GameState::new_two_player(42);
+        let event_keys = keys_from_event(
+            &GameEvent::PermanentPhasedOut {
+                object_id: crate::types::identifiers::ObjectId(1),
+                indirect: false,
+            },
+            &state,
+        );
+        assert!(event_keys.contains(&TriggerEventKey::PhaseOut));
+    }
+
+    #[test]
+    fn from_anywhere_to_graveyard_emits_battlefield_keys_and_stays_unclassified() {
+        // CR 603.6c: A trigger with destination=Graveyard and unrestricted origin
+        // ("from anywhere") should emit Dies and LeaveBattlefield keys for
+        // battlefield-origin events, but must still route through unclassified
+        // for non-battlefield origins such as library→graveyard or hand→graveyard.
+        let def = TriggerDefinition::new(TriggerMode::ChangesZone)
+            .destination(Zone::Graveyard)
+            .valid_card(TargetFilter::Typed(TypedFilter::card()));
+        let (keys, route) = keys_from_trigger_def(&def);
+        assert!(keys.contains(&TriggerEventKey::Dies(None)));
+        assert!(keys.contains(&TriggerEventKey::LeaveBattlefield(None)));
+        assert!(route);
+    }
+
+    #[test]
+    fn from_anywhere_to_graveyard_candidate_survives_library_origin_event() {
+        // CR 603.6c: "from anywhere" includes library→graveyard moves. The
+        // event side emits only Milled for this shape, so this class must stay
+        // in the unclassified safety bucket until a generic graveyard key exists.
+        let mut state = GameState::new_two_player(42);
+        let watcher = ObjectId(99);
+        let def = TriggerDefinition::new(TriggerMode::ChangesZone)
+            .destination(Zone::Graveyard)
+            .valid_card(TargetFilter::Typed(TypedFilter::card()));
+        state.trigger_index.add(watcher, &[def], false);
+
+        let event = GameEvent::ZoneChanged {
+            object_id: ObjectId(7),
+            from: Some(Zone::Library),
+            to: Zone::Graveyard,
+            record: Box::new(ZoneChangeRecord::test_minimal(
+                ObjectId(7),
+                Some(Zone::Library),
+                Zone::Graveyard,
+            )),
+        };
+
+        let candidates = candidates_for_event(&state, &event);
+        assert!(candidates.contains(&watcher));
     }
 }

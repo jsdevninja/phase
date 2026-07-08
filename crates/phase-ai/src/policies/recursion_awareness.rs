@@ -155,10 +155,22 @@ mod tests {
         obj.card_types.core_types.push(CoreType::Creature);
         obj.power = Some(2);
         obj.toughness = Some(2);
-        obj.keywords.push(Keyword::Escape {
-            cost: engine::types::mana::ManaCost::zero(),
-            exile_count: 3,
-        });
+        obj.keywords.push(Keyword::Escape(
+            engine::types::keywords::EscapeCost::NonMana(
+                engine::types::ability::AbilityCost::Composite {
+                    costs: vec![
+                        engine::types::ability::AbilityCost::Mana {
+                            cost: engine::types::mana::ManaCost::zero(),
+                        },
+                        engine::types::ability::AbilityCost::Exile {
+                            count: 3,
+                            zone: Some(Zone::Graveyard),
+                            filter: None,
+                        },
+                    ],
+                },
+            ),
+        ));
 
         let config = AiConfig::default();
         let ability = ResolvedAbility::new(
@@ -179,6 +191,7 @@ mod tests {
                     legal_targets: vec![TargetRef::Object(creature)],
                     optional: false,
                 }],
+                mode_labels: Vec::new(),
                 selection: Default::default(),
             },
             candidates: Vec::new(),
@@ -200,6 +213,7 @@ mod tests {
             config: &config,
             context: &crate::context::AiContext::empty(&config.weights),
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
 
         let score = RecursionAwarenessPolicy.score(&ctx);
@@ -224,10 +238,22 @@ mod tests {
         obj.card_types.core_types.push(CoreType::Creature);
         obj.power = Some(2);
         obj.toughness = Some(2);
-        obj.keywords.push(Keyword::Escape {
-            cost: engine::types::mana::ManaCost::zero(),
-            exile_count: 3,
-        });
+        obj.keywords.push(Keyword::Escape(
+            engine::types::keywords::EscapeCost::NonMana(
+                engine::types::ability::AbilityCost::Composite {
+                    costs: vec![
+                        engine::types::ability::AbilityCost::Mana {
+                            cost: engine::types::mana::ManaCost::zero(),
+                        },
+                        engine::types::ability::AbilityCost::Exile {
+                            count: 3,
+                            zone: Some(Zone::Graveyard),
+                            filter: None,
+                        },
+                    ],
+                },
+            ),
+        ));
 
         let config = AiConfig::default();
         let ability = ResolvedAbility::new(
@@ -238,10 +264,13 @@ mod tests {
                 owner_library: false,
                 enter_transformed: false,
                 enters_under: None,
-                enter_tapped: false,
+                enter_tapped: engine::types::zones::EtbTapState::Unspecified,
                 enters_attacking: false,
                 up_to: false,
                 enter_with_counters: vec![],
+                conditional_enter_with_counters: vec![],
+                face_down_profile: None,
+                enters_modified_if: None,
             },
             Vec::new(),
             ObjectId(100),
@@ -256,6 +285,7 @@ mod tests {
                     legal_targets: vec![TargetRef::Object(creature)],
                     optional: false,
                 }],
+                mode_labels: Vec::new(),
                 selection: Default::default(),
             },
             candidates: Vec::new(),
@@ -277,6 +307,7 @@ mod tests {
             config: &config,
             context: &crate::context::AiContext::empty(&config.weights),
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
 
         let score = RecursionAwarenessPolicy.score(&ctx);

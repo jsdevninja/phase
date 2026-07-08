@@ -8,8 +8,8 @@ use serde::Serialize;
 
 use super::effect_chain::EffectChainIr;
 use crate::types::ability::{
-    AbilityDefinition, TargetFilter, TriggerCondition, TriggerConstraint, TriggerDefinition,
-    UnlessPayModifier,
+    AbilityDefinition, ControllerRef, TargetFilter, TriggerCondition, TriggerConstraint,
+    TriggerDefinition, UnlessPayModifier,
 };
 use crate::types::triggers::TriggerMode;
 
@@ -58,12 +58,28 @@ pub(crate) struct TriggerModifiers {
     pub(crate) intervening_if: Option<TriggerCondition>,
     /// CR 608.2k: Trigger subject for pronoun resolution in effect text.
     pub(crate) trigger_subject: TargetFilter,
-    /// Whether "for the first time each turn" was stripped from condition text.
-    pub(crate) first_time_each_turn: bool,
+    /// CR 603.2: "for the first time ..." qualifier in the trigger event.
+    pub(crate) first_time_limit: Option<FirstTimeLimit>,
     /// Constraint parsed from full trigger text.
     pub(crate) constraint: Option<TriggerConstraint>,
     /// Whether effect text contains "up to one".
     pub(crate) has_up_to: bool,
     /// Lowered effect text (after comma split), for `effect_adds_mana_to_triggering_player`.
     pub(crate) effect_lower: String,
+    /// CR 109.4 + CR 603.7c: The relative-player scope the trigger condition
+    /// established for its effect body (`TargetPlayer` for "deals [combat]
+    /// damage to a player" / "attacks a player", `ParentTargetController` for
+    /// damage-source-controller triggers, `ScopedPlayer` for scoped-phase
+    /// triggers). Lowering reads this to rebind the body's `PlayerScope::Target`
+    /// possessive quantities ("they lose half their life") to
+    /// `PlayerScope::ScopedPlayer` for the `TargetPlayer` case, which resolves
+    /// against the damaged/attacked player stamped on the resolving ability from
+    /// the triggering event.
+    pub(crate) relative_player_scope: Option<ControllerRef>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub(crate) enum FirstTimeLimit {
+    EachTurn,
+    EachOpponentTurn,
 }

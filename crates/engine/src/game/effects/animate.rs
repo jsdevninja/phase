@@ -1,7 +1,7 @@
 use std::str::FromStr;
 
 use crate::types::ability::{
-    ContinuousModification, Duration, Effect, EffectError, EffectKind, ResolvedAbility,
+    ContinuousModification, Duration, Effect, EffectError, EffectKind, PtValue, ResolvedAbility,
     TargetFilter, TargetRef,
 };
 use crate::types::card_type::CoreType;
@@ -25,8 +25,8 @@ pub fn resolve(
             keywords,
             ..
         } => (
-            *power,
-            *toughness,
+            power.clone(),
+            toughness.clone(),
             types.as_slice(),
             remove_types.as_slice(),
             keywords.as_slice(),
@@ -42,11 +42,34 @@ pub fn resolve(
     let mut modifications = Vec::new();
 
     // CR 613.4 / Layer 7b: Set base P/T (overrides printed values).
-    if let Some(p) = power {
-        modifications.push(ContinuousModification::SetPower { value: p });
+    // PtValue::Fixed(n) emits a static SetPower; PtValue::Quantity(q) emits
+    // SetPowerDynamic so the layer system re-evaluates q each tick (CR 613.1).
+    //
+    // CR 608.2h exception: a quantity that reads a resolution-only object scope
+    // (the triggering/cost object — "that creature's power" → `Power {
+    // CostPaidObject }`) is snapshotted to a fixed `SetPower`/`SetToughness` at
+    // resolution. Such referents are gone by the time the layer system
+    // re-evaluates, so a dynamic modification would read 0; CR 608.2h also
+    // requires the value be determined once when the effect applies. Source- and
+    // recipient-scoped quantities (CDA "becomes X/X where X is its power") stay
+    // dynamic — they remain layer-resolvable.
+    match power {
+        Some(PtValue::Fixed(n)) => {
+            modifications.push(ContinuousModification::SetPower { value: n })
+        }
+        Some(PtValue::Quantity(q)) => {
+            modifications.push(set_pt_modification(state, ability, q, false))
+        }
+        Some(PtValue::Variable(_)) | None => {}
     }
-    if let Some(t) = toughness {
-        modifications.push(ContinuousModification::SetToughness { value: t });
+    match toughness {
+        Some(PtValue::Fixed(n)) => {
+            modifications.push(ContinuousModification::SetToughness { value: n })
+        }
+        Some(PtValue::Quantity(q)) => {
+            modifications.push(set_pt_modification(state, ability, q, true))
+        }
+        Some(PtValue::Variable(_)) | None => {}
     }
 
     // CR 613.1d / Layer 4: Add types and subtypes.
@@ -99,6 +122,31 @@ pub fn resolve(
     Ok(())
 }
 
+/// CR 613.4b + CR 608.2h: Build the layer-7b base-P/T set modification for a
+/// dynamic `PtValue::Quantity`. Resolution-only-scoped quantities (the
+/// triggering/cost object referent) are snapshotted to a fixed value here;
+/// everything else stays a `SetPowerDynamic`/`SetToughnessDynamic` the layer
+/// system re-evaluates. `is_toughness` selects power vs. toughness.
+fn set_pt_modification(
+    state: &GameState,
+    ability: &ResolvedAbility,
+    value: crate::types::ability::QuantityExpr,
+    is_toughness: bool,
+) -> ContinuousModification {
+    if crate::game::quantity::quantity_expr_uses_resolution_only_object_scope(&value) {
+        let resolved = crate::game::quantity::resolve_quantity_with_targets(state, &value, ability);
+        if is_toughness {
+            ContinuousModification::SetToughness { value: resolved }
+        } else {
+            ContinuousModification::SetPower { value: resolved }
+        }
+    } else if is_toughness {
+        ContinuousModification::SetToughnessDynamic { value }
+    } else {
+        ContinuousModification::SetPowerDynamic { value }
+    }
+}
+
 fn resolve_animate_targets(ability: &ResolvedAbility) -> Vec<crate::types::identifiers::ObjectId> {
     if let Effect::Animate { target, .. } = &ability.effect {
         if matches!(target, TargetFilter::None) {
@@ -122,6 +170,7 @@ fn resolve_animate_targets(ability: &ResolvedAbility) -> Vec<crate::types::ident
 mod tests {
     use super::*;
     use crate::game::zones::create_object;
+    use crate::types::ability::{QuantityExpr, QuantityRef};
     use crate::types::identifiers::CardId;
     use crate::types::player::PlayerId;
     use crate::types::zones::Zone;
@@ -139,8 +188,8 @@ mod tests {
 
         let ability = ResolvedAbility::new(
             Effect::Animate {
-                power: Some(7),
-                toughness: Some(7),
+                power: Some(PtValue::Fixed(7)),
+                toughness: Some(PtValue::Fixed(7)),
                 types: vec!["Creature".to_string(), "Beast".to_string()],
                 remove_types: vec![],
                 keywords: vec![],
@@ -189,8 +238,8 @@ mod tests {
 
         let ability = ResolvedAbility::new(
             Effect::Animate {
-                power: Some(3),
-                toughness: Some(3),
+                power: Some(PtValue::Fixed(3)),
+                toughness: Some(PtValue::Fixed(3)),
                 types: vec!["Creature".to_string()],
                 remove_types: vec![],
                 keywords: vec![],
@@ -223,8 +272,8 @@ mod tests {
 
         let mut ability = ResolvedAbility::new(
             Effect::Animate {
-                power: Some(5),
-                toughness: Some(5),
+                power: Some(PtValue::Fixed(5)),
+                toughness: Some(PtValue::Fixed(5)),
                 types: vec!["Creature".to_string()],
                 remove_types: vec![],
                 keywords: vec![],
@@ -242,6 +291,190 @@ mod tests {
         assert_eq!(
             state.transient_continuous_effects[0].duration,
             Duration::UntilHostLeavesPlay
+        );
+    }
+
+    /// CR 613.4 + CR 613.1: PtValue::Quantity routes to SetPowerDynamic /
+    /// SetToughnessDynamic so the layer system re-evaluates the quantity each
+    /// tick (e.g. "becomes an X/X creature" where X = CostXPaid).
+    #[test]
+    fn animate_dynamic_pt_emits_set_power_dynamic() {
+        let mut state = GameState::new_two_player(42);
+        let obj_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Land".to_string(),
+            Zone::Battlefield,
+        );
+
+        let cost_x = QuantityExpr::Ref {
+            qty: QuantityRef::CostXPaid,
+        };
+        let ability = ResolvedAbility::new(
+            Effect::Animate {
+                power: Some(PtValue::Quantity(cost_x.clone())),
+                toughness: Some(PtValue::Quantity(cost_x.clone())),
+                types: vec!["Creature".to_string()],
+                remove_types: vec![],
+                keywords: vec![],
+                target: TargetFilter::None,
+            },
+            vec![],
+            obj_id,
+            PlayerId(0),
+        );
+
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        let tce = &state.transient_continuous_effects[0];
+        assert!(
+            tce.modifications
+                .contains(&ContinuousModification::SetPowerDynamic {
+                    value: cost_x.clone()
+                }),
+            "must emit SetPowerDynamic(CostXPaid)"
+        );
+        assert!(
+            tce.modifications
+                .contains(&ContinuousModification::SetToughnessDynamic { value: cost_x }),
+            "must emit SetToughnessDynamic(CostXPaid)"
+        );
+        assert!(
+            !tce.modifications
+                .iter()
+                .any(|m| matches!(m, ContinuousModification::SetPower { .. })),
+            "must not emit static SetPower when PtValue::Quantity"
+        );
+    }
+
+    /// CR 608.2h + CR 613.4b: a base-power set whose value reads a
+    /// resolution-only object scope ("that creature's power" →
+    /// `Power { CostPaidObject }`, the triggering object) is snapshotted to a
+    /// fixed `SetPower` at resolution — the layer system can't re-resolve that
+    /// referent later. A `Source`-scoped value, by contrast, stays a dynamic
+    /// `SetPowerDynamic` (layer-resolvable per object).
+    #[test]
+    fn animate_snapshots_event_scoped_power_to_fixed_set_power() {
+        let mut state = GameState::new_two_player(42);
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Source".to_string(),
+            Zone::Battlefield,
+        );
+        let entering = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Entering".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&entering).unwrap();
+            obj.card_types
+                .core_types
+                .push(crate::types::card_type::CoreType::Creature);
+            obj.power = Some(5);
+            obj.toughness = Some(5);
+            obj.base_power = Some(5);
+            obj.base_toughness = Some(5);
+        }
+        // The trigger-event source is the entering creature, so
+        // `Power { CostPaidObject }` resolves (slot-2 fallback) to its power.
+        state.current_trigger_event = Some(crate::types::events::GameEvent::ZoneChanged {
+            object_id: entering,
+            from: Some(Zone::Hand),
+            to: Zone::Battlefield,
+            record: Box::new(crate::types::game_state::ZoneChangeRecord::test_minimal(
+                entering,
+                Some(Zone::Hand),
+                Zone::Battlefield,
+            )),
+        });
+
+        let event_power = QuantityExpr::Ref {
+            qty: QuantityRef::Power {
+                scope: crate::types::ability::ObjectScope::CostPaidObject,
+            },
+        };
+        let ability = ResolvedAbility::new(
+            Effect::Animate {
+                power: Some(PtValue::Quantity(event_power)),
+                toughness: None,
+                types: vec![],
+                remove_types: vec![],
+                keywords: vec![],
+                target: TargetFilter::None,
+            },
+            vec![],
+            source,
+            PlayerId(0),
+        );
+
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        let tce = &state.transient_continuous_effects[0];
+        assert!(
+            tce.modifications
+                .contains(&ContinuousModification::SetPower { value: 5 }),
+            "event-scoped base power must be snapshotted to a fixed SetPower(5), got {:?}",
+            tce.modifications
+        );
+        assert!(
+            !tce.modifications
+                .iter()
+                .any(|m| matches!(m, ContinuousModification::SetPowerDynamic { .. })),
+            "must not leave a dynamic SetPowerDynamic for a resolution-only scope"
+        );
+    }
+
+    /// Guard: a `Source`-scoped dynamic base power must stay `SetPowerDynamic`
+    /// so CDA-style "becomes an X/X where X is its power" set effects remain
+    /// layer-resolvable (no snapshot).
+    #[test]
+    fn animate_keeps_source_scoped_power_dynamic() {
+        let mut state = GameState::new_two_player(42);
+        let obj_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Source".to_string(),
+            Zone::Battlefield,
+        );
+        let source_power = QuantityExpr::Ref {
+            qty: QuantityRef::Power {
+                scope: crate::types::ability::ObjectScope::Source,
+            },
+        };
+        let ability = ResolvedAbility::new(
+            Effect::Animate {
+                power: Some(PtValue::Quantity(source_power.clone())),
+                toughness: None,
+                types: vec![],
+                remove_types: vec![],
+                keywords: vec![],
+                target: TargetFilter::None,
+            },
+            vec![],
+            obj_id,
+            PlayerId(0),
+        );
+
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        let tce = &state.transient_continuous_effects[0];
+        assert!(
+            tce.modifications
+                .contains(&ContinuousModification::SetPowerDynamic {
+                    value: source_power
+                }),
+            "source-scoped base power must stay dynamic, got {:?}",
+            tce.modifications
         );
     }
 }

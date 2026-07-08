@@ -3,22 +3,30 @@ import { motion, useReducedMotion } from "framer-motion";
 import type { ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 
-import type { WaitingFor } from "../../adapter/types.ts";
+import type { GameObject, ObjectId, WaitingFor } from "../../adapter/types.ts";
 import { useCanActForWaitingState } from "../../hooks/usePlayerId.ts";
 import { useGameStore } from "../../stores/gameStore.ts";
 import { useUiStore } from "../../stores/uiStore.ts";
+import { getBoardChoiceView } from "../../viewmodel/gameStateView.ts";
+import { GAME_Z_LAYER } from "../../constants/ui.ts";
 import { DialogPeekCtx, type DialogPeekContext } from "./dialogPeekContext.ts";
 
 // `WaitingFor` variants that do NOT render a centered dialog/overlay.
 // Board-level interactions (Priority, combat declarations) and pre-game
 // flows render inline on the board rather than as a centered modal.
+//
+// NOTE: combat damage *assignment* (`AssignCombatDamage` / `AssignBlockerDamage`)
+// is deliberately ABSENT — unlike attacker/blocker declaration, it renders a
+// centered `ChoiceOverlay` modal (via `CardChoiceModal` → `DamageAssignmentModal`).
+// Listing it here would leave the host un-anchored (`className=""`), so the
+// modal's `fixed inset-0 z-50` would be trapped inside framer-motion's
+// transform stacking context and paint BELOW the board/HUD/hand (see the
+// anchoring contract on lines 114-123). Centered modals must stay out of this set.
 const NON_DIALOG_WAITING_FOR_TYPES: ReadonlySet<WaitingFor["type"]> = new Set<WaitingFor["type"]>([
   "Priority",
   "DeclareAttackers",
   "DeclareBlockers",
-  "AssignCombatDamage",
   "MulliganDecision",
-  "MulliganBottomCards",
   "OpeningHandBottomCards",
   "BetweenGamesSideboard",
   "BetweenGamesChoosePlayDraw",
@@ -42,23 +50,50 @@ export const CLICK_THROUGH_WAITING_FOR_TYPES: ReadonlySet<WaitingFor["type"]> = 
   "CopyRetarget",
   "RetargetChoice",
   "ExploreChoice",
+  "PopulateChoice",
   "ReturnAsAuraTarget",
-  "TapCreaturesForManaAbility",
-  "TapCreaturesForSpellCost",
 ]);
+
+// CR 118.3 + CR 605.3b: a `PayCost` prompt is click-through only for the
+// TapCreatures kind (the player taps creatures on the battlefield). All other
+// cost kinds surface a modal in `CardChoiceModal` and must stay host-wrapped.
+export function isClickThroughWaitingFor(
+  waitingFor: WaitingFor | null | undefined,
+  objects?: Record<ObjectId, GameObject | undefined>,
+): boolean {
+  if (!waitingFor) return false;
+  if (CLICK_THROUGH_WAITING_FOR_TYPES.has(waitingFor.type)) return true;
+  return getBoardChoiceView(waitingFor, objects) != null;
+}
 
 function isDialogVisibleFor(waitingFor: WaitingFor | null | undefined): boolean {
   if (!waitingFor) return false;
   return !NON_DIALOG_WAITING_FOR_TYPES.has(waitingFor.type);
 }
 
-function isClickThroughDialog(waitingFor: WaitingFor | null | undefined): boolean {
+function isClickThroughDialog(
+  waitingFor: WaitingFor | null | undefined,
+  objects?: Record<ObjectId, GameObject | undefined>,
+): boolean {
   if (!waitingFor) return false;
-  return CLICK_THROUGH_WAITING_FOR_TYPES.has(waitingFor.type);
+  if (isClickThroughWaitingFor(waitingFor, objects)) return true;
+  // Any `ManaPayment` panel is click-through. The host still anchors the panel
+  // at `fixed inset-0 z-40` (so it can't be trapped beneath the board), but
+  // click-through marks it `pointer-events: none` so board taps reach the
+  // battlefield — the panel's own controls re-enable events.
+  //
+  // Manual payment of plain/hybrid mana DOES need board interaction: the player
+  // taps their own lands and clicks mana-pool pips behind the panel to pay. (In
+  // auto mode an unambiguous cast finalizes before any panel is shown, so a
+  // `ManaPayment` WaitingFor only ever reaches the UI when board taps are live.)
+  // Convoke/improvise (CR 702.51a / CR 702.126a), which additionally tap
+  // creatures/artifacts, are a subset of this same click-through behavior.
+  return waitingFor.type === "ManaPayment";
 }
 
 export function DialogHost({ children }: { children: ReactNode }) {
   const waitingFor = useGameStore((s) => s.waitingFor);
+  const objects = useGameStore((s) => s.gameState?.objects);
   // Only treat a `WaitingFor` as a host-anchored dialog when the local
   // player can actually act on it. Otherwise (opponent searching their
   // library, scrying, etc.) the engine's WaitingFor is on the opponent and
@@ -88,13 +123,36 @@ export function DialogHost({ children }: { children: ReactNode }) {
 
   const dialogVisible =
     (isDialogVisibleFor(waitingFor) && canActForWaitingState) || hasUiDialog;
-  const clickThrough = isClickThroughDialog(waitingFor);
-  // Only wrap when there's a centered dialog that benefits from being
-  // anchored to the viewport. Click-through overlays (TargetingOverlay)
-  // must NOT be wrapped — the host would intercept board clicks at z-40
-  // and break target picking.
-  const wrapped = dialogVisible && !clickThrough;
-  const showPeekTab = peeked && wrapped;
+  // CR 702.51a: convoke/improvise payment marks the host click-through so board
+  // taps reach creatures. But a UI-driven modal opened mid-payment — e.g. the
+  // ability picker fired by tapping a mana creature like Birds of Paradise, which
+  // is convoke-eligible AND has an activatable mana ability — renders INSIDE this
+  // host. Leaving the host click-through makes that modal inherit
+  // `pointer-events: none`, so its buttons are dead and clicks fall through to the
+  // board/hand behind it. While such a modal is up the player interacts with it,
+  // not the board, so suppress click-through to restore pointer events.
+  const clickThrough = isClickThroughDialog(waitingFor, objects) && !hasUiDialog;
+  // BASE INVARIANT: every visible prompt is anchored in this viewport-level
+  // DialogHost stacking context, so no prompt can ever be trapped beneath the
+  // board. The board grid is its own lower stacking context; framer-motion
+  // leaves a `transform`/`will-change: transform` on
+  // this node, which would demote an un-anchored (className="") host to a
+  // `z-auto` context that paints BELOW the board — burying the dialog behind
+  // the HUD and hand. Anchoring at GAME_Z_LAYER.dialogHost keeps the context
+  // above the board regardless of any transform framer applies.
+  // Click-through is achieved with `pointer-events: none` (below), NOT by
+  // un-anchoring, so board taps still reach the battlefield.
+  const anchored = dialogVisible;
+  // Any mana-payment panel is bottom-anchored and can overlap the very lands /
+  // creatures the player must tap to pay (manual mana, convoke, improvise). Unlike
+  // the translucent full-screen target overlays, it benefits from the peek/slide
+  // affordance so the player can collapse it off an overlapped permanent — so it
+  // stays peekable even while click-through. Other click-through overlays (target
+  // picking) are translucent and full-screen, so they stay put and pass taps
+  // straight through.
+  const isManaPayment = waitingFor?.type === "ManaPayment";
+  const peekable = anchored && (!clickThrough || isManaPayment);
+  const showPeekTab = peeked && peekable;
 
   const ctxValue = useMemo<DialogPeekContext>(
     () => ({
@@ -109,30 +167,35 @@ export function DialogHost({ children }: { children: ReactNode }) {
   // right (mirrors the stack panel — established muscle memory). On narrow
   // viewports it slides down (more reachable on phones).
   const isNarrow = useIsNarrowViewport();
+  // Only apply the peek slide transform while peeked. Framer-motion keeps a
+  // residual `transform` (even at `{ x: 0, y: 0 }`) whenever `animate` is set,
+  // which breaks `<input type="range">` hit-testing in bottom-anchored panels
+  // such as ChooseXValueUI — the slider looks fine but ignores drags until
+  // something else reflows the tree (issue #2427).
   const slideTransform = peeked
     ? isNarrow
       ? { x: 0, y: "calc(100vh - 64px)" }
       : { x: "calc(100vw - 32px)", y: 0 }
-    : { x: 0, y: 0 };
+    : undefined;
 
   return (
     <DialogPeekCtx.Provider value={ctxValue}>
-      {/* The host's motion.div must (a) NOT establish a transform-CB that
-          mis-anchors `fixed inset:0` dialog descendants when at rest, and
-          (b) NOT block board clicks/hovers when no dialog is up.
-          Both are achieved by gating `fixed inset-0` on `dialogVisible`:
-          when a dialog is visible the host fills the viewport (so the
-          transform CB IS the viewport, dialogs render correctly, slide
-          works); when none is up the host collapses to an in-flow 0-size
-          box that intercepts nothing. Pointer-events:none kicks in only
-          while peeked so clicks/hovers pass through to the battlefield —
-          otherwise the dialog itself handles events normally. */}
+      {/* When a dialog is visible the host fills the viewport at the DialogHost
+          stacking context so descendants render above the board; when none is
+          up it collapses to an in-flow 0-size box that intercepts nothing.
+          `pointer-events: none` lets taps/hovers pass through to the
+          battlefield while peeked OR for click-through prompts (convoke /
+          improvise / target picking); interactive children re-enable events
+          with `pointer-events-auto`. Otherwise the dialog handles events
+          normally. */}
       <motion.div
-        className={wrapped ? "fixed inset-0 z-40" : ""}
+        className={anchored ? `fixed inset-0 ${GAME_Z_LAYER.dialogHost}` : ""}
         style={
-          wrapped ? { pointerEvents: peeked ? "none" : undefined } : undefined
+          anchored
+            ? { pointerEvents: clickThrough || peeked ? "none" : undefined }
+            : undefined
         }
-        animate={wrapped ? slideTransform : undefined}
+        animate={peekable && peeked ? slideTransform : undefined}
         transition={
           shouldReduceMotion
             ? { duration: 0 }
@@ -151,7 +214,7 @@ export function DialogHost({ children }: { children: ReactNode }) {
   );
 }
 
-function PeekRestoreTab({
+export function PeekRestoreTab({
   direction,
   onClick,
 }: {
@@ -165,7 +228,7 @@ function PeekRestoreTab({
   const positionClass =
     direction === "right"
       ? "right-3 top-1/2 -translate-y-1/2 h-24 w-9 rounded-2xl"
-      : "bottom-3 left-1/2 -translate-x-1/2 h-9 w-24 rounded-2xl";
+      : "left-3 top-[63%] -translate-y-1/2 h-9 w-9 rounded-2xl";
 
   const iconRotate = direction === "right" ? "rotate-180" : "-rotate-90";
 
@@ -190,7 +253,7 @@ function PeekRestoreTab({
         scale: { delay: 0.1, duration: 0.2 },
         boxShadow: { duration: 2.4, repeat: Infinity, ease: "easeInOut" },
       }}
-      className={`fixed z-[60] flex items-center justify-center border border-cyan-400/40 bg-[#0b1020]/96 text-cyan-200 backdrop-blur-md transition-colors hover:bg-cyan-500/20 hover:text-white ${positionClass}`}
+      className={`fixed ${GAME_Z_LAYER.floatingOverlay} flex items-center justify-center border border-cyan-400/40 bg-[#0b1020]/96 text-cyan-200 backdrop-blur-md transition-colors hover:bg-cyan-500/20 hover:text-white ${positionClass}`}
     >
       <svg
         xmlns="http://www.w3.org/2000/svg"
@@ -208,7 +271,7 @@ function PeekRestoreTab({
   );
 }
 
-function useIsNarrowViewport(breakpoint = 640): boolean {
+export function useIsNarrowViewport(breakpoint = 640): boolean {
   const [isNarrow, setIsNarrow] = useState(() =>
     typeof window === "undefined" ? false : window.innerWidth < breakpoint,
   );

@@ -12,7 +12,7 @@ use super::ast::{ClauseBoundary, ContinuationAst, ParsedEffectClause};
 use crate::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, ControllerRef,
     DelayedTriggerCondition, MultiTargetSpec, OpponentMayScope, PlayerFilter, QuantityExpr,
-    RoundingMode, TargetSelectionMode, UnlessPayModifier,
+    RoundingMode, TargetFilter, TargetSelectionMode, UnlessPayModifier,
 };
 use crate::types::keywords::Keyword;
 use crate::types::mana::ManaExpiry;
@@ -42,6 +42,20 @@ pub(crate) struct EffectChainIr {
     pub(crate) repeat_until: Option<crate::types::ability::RepeatContinuation>,
 }
 
+/// CR 608.2c + CR 601.2c: Subject of a "does the same / does so" effect-replication
+/// directive. Such a clause replicates the immediately-preceding sibling effect for
+/// a different actor. Typed (never a `bool`/`String`) so the deferred player-set
+/// fanout — "each opponent … does the same" (the Curse cycle, Warp World / Morphic
+/// Tide) — slots in as a clean enum extension rather than a re-architecture.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) enum DoesTheSameSubject {
+    /// CR 115.1a + CR 601.2c: "[then] target opponent does the same / does so." —
+    /// replicate the preceding action for a single targeted opponent (The Wedding
+    /// of River Song). The opponent is a cast-time target (CR 601.2c); at
+    /// resolution they perform the same action on their own objects (CR 608.2d).
+    TargetOpponent,
+}
+
 /// Special-case clause actions that modify or attach to adjacent clauses during lowering.
 ///
 /// The chunk loop's special-case handlers (otherwise, instead, alt-cost rider, etc.)
@@ -57,6 +71,12 @@ pub(crate) enum SpecialClause {
     OtherwiseFallback(Box<AbilityDefinition>),
     /// CR 614.1a + CR 514.2: Die-exile-rider — attach as sub_ability on previous def.
     DieExileRider(Box<AbilityDefinition>),
+    /// CR 608.2c + CR 701.19c: "[noun] dealt damage this way can't be
+    /// regenerated this turn." — a separate-sentence regen rider that attaches
+    /// as a sub_ability on the previous damage clause (Incinerate, Flamebreak,
+    /// Jaya Ballard, Task Mage). Carries a `GenericEffect{CantBeRegenerated}`
+    /// whose `target: TrackedSet` binds to the damage clause's published set.
+    CantBeRegeneratedRider(Box<AbilityDefinition>),
     /// CR 608.2c: Dig-instead alternative — replace previous Dig with conditional alternative.
     DigInsteadAlt(Box<AbilityDefinition>),
     /// CR 608.2e: Generic instead clause — attach to previous def as sub_ability.
@@ -77,6 +97,13 @@ pub(crate) enum SpecialClause {
     /// additional `StaticDefinition` cloned from the antecedent grant template,
     /// with both the granted keyword and the gating condition's keyword swapped.
     SameIsTrueFor(Vec<Keyword>),
+    /// CR 608.2c: "Repeat this process for <keyword list>." — Kathril, Aspect
+    /// Warper. Replicates the antecedent conditional keyword-counter clause
+    /// (`PutCounter { counter_type: Keyword(..) }` gated by a graveyard-keyword
+    /// condition) once per listed keyword, swapping both the placed counter's
+    /// keyword and the gating condition's keyword. The counters-class analogue
+    /// of `SameIsTrueFor` (which handles static keyword grants).
+    RepeatProcessForKeywords(Vec<Keyword>),
 }
 
 /// Per-clause IR: captures everything about a single parsed chunk before chain assembly.
@@ -135,13 +162,19 @@ pub(crate) struct ClauseIr {
     /// `Random` when the parser stripped a leading "random " modifier.
     #[serde(default, skip_serializing_if = "TargetSelectionMode::is_chosen")]
     pub(crate) target_selection_mode: TargetSelectionMode,
+    /// CR 601.2c + CR 603.3d: Target chooser captured from `ParseContext` after
+    /// this chunk was parsed. Stamped onto the produced `AbilityDefinition` during
+    /// lowering. `None` (default) = controller chooses; `Some(ScopedPlayer)` for a
+    /// targeted "of their choice" controlled by the phase-trigger active player.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) target_chooser: Option<TargetFilter>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::parser::oracle_ir::ast::parsed_clause;
-    use crate::types::ability::{Effect, TargetFilter};
+    use crate::types::ability::Effect;
 
     #[test]
     fn effect_chain_ir_empty_construction() {
@@ -181,6 +214,7 @@ mod tests {
             special: None,
             source_text: "draw a card".to_string(),
             target_selection_mode: TargetSelectionMode::Chosen,
+            target_chooser: None,
         };
         assert_eq!(clause.source_text, "draw a card");
         assert!(!clause.is_optional);
@@ -215,6 +249,7 @@ mod tests {
                 special: None,
                 source_text: "draw two cards".to_string(),
                 target_selection_mode: TargetSelectionMode::Chosen,
+                target_chooser: None,
             }],
             kind: AbilityKind::Spell,
             chain_rounding: None,

@@ -92,14 +92,48 @@ describe("AiOpponentConfig — cEDH toggle", () => {
 
     // Expand the first seat panel and change only seat 0.
     await user.click(screen.getByRole("button", { name: /Opponent 1/i }));
-    const difficultySelects = screen.getAllByRole("combobox", { name: /Difficulty/i });
-    await user.selectOptions(difficultySelects[0], "Medium");
+    const difficultyTriggers = screen.getAllByRole("button", { name: /^Difficulty$/i });
+    await user.click(difficultyTriggers[0]);
+    await user.click(screen.getByRole("option", { name: /Medium/i }));
 
     // Seat 1 must still be Hard — changing one seat never affects another.
     await waitFor(() => {
       const seats = usePreferencesStore.getState().aiSeats;
       expect(seats[0].difficulty).toBe("Medium");
       expect(seats[1].difficulty).toBe("Hard");
+    });
+  });
+});
+
+describe("AiOpponentConfig — cEDH toggle format gating", () => {
+  it("renders the toggle for Commander", () => {
+    render(<AiOpponentConfig selectedFormat="Commander" opponentCount={1} />);
+    expect(screen.getByRole("switch", { name: /cEDH mode/i })).toBeInTheDocument();
+  });
+
+  it("renders the toggle for Duel Commander", () => {
+    render(<AiOpponentConfig selectedFormat="DuelCommander" opponentCount={1} />);
+    expect(screen.getByRole("switch", { name: /cEDH mode/i })).toBeInTheDocument();
+  });
+
+  it("hides the toggle for non-Commander formats", () => {
+    render(<AiOpponentConfig selectedFormat="Standard" opponentCount={1} />);
+    expect(screen.queryByRole("switch", { name: /cEDH mode/i })).not.toBeInTheDocument();
+  });
+
+  it("clears a stale cEDH flag when switching away from a Commander format", async () => {
+    act(() => {
+      usePreferencesStore.getState().setCedhMode(true);
+    });
+
+    const { rerender } = render(<AiOpponentConfig selectedFormat="Commander" opponentCount={1} />);
+    expect(usePreferencesStore.getState().cedhMode).toBe(true);
+
+    // Simulate the setup page re-passing a new format prop on dropdown change.
+    rerender(<AiOpponentConfig selectedFormat="Standard" opponentCount={1} />);
+
+    await waitFor(() => {
+      expect(usePreferencesStore.getState().cedhMode).toBe(false);
     });
   });
 });
@@ -117,13 +151,13 @@ describe("AiOpponentConfig — cEDH badge + disabled difficulty", () => {
 
     // Before enabling: no badge, dropdown enabled.
     expect(screen.queryByLabelText("cEDH")).not.toBeInTheDocument();
-    expect(screen.getByRole("combobox", { name: /Difficulty/i })).toBeEnabled();
+    expect(screen.getByRole("button", { name: /^Difficulty$/i })).toBeEnabled();
 
     await user.click(screen.getByRole("switch", { name: /cEDH mode/i }));
 
     await waitFor(() => {
       expect(screen.getByLabelText("cEDH")).toBeInTheDocument();
-      expect(screen.getByRole("combobox", { name: /Difficulty/i })).toBeDisabled();
+      expect(screen.getByRole("button", { name: /^Difficulty$/i })).toBeDisabled();
     });
   });
 
@@ -135,6 +169,32 @@ describe("AiOpponentConfig — cEDH badge + disabled difficulty", () => {
 
     render(<AiOpponentConfig selectedFormat="Commander" opponentCount={1} />);
     expect(screen.queryByLabelText("cEDH")).not.toBeInTheDocument();
+  });
+
+  it("clears cEDH mode when switching away from Commander-family formats", async () => {
+    act(() => {
+      usePreferencesStore.getState().setCedhMode(true);
+    });
+
+    const { rerender } = render(<AiOpponentConfig selectedFormat="Commander" opponentCount={1} />);
+    rerender(<AiOpponentConfig selectedFormat="Standard" opponentCount={1} />);
+
+    await waitFor(() => {
+      expect(usePreferencesStore.getState().cedhMode).toBe(false);
+    });
+  });
+
+  it("preserves cEDH mode when the selected format is not loaded", () => {
+    act(() => {
+      usePreferencesStore.getState().setCedhMode(true);
+    });
+
+    const { rerender } = render(<AiOpponentConfig selectedFormat="Commander" opponentCount={1} />);
+    rerender(<AiOpponentConfig selectedFormat={undefined} opponentCount={1} />);
+    expect(usePreferencesStore.getState().cedhMode).toBe(true);
+
+    rerender(<AiOpponentConfig selectedFormat={null} opponentCount={1} />);
+    expect(usePreferencesStore.getState().cedhMode).toBe(true);
   });
 });
 
@@ -151,7 +211,7 @@ describe("AiOpponentConfig — bracket filter", () => {
 
   it("filter off (empty selection) keeps untagged candidates in the random pool", () => {
     render(<AiOpponentConfig selectedFormat="Commander" opponentCount={1} />);
-    expect(screen.getByRole("option", { name: /Random \(4\)/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^Deck$/i })).toHaveTextContent(/Random \(4\)/);
   });
 
   it("selecting brackets {2, 4} narrows the pool to those candidates and excludes untagged", async () => {
@@ -162,7 +222,7 @@ describe("AiOpponentConfig — bracket filter", () => {
     await user.click(screen.getByRole("button", { name: "4 Optimized" }));
 
     await waitFor(() => {
-      expect(screen.getByRole("option", { name: /Random \(2\)/ })).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: /^Deck$/i })).toHaveTextContent(/Random \(2\)/);
     });
   });
 });

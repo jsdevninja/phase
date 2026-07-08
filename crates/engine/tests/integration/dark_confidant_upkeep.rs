@@ -38,28 +38,17 @@
 //! The new `effect_context_object` path and the `last_revealed_ids` target
 //! injection therefore do not double-bind for this card.
 
-use std::path::Path;
-use std::sync::OnceLock;
-
-use engine::database::card_db::CardDatabase;
 use engine::game::scenario::{GameScenario, P0};
 use engine::game::scenario_db::GameScenarioDbExt;
 use engine::types::ability::TargetRef;
 use engine::types::actions::GameAction;
-use engine::types::game_state::WaitingFor;
+use engine::types::game_state::{CastPaymentMode, WaitingFor};
 use engine::types::identifiers::ObjectId;
 use engine::types::mana::{ManaType, ManaUnit};
 use engine::types::phase::Phase;
 use engine::types::zones::Zone;
 
-fn load_db() -> Option<&'static CardDatabase> {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../client/public/card-data.json");
-    if !path.exists() {
-        return None;
-    }
-    static DB: OnceLock<CardDatabase> = OnceLock::new();
-    Some(DB.get_or_init(|| CardDatabase::from_export(&path).expect("export should load")))
-}
+use crate::support::shared_card_db as load_db;
 
 /// CR 608.2c — Dark Confidant's upkeep trigger reveals the top card of P0's
 /// library and P0 loses life equal to *that revealed card's* mana value.
@@ -80,6 +69,9 @@ fn dark_confidant_upkeep_loses_life_equal_to_revealed_card_mana_value() {
     let confidant = scenario.add_real_card(P0, "Dark Confidant", Zone::Battlefield, db);
     // Cancel is {1}{U}{U} — mana value 3, distinct from Dark Confidant's 2.
     let revealed = scenario.add_real_card(P0, "Cancel", Zone::Library, db);
+    // Keep a card under Cancel so advancing through the draw step does not
+    // eliminate P0 after Dark Confidant moves the revealed card to hand.
+    scenario.add_real_card(P0, "Island", Zone::Library, db);
     let mut runner = scenario.build();
     engine::game::rehydrate_game_from_card_db(runner.state_mut(), db);
 
@@ -195,6 +187,8 @@ fn conclave_mentor_dies_trigger_gains_life_equal_to_its_power() {
             object_id: bolt,
             card_id: bolt_card_id,
             targets: vec![],
+
+            payment_mode: CastPaymentMode::Auto,
         })
         .expect("cast Lightning Bolt");
     if matches!(result.waiting_for, WaitingFor::TargetSelection { .. }) {

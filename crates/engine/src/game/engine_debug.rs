@@ -17,6 +17,7 @@ use super::effects::change_zone::shuffle_library;
 use super::engine::EngineError;
 use super::game_object::AttachTarget;
 use super::zones;
+use crate::game::token_presets::TokenPtProvenance;
 
 pub fn apply_debug_action(
     state: &mut GameState,
@@ -32,31 +33,25 @@ pub fn apply_debug_action(
             simulate,
         } => {
             validate_object(state, object_id)?;
+            // Debug forces a zone change — route through the zone pipeline under
+            // the `DebugCommand` exempt cause, which is FULLY inert: it skips
+            // both the replacement consult and the delivery tail (no
+            // enters-with-counter statics, no pending-ETB-counter consumption,
+            // no devour snapshot), while the unconditional primitive guards
+            // still run. DebugCommand is non-pausing by construction (always
+            // `Done`), so the result is safely discarded. The library-position
+            // arm folds the raw `move_to_library_position` / `_at_index`
+            // siblings in via the placement request.
+            let mut req = crate::game::zone_pipeline::ZoneMoveRequest::debug(object_id, to_zone);
             if to_zone == Zone::Library {
-                match library_position.unwrap_or(LibraryPosition::Bottom) {
-                    LibraryPosition::Top => {
-                        zones::move_to_library_position(state, object_id, true, events);
-                    }
-                    LibraryPosition::Bottom => {
-                        zones::move_to_library_position(state, object_id, false, events);
-                    }
-                    LibraryPosition::NthFromTop { n } => {
-                        zones::move_to_library_at_index(
-                            state,
-                            object_id,
-                            Some(n.saturating_sub(1) as usize),
-                            events,
-                        );
-                    }
-                }
-            } else {
-                zones::move_to_zone(state, object_id, to_zone, events);
+                req = req.at_library_position(library_position.unwrap_or(LibraryPosition::Bottom));
             }
+            crate::game::zone_pipeline::move_object(state, req, events);
             if simulate {
                 super::sba::check_state_based_actions(state, events);
                 super::triggers::process_triggers(state, events);
             }
-            state.layers_dirty = true;
+            crate::game::layers::mark_layers_full(state);
         }
 
         DebugAction::CreateCard { .. } => {
@@ -88,21 +83,59 @@ pub fn apply_debug_action(
 
             zones::remove_from_zone(state, object_id, zone, owner);
             state.objects.remove(&object_id);
-            state.layers_dirty = true;
+            crate::game::layers::mark_layers_full(state);
+        }
+
+        DebugAction::Sacrifice { object_id } => {
+            validate_object(state, object_id)?;
+            // CR 701.21: A player sacrifices a permanent they control. Route
+            // through the single sacrifice authority so the replacement pipeline
+            // (e.g. Rest in Peace → exile) and dies/leaves-the-battlefield
+            // triggers fire — unlike `RemoveObject`, which deletes the object
+            // outright with no triggers.
+            let controller = state.objects[&object_id].controller;
+            match super::sacrifice::sacrifice_permanent(state, object_id, controller, events)
+                .map_err(|err| EngineError::InvalidAction(format!("{err:?}")))?
+            {
+                super::sacrifice::SacrificeOutcome::Complete => {
+                    super::triggers::process_triggers(state, events); // CR 603: dies/LTB triggers
+                    let delayed = super::triggers::check_delayed_triggers(state, events);
+                    events.extend(delayed);
+                    super::sba::check_state_based_actions(state, events); // CR 704
+                }
+                super::sacrifice::SacrificeOutcome::NeedsReplacementChoice(player) => {
+                    state.waiting_for =
+                        super::replacement::replacement_choice_waiting_for(player, state);
+                }
+            }
         }
 
         DebugAction::DrawCards { player_id, count } => {
             validate_player(state, player_id)?;
-            // CR 614.6 + CR 614.11 + CR 704.3: route through the single-authority
-            // helper so post-replacement continuations (Jace WinTheGame,
-            // Abundance reveal-until) drain in the same step as the draw.
-            let _ = super::effects::draw::draw_through_replacement(
-                state,
-                player_id,
-                count,
-                events,
-                super::effects::draw::apply_draw_after_replacement,
-            );
+            // CR 121.6b + CR 614.6 + CR 614.11 + CR 704.3: route through
+            // `resume_multi_draw` (not the raw `draw_through_replacement`) so a
+            // `count > 1` debug draw offers replacement independently per unit,
+            // matching the real draw pipeline, and post-replacement
+            // continuations (Jace WinTheGame, Abundance reveal-until) still
+            // drain in the same step.
+            let event_start = events.len();
+            let result =
+                super::effects::draw::resume_multi_draw(state, player_id, count, 0, events);
+            // CR 603.2: Mirror the normal draw pipeline — `PassPriority` /
+            // `run_post_action_pipeline` scans CardDrawn events after the draw
+            // step's turn-based action. Debug draw previously returned without
+            // that scan, so draw triggers (Sheoldred, Rhystic Study, etc.) never
+            // fired unless a replacement-choice round-trip happened to run the
+            // pipeline. Defer trigger/SBA processing while a replacement choice
+            // is open; the choice handler owns the post-draw scan.
+            if !matches!(
+                result,
+                super::replacement::ReplacementResult::NeedsChoice(_)
+            ) {
+                let draw_events: Vec<_> = events[event_start..].to_vec();
+                super::triggers::process_triggers(state, &draw_events);
+                super::sba::check_state_based_actions(state, events);
+            }
         }
 
         DebugAction::Mill { player_id, count } => {
@@ -114,9 +147,33 @@ pub fn apply_debug_action(
                 .take(count as usize)
                 .copied()
                 .collect();
+            // Debug mill — route through the pipeline under `DebugCommand`
+            // (fully inert: no consult, no delivery tail; non-pausing by
+            // construction, so the result is safely discarded).
             for id in top_ids {
-                zones::move_to_zone(state, id, Zone::Graveyard, events);
+                let req = crate::game::zone_pipeline::ZoneMoveRequest::debug(id, Zone::Graveyard);
+                crate::game::zone_pipeline::move_object(state, req, events);
             }
+        }
+
+        DebugAction::Reveal { player_id, count } => {
+            validate_player(state, player_id)?;
+            // CR 701.20a/b: Reveal the top `count` cards of the player's library
+            // via the real `Effect::RevealTop` resolver — marks them revealed and
+            // emits `CardsRevealed` without moving the cards. `TargetFilter::Any`
+            // + an explicit `TargetRef::Player` makes the resolver reveal exactly
+            // the requested library (see `reveal_top::resolve`).
+            let ability = ResolvedAbility::new(
+                Effect::RevealTop {
+                    player: TargetFilter::Any,
+                    count,
+                },
+                vec![TargetRef::Player(player_id)],
+                ObjectId(0),
+                player_id,
+            );
+            super::effects::reveal_top::resolve(state, &ability, events)
+                .map_err(|err| EngineError::InvalidAction(format!("{err:?}")))?;
         }
 
         DebugAction::ShuffleLibrary { player_id } => {
@@ -143,7 +200,7 @@ pub fn apply_debug_action(
             if let Some(t) = toughness {
                 obj.base_toughness = Some(t);
             }
-            state.layers_dirty = true;
+            crate::game::layers::mark_layers_full(state);
         }
 
         DebugAction::ModifyCounters {
@@ -182,11 +239,26 @@ pub fn apply_debug_action(
                 let lore = obj.counters.get(&CounterType::Lore).copied().unwrap_or(0);
                 obj.class_level = Some((lore as u8).max(1));
             }
-            state.layers_dirty = true;
+            crate::game::layers::mark_layers_full(state);
         }
 
         DebugAction::SetTapped { object_id, tapped } => {
             validate_object_mut(state, object_id)?.tapped = tapped;
+        }
+
+        DebugAction::SetPrepared {
+            object_id,
+            prepared,
+        } => {
+            // CR 722.3a/b: Route through the single authority so the
+            // prepare-face gate and Became(Un)Prepared events are honored
+            // instead of writing `obj.prepared` directly.
+            validate_object_mut(state, object_id)?;
+            if prepared {
+                super::effects::prepare::prepare_object(state, object_id, events);
+            } else {
+                super::effects::prepare::unprepare_object(state, object_id, events);
+            }
         }
 
         DebugAction::SetController {
@@ -203,7 +275,7 @@ pub fn apply_debug_action(
             // `apply_battlefield_entry_controller_override` writes both fields.
             obj.base_controller = Some(controller);
             obj.controller = controller;
-            state.layers_dirty = true;
+            crate::game::layers::mark_layers_full(state);
         }
 
         DebugAction::SetSummoningSickness { object_id, sick } => {
@@ -216,17 +288,31 @@ pub fn apply_debug_action(
             transformed,
             flipped,
         } => {
-            let obj = validate_object_mut(state, object_id)?;
+            validate_object(state, object_id)?;
             if let Some(fd) = face_down {
-                obj.face_down = fd;
-            }
-            if let Some(t) = transformed {
-                obj.transformed = t;
+                validate_object_mut(state, object_id)?.face_down = fd;
             }
             if let Some(f) = flipped {
-                obj.flipped = f;
+                validate_object_mut(state, object_id)?.flipped = f;
             }
-            state.layers_dirty = true;
+            if let Some(want_transformed) = transformed {
+                let (zone, has_back_face, currently_transformed) = {
+                    let obj = state.objects.get(&object_id).unwrap();
+                    (obj.zone, obj.back_face.is_some(), obj.transformed)
+                };
+                if want_transformed != currently_transformed {
+                    // CR 701.27a: toggling `transformed` on a DFC must swap
+                    // printed faces, not just flip the flag — a flag-only write
+                    // leaves zone-exit revert applying the wrong characteristics
+                    // (issue #3290 / debug transform tool, issue #3284).
+                    if zone == Zone::Battlefield && has_back_face {
+                        crate::game::transform::transform_permanent(state, object_id, events)?;
+                    } else {
+                        validate_object_mut(state, object_id)?.transformed = want_transformed;
+                    }
+                }
+            }
+            crate::game::layers::mark_layers_full(state);
         }
 
         DebugAction::Attach { object_id, target } => {
@@ -241,7 +327,7 @@ pub fn apply_debug_action(
                     attach_to_player(state, object_id, target_player);
                 }
             }
-            state.layers_dirty = true;
+            crate::game::layers::mark_layers_full(state);
         }
 
         DebugAction::Detach { object_id } => {
@@ -255,7 +341,7 @@ pub fn apply_debug_action(
             if let Some(obj) = state.objects.get_mut(&object_id) {
                 obj.attached_to = None;
             }
-            state.layers_dirty = true;
+            crate::game::layers::mark_layers_full(state);
         }
 
         DebugAction::GrantKeyword { object_id, keyword } => {
@@ -268,7 +354,7 @@ pub fn apply_debug_action(
             if !obj.base_keywords.contains(&keyword) {
                 obj.base_keywords.push(keyword);
             }
-            state.layers_dirty = true;
+            crate::game::layers::mark_layers_full(state);
         }
 
         DebugAction::RemoveKeyword { object_id, keyword } => {
@@ -276,7 +362,7 @@ pub fn apply_debug_action(
             // CR 613.1 + CR 613.1f: write the base keyword set (the Layer-6 input)
             // so the removal survives the layer recompute; see GrantKeyword above.
             obj.base_keywords.retain(|k| k != &keyword);
-            state.layers_dirty = true;
+            crate::game::layers::mark_layers_full(state);
         }
 
         DebugAction::SetLife { player_id, life } => {
@@ -302,15 +388,28 @@ pub fn apply_debug_action(
 
         DebugAction::AddMana { player_id, mana } => {
             validate_player(state, player_id)?;
-            if let Some(player) = state.players.iter_mut().find(|p| p.id == player_id) {
-                for mana_type in mana {
-                    player.mana_pool.add(crate::types::mana::ManaUnit::new(
-                        mana_type,
-                        ObjectId(0),
-                        false,
-                        vec![],
-                    ));
-                }
+            for mana_type in mana {
+                // CR 118.3a: route through the stamping authority so each
+                // debug-added unit gets a distinct `pip_id`, exactly like
+                // produced mana. A bare `mana_pool.add` leaves the unstamped
+                // sentinel (`ManaPipId(0)`) on every unit, which makes all of
+                // them pin/unpin together in the manual-payment UI.
+                state.add_mana_to_pool(
+                    player_id,
+                    crate::types::mana::ManaUnit::new(mana_type, ObjectId(0), false, vec![]),
+                );
+            }
+        }
+
+        DebugAction::SetInfiniteMana { player_id, enabled } => {
+            validate_player(state, player_id)?;
+            if enabled {
+                // Delegate to the single write authority; record the six Mana axes.
+                state.mark_unbounded_loop(player_id, &super::mana_payment::INFINITE_MANA_AXES);
+                // Seed immediately so the pool reads full before the next probe.
+                super::mana_payment::refill_infinite_mana(state);
+            } else {
+                state.clear_unbounded_loop(player_id);
             }
         }
 
@@ -334,11 +433,13 @@ pub fn apply_debug_action(
             super::triggers::process_triggers(state, events);
         }
 
-        DebugAction::CreateToken { request } => {
+        DebugAction::CreateToken { request, run_etb } => {
             let (owner, characteristics, enter_with_counters, preset_image_ref) = match request {
                 DebugTokenRequest::Preset {
                     preset_id,
                     owner,
+                    power_override,
+                    toughness_override,
                     enter_with_counters,
                 } => {
                     let preset = crate::game::token_presets::known_token_preset_by_id(&preset_id)
@@ -347,9 +448,31 @@ pub fn apply_debug_action(
                             "Debug: unknown token preset id {preset_id}"
                         ))
                     })?;
+                    let mut characteristics = preset.body.clone();
+                    match (&preset.pt_provenance, power_override, toughness_override) {
+                        (
+                            TokenPtProvenance::SourceDefinedOrDynamic { .. },
+                            Some(power),
+                            Some(toughness),
+                        ) => {
+                            characteristics.power = Some(power);
+                            characteristics.toughness = Some(toughness);
+                        }
+                        (TokenPtProvenance::SourceDefinedOrDynamic { .. }, _, _) => {
+                            return Err(EngineError::InvalidAction(format!(
+                                "Debug: token preset {preset_id} requires both power_override and toughness_override"
+                            )));
+                        }
+                        (TokenPtProvenance::FixedOrAbsent, None, None) => {}
+                        (TokenPtProvenance::FixedOrAbsent, _, _) => {
+                            return Err(EngineError::InvalidAction(format!(
+                                "Debug: token preset {preset_id} has fixed or absent P/T and does not accept overrides"
+                            )));
+                        }
+                    }
                     (
                         owner,
-                        preset.body.clone(),
+                        characteristics,
                         enter_with_counters,
                         preset.token_image_ref.clone(),
                     )
@@ -383,25 +506,40 @@ pub fn apply_debug_action(
             let proposed = ProposedEvent::CreateToken {
                 owner,
                 spec: Box::new(spec),
+                copy: None,
                 enter_tapped: crate::types::proposed_event::EtbTapState::Unspecified,
                 count: 1,
                 applied: HashSet::new(),
             };
-            let first_created_id = state.next_object_id;
             match super::replacement::replace_event(state, proposed, events) {
                 super::replacement::ReplacementResult::Execute(event) => {
                     super::effects::token::apply_create_token_after_replacement(
                         state, event, events,
                     );
+                    // CR 111.4 + CR 707.2a: Preset spawns must install catalog
+                    // `rules_text` abilities (SOS Pest attack-life trigger, etc.)
+                    // after linking the preset image ref. The apply path runs
+                    // `inject_catalog_token_abilities` during creation when
+                    // `token_image_ref` is already set; debug preset creation
+                    // deferred the ref until here, so inject + reindex now.
                     if let Some(image_ref) = preset_image_ref {
-                        for (id, obj) in state.objects.iter_mut() {
-                            if id.0 >= first_created_id {
+                        let created_ids = state.last_created_token_ids.clone();
+                        for token_id in created_ids {
+                            if let Some(obj) = state.objects.get_mut(&token_id) {
                                 obj.token_image_ref = Some(image_ref.clone());
                             }
+                            super::effects::token::inject_catalog_token_abilities(state, token_id);
+                            super::trigger_index::reindex_object_triggers(state, token_id);
                         }
                     }
-                    super::triggers::process_triggers(state, events); // CR 603: Process triggers
-                    super::sba::check_state_based_actions(state, events); // CR 704: Check SBAs
+                    // "Run ETB effects" unchecked: the token is still created
+                    // (with its replacement-window counters) but its ETB triggers
+                    // and the SBA pass are skipped — mirrors the raw placement of
+                    // `MoveToZone { simulate: false }`.
+                    if run_etb {
+                        super::triggers::process_triggers(state, events); // CR 603: Process triggers
+                        super::sba::check_state_based_actions(state, events); // CR 704: Check SBAs
+                    }
                 }
                 super::replacement::ReplacementResult::Prevented => {}
                 super::replacement::ReplacementResult::NeedsChoice(player) => {
@@ -518,10 +656,35 @@ fn apply_energy_delta(
 pub fn route_debug_create_to_battlefield(
     state: &mut GameState,
     object_id: ObjectId,
+    run_etb: bool,
 ) -> ActionResult {
     use super::replacement::{self, ReplacementResult};
 
     let mut events: Vec<GameEvent> = vec![];
+
+    // "Run ETB effects" unchecked: place the staged object on the battlefield
+    // raw — no replacement window, no ETB triggers, no SBA pass. This mirrors
+    // `MoveToZone { simulate: false }`, letting a board position be staged
+    // without the entering permanent's "when ~ enters" abilities going on the
+    // stack.
+    if !run_etb {
+        // Debug staging — route through the pipeline under `DebugCommand`,
+        // which is FULLY inert: no replacement consult AND no delivery tail
+        // (no intrinsic or statics-derived enters-with counters, no
+        // pending-ETB-counter consumption, no devour snapshot), matching the
+        // prior raw placement exactly. ETB triggers / SBA are NOT run here;
+        // that is `run_etb`'s job below. DebugCommand is non-pausing by
+        // construction (always `Done`), so the result is safely discarded.
+        let req = crate::game::zone_pipeline::ZoneMoveRequest::debug(object_id, Zone::Battlefield);
+        crate::game::zone_pipeline::move_object(state, req, &mut events);
+        crate::game::layers::mark_layers_full(state);
+        return ActionResult {
+            events,
+            waiting_for: state.waiting_for.clone(),
+            log_entries: vec![],
+        };
+    }
+
     let from = state
         .objects
         .get(&object_id)
@@ -533,24 +696,37 @@ pub fn route_debug_create_to_battlefield(
         from,
         to: Zone::Battlefield,
         cause: None,
+        attach_to: None,
         enter_tapped: Default::default(),
         enter_with_counters: vec![],
         controller_override: None,
         enter_transformed: false,
+        face_down_profile: None,
         applied: HashSet::new(),
     };
 
     let mut waiting_for = state.waiting_for.clone();
     match replacement::replace_event(state, proposed, &mut events) {
         ReplacementResult::Execute(event) => {
-            super::effects::change_zone::deliver_replaced_zone_change(
+            // CR 614.12a: a Devour as-enters sacrifice may surface its own
+            // `EffectZoneChoice`; park on it so the debug-place flow keeps the
+            // pending sacrifice prompt instead of overwriting it.
+            match super::effects::change_zone::deliver_replaced_zone_change(
                 state,
                 event,
                 None,
                 None,
                 false,
+                crate::types::game_state::PostReplacementDrainOwner::DeliveryTail,
+                None,
                 &mut events,
-            );
+            ) {
+                super::effects::change_zone::ZoneDeliveryResult::Done => {}
+                super::effects::change_zone::ZoneDeliveryResult::NeedsChoice(player) => {
+                    replacement::park_waiting_for(state, player);
+                    waiting_for = state.waiting_for.clone();
+                }
+            }
             super::triggers::process_triggers(state, &events); // CR 603: Process triggers
             super::sba::check_state_based_actions(state, &mut events); // CR 704: Check SBAs
         }
@@ -599,12 +775,16 @@ fn validate_player(state: &GameState, player_id: PlayerId) -> Result<(), EngineE
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::game::game_object::BackFaceData;
     use crate::game::zones::create_object;
+    use crate::types::ability::{AbilityDefinition, AbilityKind};
     use crate::types::actions::GameAction;
+    use crate::types::card::LayoutKind;
+    use crate::types::definitions::Definitions;
     use crate::types::format::FormatConfig;
     use crate::types::identifiers::CardId;
     use crate::types::keywords::Keyword;
-    use crate::types::mana::ManaColor;
+    use crate::types::mana::{ManaColor, ManaCost};
     use crate::types::proposed_event::TokenCharacteristics;
     use crate::types::CoreType;
 
@@ -612,6 +792,50 @@ mod tests {
         let mut state = GameState::new(FormatConfig::standard().with_sandbox(), 2, 42);
         state.debug_mode = true;
         state
+    }
+
+    /// CR 118.3a regression: debug-added mana must route through the stamping
+    /// authority so each unit gets a DISTINCT, nonzero `pip_id`. A bare
+    /// `mana_pool.add` leaves every unit at the unstamped sentinel (0), which
+    /// makes all same-color pips in the manual-payment UI pin/unpin together.
+    #[test]
+    fn debug_add_mana_stamps_distinct_pip_ids() {
+        let mut state = sandbox_state();
+        let mut events = Vec::new();
+        apply_debug_action(
+            &mut state,
+            PlayerId(0),
+            DebugAction::AddMana {
+                player_id: PlayerId(0),
+                mana: vec![
+                    crate::types::mana::ManaType::Green,
+                    crate::types::mana::ManaType::Green,
+                    crate::types::mana::ManaType::Green,
+                ],
+            },
+            &mut events,
+        )
+        .unwrap();
+
+        let ids: Vec<u64> = state.players[0]
+            .mana_pool
+            .mana
+            .iter()
+            .map(|u| u.pip_id.0)
+            .collect();
+        assert_eq!(ids.len(), 3, "three AddMana entries → three pool units");
+        assert!(
+            ids.iter().all(|&id| id != 0),
+            "debug-added units must be stamped (nonzero pip_id), got {ids:?}"
+        );
+        assert_eq!(
+            ids.iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            3,
+            "debug-added pip ids must be distinct, got {ids:?}"
+        );
     }
 
     fn zero_zero_creature() -> TokenCharacteristics {
@@ -627,10 +851,165 @@ mod tests {
         }
     }
 
+    fn prepare_back_face() -> BackFaceData {
+        let mut card_types = crate::types::card_type::CardType::default();
+        card_types.core_types.push(CoreType::Sorcery);
+        BackFaceData {
+            name: "Test Prepare Face".to_string(),
+            power: None,
+            toughness: None,
+            loyalty: None,
+            defense: None,
+            card_types,
+            mana_cost: ManaCost::default(),
+            keywords: Vec::new(),
+            abilities: vec![AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::Draw {
+                    count: QuantityExpr::Fixed { value: 1 },
+                    target: TargetFilter::Controller,
+                },
+            )],
+            trigger_definitions: Definitions::default(),
+            replacement_definitions: Definitions::default(),
+            static_definitions: Definitions::default(),
+            color: Vec::new(),
+            printed_ref: None,
+            modal: None,
+            additional_cost: None,
+            strive_cost: None,
+            casting_restrictions: Vec::new(),
+            casting_options: Vec::new(),
+            layout_kind: Some(LayoutKind::Prepare),
+        }
+    }
+
     /// CR 122.6a + CR 614.1: A debug-created 0/0 creature token with
     /// `+1/+1` counters in `enter_with_counters` enters as a 2/2 because
     /// the counters apply during the same ETB replacement window that
     /// engine-driven token creation uses. CR 704.5f does not kill it.
+    /// CR 111.4 + CR 603.6a: Debug preset spawns must install catalog
+    /// `rules_text` triggers and register them in the trigger index — same as
+    /// engine-driven token creation (issue #853).
+    #[test]
+    fn debug_create_preset_token_installs_catalog_triggers() {
+        let mut state = sandbox_state();
+        let sos_pest_preset_id = "00a0801d-0212-5890-8957-3cde30f382f9";
+        let action = GameAction::Debug(DebugAction::CreateToken {
+            request: DebugTokenRequest::Preset {
+                preset_id: sos_pest_preset_id.to_string(),
+                owner: PlayerId(0),
+                power_override: None,
+                toughness_override: None,
+                enter_with_counters: Vec::new(),
+            },
+            run_etb: true,
+        });
+        let result = crate::game::engine::apply(&mut state, PlayerId(0), action)
+            .expect("debug CreateToken preset should succeed");
+
+        let token_id = result
+            .events
+            .iter()
+            .find_map(|event| match event {
+                GameEvent::TokenCreated { object_id, .. } => Some(*object_id),
+                _ => None,
+            })
+            .expect("TokenCreated event should fire");
+
+        let obj = state
+            .objects
+            .get(&token_id)
+            .expect("pest token should exist on battlefield");
+        assert_eq!(
+            obj.trigger_definitions.len(),
+            1,
+            "SOS Pest preset must install its attack-life trigger"
+        );
+        assert_eq!(
+            obj.trigger_definitions[0].mode,
+            crate::types::triggers::TriggerMode::Attacks
+        );
+        assert!(
+            state
+                .trigger_index
+                .by_key
+                .values()
+                .any(|bucket| bucket.contains(&token_id)),
+            "catalog trigger must be registered in the trigger index"
+        );
+    }
+
+    #[test]
+    fn debug_create_source_defined_preset_requires_both_pt_overrides() {
+        let mut state = sandbox_state();
+        let action = GameAction::Debug(DebugAction::CreateToken {
+            request: DebugTokenRequest::Preset {
+                preset_id: "1545ee29-d9c1-57ff-acae-431cfd6d60cf".to_string(),
+                owner: PlayerId(0),
+                power_override: Some(4),
+                toughness_override: None,
+                enter_with_counters: Vec::new(),
+            },
+            run_etb: true,
+        });
+
+        let err = crate::game::engine::apply(&mut state, PlayerId(0), action)
+            .expect_err("source-defined preset must reject incomplete P/T overrides");
+
+        assert!(format!("{err:?}").contains("requires both power_override and toughness_override"));
+    }
+
+    #[test]
+    fn debug_create_source_defined_preset_accepts_pt_overrides() {
+        let mut state = sandbox_state();
+        let action = GameAction::Debug(DebugAction::CreateToken {
+            request: DebugTokenRequest::Preset {
+                preset_id: "1545ee29-d9c1-57ff-acae-431cfd6d60cf".to_string(),
+                owner: PlayerId(0),
+                power_override: Some(4),
+                toughness_override: Some(5),
+                enter_with_counters: Vec::new(),
+            },
+            run_etb: true,
+        });
+        let result = crate::game::engine::apply(&mut state, PlayerId(0), action)
+            .expect("complete source-defined P/T overrides should create token");
+
+        let token_id = result
+            .events
+            .iter()
+            .find_map(|event| match event {
+                GameEvent::TokenCreated { object_id, .. } => Some(*object_id),
+                _ => None,
+            })
+            .expect("TokenCreated event should fire");
+        let token = state.objects.get(&token_id).expect("token remains live");
+
+        assert_eq!(token.power, Some(4));
+        assert_eq!(token.toughness, Some(5));
+    }
+
+    #[test]
+    fn debug_create_fixed_preset_rejects_pt_overrides() {
+        let mut state = sandbox_state();
+        let action = GameAction::Debug(DebugAction::CreateToken {
+            request: DebugTokenRequest::Preset {
+                preset_id: "25b62fd5-b036-5c64-88fd-8f50d0675e4d".to_string(),
+                owner: PlayerId(0),
+                power_override: Some(4),
+                toughness_override: Some(5),
+                enter_with_counters: Vec::new(),
+            },
+            run_etb: true,
+        });
+
+        let err = crate::game::engine::apply(&mut state, PlayerId(0), action)
+            .expect_err("fixed preset must reject P/T overrides");
+
+        assert!(format!("{err:?}").contains("does not accept overrides"));
+    }
+
     #[test]
     fn debug_create_token_enters_with_counters_survives_sba() {
         let mut state = sandbox_state();
@@ -640,6 +1019,7 @@ mod tests {
                 characteristics: zero_zero_creature(),
                 enter_with_counters: vec![(CounterType::Plus1Plus1, 2)],
             },
+            run_etb: true,
         });
         let result = crate::game::engine::apply(&mut state, PlayerId(0), action)
             .expect("debug CreateToken should succeed");
@@ -749,6 +1129,63 @@ mod tests {
         assert_eq!(token.name, "Copy Source");
         assert_eq!(token.power, Some(2));
         assert_eq!(token.toughness, Some(3));
+    }
+
+    #[test]
+    fn debug_set_prepared_routes_through_prepare_gate() {
+        let mut state = sandbox_state();
+        let object_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Test Permanent".to_string(),
+            Zone::Battlefield,
+        );
+
+        let no_face_result = crate::game::engine::apply(
+            &mut state,
+            PlayerId(0),
+            GameAction::Debug(DebugAction::SetPrepared {
+                object_id,
+                prepared: true,
+            }),
+        )
+        .expect("debug SetPrepared should be accepted");
+        assert!(state.objects[&object_id].prepared.is_none());
+        assert!(!no_face_result
+            .events
+            .iter()
+            .any(|event| matches!(event, GameEvent::BecamePrepared { .. })));
+
+        state.objects.get_mut(&object_id).unwrap().back_face = Some(prepare_back_face());
+
+        let prepared_result = crate::game::engine::apply(
+            &mut state,
+            PlayerId(0),
+            GameAction::Debug(DebugAction::SetPrepared {
+                object_id,
+                prepared: true,
+            }),
+        )
+        .expect("debug SetPrepared should prepare eligible object");
+        assert!(state.objects[&object_id].prepared.is_some());
+        assert!(prepared_result.events.iter().any(
+            |event| matches!(event, GameEvent::BecamePrepared { object_id: id } if *id == object_id)
+        ));
+
+        let unprepared_result = crate::game::engine::apply(
+            &mut state,
+            PlayerId(0),
+            GameAction::Debug(DebugAction::SetPrepared {
+                object_id,
+                prepared: false,
+            }),
+        )
+        .expect("debug SetPrepared should unprepare object");
+        assert!(state.objects[&object_id].prepared.is_none());
+        assert!(unprepared_result.events.iter().any(
+            |event| matches!(event, GameEvent::BecameUnprepared { object_id: id } if *id == object_id)
+        ));
     }
 
     /// Issue #464 — CR 110.2 + CR 613.1b: `DebugAction::SetController` must
@@ -952,6 +1389,57 @@ mod tests {
         assert_eq!(state.players[0].library.back(), Some(&to_bottom));
     }
 
+    /// Phase D review fix: a `DebugCommand` zone change is FULLY inert — it
+    /// skips the delivery tail, not just the replacement consult. Pending ETB
+    /// counters from delayed triggers ("that creature enters with an
+    /// additional +1/+1 counter") must NOT be applied to or consumed by a
+    /// debug-staged battlefield entry. Pre-fix, the exempt path delivered
+    /// through the full tail: the staged object entered with the pending
+    /// counters and the `pending_etb_counters` entry was consumed (the same
+    /// tail arm would also mint Kalain-class `EntersWithAdditionalCounters`
+    /// statics onto staged creatures).
+    #[test]
+    fn debug_move_to_battlefield_skips_delivery_tail_counters() {
+        use crate::game::zones::create_object;
+        use crate::types::identifiers::CardId;
+
+        let mut state = sandbox_state();
+        let staged = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Staged Creature".to_string(),
+            Zone::Hand,
+        );
+        state
+            .pending_etb_counters
+            .push((staged, CounterType::Plus1Plus1, 2));
+
+        crate::game::engine::apply(
+            &mut state,
+            PlayerId(0),
+            GameAction::Debug(DebugAction::MoveToZone {
+                object_id: staged,
+                to_zone: Zone::Battlefield,
+                library_position: None,
+                simulate: false,
+            }),
+        )
+        .expect("debug MoveToZone battlefield should succeed");
+
+        let obj = &state.objects[&staged];
+        assert_eq!(obj.zone, Zone::Battlefield);
+        assert!(
+            obj.counters.is_empty(),
+            "a debug-staged entry must not receive delivery-tail counters"
+        );
+        assert_eq!(
+            state.pending_etb_counters.len(),
+            1,
+            "a debug-staged entry must not consume pending ETB counters"
+        );
+    }
+
     #[test]
     fn debug_modify_player_counters_routes_poison_to_dedicated_field() {
         let mut state = sandbox_state();
@@ -1112,6 +1600,7 @@ mod tests {
                 characteristics: zero_zero_creature(),
                 enter_with_counters: Vec::new(),
             },
+            run_etb: true,
         });
         let result = crate::game::engine::apply(&mut state, PlayerId(0), action)
             .expect("debug CreateToken should succeed");
@@ -1130,6 +1619,56 @@ mod tests {
         assert!(
             !state.objects.contains_key(&token_id),
             "0/0 token with no counters should be removed by SBA + CR 704.5d",
+        );
+    }
+
+    /// CR 603.2 + CR 121.1: Debug draw must scan CardDrawn events for triggers,
+    /// matching the post-priority pipeline that natural draw-step draws use.
+    #[test]
+    fn debug_draw_cards_processes_draw_triggers() {
+        use crate::game::scenario::{GameScenario, P0};
+        use crate::types::phase::Phase;
+        use crate::types::triggers::TriggerMode;
+
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        scenario.with_library_top(P0, &["Lib A", "Lib B"]);
+        scenario.add_creature_from_oracle(
+            P0,
+            "Watcher",
+            2,
+            2,
+            "Whenever you draw a card, you gain 2 life.",
+        );
+        let mut runner = scenario.build();
+        runner.state_mut().debug_mode = true;
+
+        let life_before = runner.state().players[0].life;
+        runner
+            .act(GameAction::Debug(DebugAction::DrawCards {
+                player_id: P0,
+                count: 1,
+            }))
+            .expect("debug draw");
+        runner.advance_until_stack_empty();
+
+        assert_eq!(
+            runner.state().players[0].life,
+            life_before + 2,
+            "draw trigger must fire after DebugAction::DrawCards"
+        );
+        let watcher = runner
+            .state()
+            .battlefield
+            .iter()
+            .find_map(|id| runner.state().objects.get(id))
+            .expect("watcher on battlefield");
+        assert!(
+            watcher
+                .trigger_definitions
+                .iter_all()
+                .any(|t| t.mode == TriggerMode::Drawn),
+            "sanity: watcher carries a Drawn trigger"
         );
     }
 }

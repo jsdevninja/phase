@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { WebSocketAdapter } from "../ws-adapter";
+import { PROTOCOL_VERSION, WebSocketAdapter } from "../ws-adapter";
 import type { GameState } from "../types";
 
 // Minimal mock WebSocket. Latest-constructed instance is exposed via
@@ -43,7 +43,7 @@ const SERVER_HELLO = JSON.stringify({
   data: {
     server_version: "0.0.0-test",
     build_commit: "testhash",
-    protocol_version: 7,
+    protocol_version: PROTOCOL_VERSION,
     mode: "Full",
   },
 });
@@ -129,13 +129,20 @@ describe("WebSocketAdapter", () => {
 
       const mockState = createMockState();
       const mockEvents = [{ type: "DrawCard", data: { player: 0, object_id: 1 } }];
+      const mockLogEntries = [{
+        seq: 0,
+        turn: 1,
+        phase: "PreCombatMain",
+        category: "Debug",
+        segments: [{ type: "Text", value: "AI guesses Land" }],
+      }];
 
       // Simulate an unsolicited StateUpdate (no pending action)
       ws.dispatchSynthetic(
         "message",
         JSON.stringify({
           type: "StateUpdate",
-          data: { state: mockState, events: mockEvents },
+          data: { state: mockState, events: mockEvents, log_entries: mockLogEntries },
         }),
       );
 
@@ -144,6 +151,7 @@ describe("WebSocketAdapter", () => {
           type: "stateChanged",
           state: mockState,
           events: mockEvents,
+          logEntries: mockLogEntries,
         }),
       );
     });
@@ -232,6 +240,72 @@ describe("WebSocketAdapter", () => {
       } finally {
         vi.useRealTimers();
       }
+    });
+  });
+
+  describe("send() error handling", () => {
+    it("rejects initialize when the post-handshake setup frame cannot be sent", async () => {
+      MockWebSocket.last = null;
+      const setupFailingAdapter = new WebSocketAdapter(
+        "ws://localhost:9374/ws",
+        "host",
+        { main_deck: [], sideboard: [] },
+      );
+      const initPromise = setupFailingAdapter.initialize();
+      await Promise.resolve();
+      const setupWs = MockWebSocket.last!;
+      setupWs.send
+        .mockImplementationOnce(() => undefined)
+        .mockImplementationOnce(() => {
+          throw new Error("InvalidStateError");
+        });
+
+      setupWs.dispatchSynthetic("message", SERVER_HELLO);
+
+      await expect(initPromise).rejects.toThrow("Failed to send setup frame");
+    });
+
+    it("sends the action frame and keeps the promise pending on a healthy socket", () => {
+      ws.send.mockClear();
+      void adapter.submitAction({ type: "PassPriority" }, 0);
+      expect(ws.send).toHaveBeenCalledWith(
+        JSON.stringify({
+          type: "Action",
+          data: { action: { type: "PassPriority" } },
+        }),
+      );
+    });
+
+    it("rejects submitAction and clears pending state when the socket throws on send", async () => {
+      const listener = vi.fn();
+      adapter.onEvent(listener);
+      ws.send.mockImplementationOnce(() => {
+        throw new Error("InvalidStateError");
+      });
+
+      await expect(
+        adapter.submitAction({ type: "PassPriority" }, 0),
+      ).rejects.toThrow();
+
+      // The action was un-pended and an error surfaced, rather than the caller
+      // hanging forever on a reply that will never come.
+      expect(listener).toHaveBeenCalledWith(
+        expect.objectContaining({ type: "actionPendingChanged", pending: false }),
+      );
+      expect(listener).toHaveBeenCalledWith(
+        expect.objectContaining({ type: "error" }),
+      );
+    });
+
+    it("emits an error instead of throwing when a fire-and-forget send hits a closed socket", () => {
+      const listener = vi.fn();
+      adapter.onEvent(listener);
+      ws.readyState = 3; // CLOSED
+
+      expect(() => adapter.sendEmote("wave")).not.toThrow();
+      expect(listener).toHaveBeenCalledWith(
+        expect.objectContaining({ type: "error" }),
+      );
     });
   });
 });

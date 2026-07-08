@@ -83,7 +83,11 @@ interface ParsedDeckUrl {
 function parseDeckUrl(raw: string): ParsedDeckUrl | null {
   // Direct API consumers (curl, third-party clients) often omit the protocol.
   // The WHATWG URL parser requires one; normalize so we accept both forms.
-  const trimmed = raw.trim();
+  const trimmed = raw
+    .trim()
+    .replace(/[)\].,!?:;]+$/u, "")
+    .replace(/^<(.+)>$/, "$1")
+    .replace(/[)\].,!?:;]+$/u, "");
   const withScheme = /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
   let url: URL;
   try {
@@ -215,6 +219,9 @@ function sectionsEmpty(sections: DeckSections): boolean {
 }
 
 function projectMoxfield(deck: MoxfieldDeck): { text: string; empty: boolean } {
+  // Only commander/main/sideboard/companion boards are imported. Moxfield's
+  // `maybeboard` (and Archidekt's Maybeboard category) are test-deck slots —
+  // see classifyArchidektCard for Archidekt exclusion.
   const sections: DeckSections = {
     commander: moxfieldBoardToCards(moxfieldBoard(deck, "commanders")),
     main: moxfieldBoardToCards(moxfieldBoard(deck, "mainboard")),

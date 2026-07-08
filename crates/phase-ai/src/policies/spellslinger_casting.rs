@@ -24,6 +24,8 @@ use crate::features::spellslinger_prowess::{
     is_low_curve_spell_parts, is_nth_spell_payoff_parts, COMMITMENT_FLOOR,
 };
 use crate::features::DeckFeatures;
+#[cfg(test)]
+use engine::types::game_state::CastPaymentMode;
 
 pub struct SpellslingerCastingPolicy;
 
@@ -264,6 +266,8 @@ mod tests {
                 object_id,
                 card_id: CardId(object_id.0),
                 targets: Vec::new(),
+
+                payment_mode: CastPaymentMode::Auto,
             },
             metadata: ActionMetadata {
                 actor: Some(AI),
@@ -362,6 +366,7 @@ mod tests {
             config: &config,
             context: &context,
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
         let verdict = SpellslingerCastingPolicy.verdict(&ctx);
         match verdict {
@@ -405,6 +410,7 @@ mod tests {
             config: &config,
             context: &context,
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
         let verdict = SpellslingerCastingPolicy.verdict(&ctx);
         match verdict {
@@ -450,6 +456,9 @@ mod tests {
             Effect::CopySpell {
                 target: TargetFilter::Any,
                 retarget: CopyRetargetPermission::KeepOriginalTargets,
+                copier: None,
+                additional_modifications: Vec::new(),
+                starting_loyalty_from_casualty_sacrifice: false,
             },
         );
         let (context, config) = make_context(0.8);
@@ -463,6 +472,7 @@ mod tests {
             config: &config,
             context: &context,
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
         let verdict = SpellslingerCastingPolicy.verdict(&ctx);
         match verdict {
@@ -504,6 +514,9 @@ mod tests {
             Effect::CopySpell {
                 target: TargetFilter::Any,
                 retarget: CopyRetargetPermission::KeepOriginalTargets,
+                copier: None,
+                additional_modifications: Vec::new(),
+                starting_loyalty_from_casualty_sacrifice: false,
             },
         ));
         let (context, config) = make_context(0.8);
@@ -517,6 +530,7 @@ mod tests {
             config: &config,
             context: &context,
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
         let verdict = SpellslingerCastingPolicy.verdict(&ctx);
         match verdict {
@@ -547,6 +561,7 @@ mod tests {
                 amount: QuantityExpr::Fixed { value: 3 },
                 target: TargetFilter::Any,
                 damage_source: None,
+                excess: None,
             },
         );
         let (context, config) = make_context(0.8);
@@ -560,6 +575,7 @@ mod tests {
             config: &config,
             context: &context,
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
         let verdict = SpellslingerCastingPolicy.verdict(&ctx);
         match verdict {
@@ -602,6 +618,7 @@ mod tests {
             config: &config,
             context: &context,
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
         let verdict = SpellslingerCastingPolicy.verdict(&ctx);
         match verdict {
@@ -637,6 +654,7 @@ mod tests {
             config: &config,
             context: &context,
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
         let verdict = SpellslingerCastingPolicy.verdict(&ctx);
         match verdict {

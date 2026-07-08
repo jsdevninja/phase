@@ -12,6 +12,13 @@
     "data": "Données"
   },
   "gameplay": {
+    "collapseLands": "Réduire Lands",
+    "collapseSupport": "Réduire Support",
+    "collapseZoneOptions": {
+      "auto": "Auto",
+      "on": "Toujours activé",
+      "off": "Toujours désactivé"
+    },
     "title": "Jouabilité",
     "language": "Langue",
     "cardSize": "Taille des cartes",
@@ -32,6 +39,11 @@
       "customUrl": "URL personnalisée",
       "none": "Aucun"
     },
+    "commandZoneOptions": {
+      "compact": "Compact",
+      "inline": "Intégré",
+      "auto": "Auto"
+    },
     "cardSizeOptions": {
       "small": "Petit",
       "medium": "Moyen",
@@ -49,15 +61,64 @@
     "showKeywords": "Afficher les mots-clés sur les cartes du champ de bataille",
     "opponentHoverPreview": "Aperçu au survol de l'adversaire",
     "showOpponentBoard": "Afficher le plateau de l'adversaire au survol du HUD",
+    "multiplayerBoardLayout": "Disposition du plateau multijoueur",
+    "multiplayerBoardLayoutOptions": {
+      "focused": "Adversaire ciblé",
+      "split": "Table divisée"
+    },
+    "cardPreviewDelay": "Délai de survol",
+    "cardPreviewDelayInstant": "Instantané",
+    "cardPreviewDelayValue": "{{ms}} ms",
+    "cardPreviewDelayHint": "Attendre ce délai après le survol d'une carte avant d'afficher l'aperçu.",
+    "cardPreview": "Aperçu de la carte au survol",
+    "cardPreviewOptions": {
+      "follow": "Suivre le curseur",
+      "side": "Ancrer sur le côté",
+      "shift": "Maintenir Maj"
+    },
+    "cardPreviewHint": {
+      "follow": "L'aperçu agrandi suit votre curseur lorsque vous survolez une carte.",
+      "side": "L'aperçu s'ancre au bord de l'écran afin de ne jamais masquer le plateau.",
+      "shift": "L'aperçu n'apparaît que tant que vous maintenez la touche Maj, comme dans Tabletop Simulator."
+    },
     "cardArtPreferences": "Préférences d'illustration des cartes",
     "clearArtOverrides_one": "Effacer tous les remplacements d'illustration ({{count}})",
     "clearArtOverrides_other": "Effacer tous les remplacements d'illustration ({{count}})",
     "clearArtOverridesConfirm_one": "Effacer les {{count}} remplacement d'illustration ?",
     "clearArtOverridesConfirm_other": "Effacer les {{count}} remplacements d'illustration ?",
+    "clearArtOverridesAction": "Effacer",
     "vfxQualityOptions": {
       "full": "Complète",
       "reduced": "Réduite",
       "minimal": "Minimale"
+    }
+  },
+  "flexLayout": {
+    "title": "Disposition flexible",
+    "description": "Déplacez les panneaux et HUD où vous voulez et redimensionnez les zones du plateau.",
+    "edit": "Personnaliser la disposition…",
+    "done": "Terminé",
+    "reset": "Réinitialiser la disposition",
+    "preset": "Préréglage",
+    "hint": "Faites glisser un panneau pour le déplacer. Faites glisser les barres lumineuses pour redimensionner les zones.",
+    "align": {
+      "left": "Aligner à gauche",
+      "center": "Centrer",
+      "right": "Aligner à droite"
+    },
+    "presets": {
+      "default": { "label": "Disposition 1", "description": "La disposition équilibrée standard." },
+      "layout2": { "label": "Disposition 2", "description": "Un champ de bataille plus grand avec les mains repliées." },
+      "layout3": { "label": "Disposition 3", "description": "Un tiers inférieur plus haut." }
+    },
+    "zones": {
+      "playerHud": "Votre HUD",
+      "opponentHud": "HUD de l'adversaire",
+      "stackPanel": "Pile",
+      "logPanel": "Journal",
+      "actionRail": "Actions",
+      "playerPiles": "Vos zones",
+      "opponentPiles": "Zones de l'adversaire"
     }
   },
   "audio": {
@@ -112,6 +173,10 @@
     "description": "L'export regroupe vos préférences, decks importés et abonnements à des flux dans un seul fichier JSON. L'import les restaure sur une autre machine. Les caches IndexedDB (cache de flux, cache audio, parties enregistrées) ne sont pas inclus — ils se reconstruisent automatiquement.",
     "exportBackup": "Exporter une sauvegarde…",
     "importBackup": "Importer une sauvegarde…",
+    "importModeTitle": "Importer une sauvegarde",
+    "importModeMessage": "Tout remplacer par la sauvegarde (destructif), ou fusionner — conserver les decks existants et ajouter ceux de la sauvegarde.",
+    "importOverwrite": "Tout remplacer",
+    "importMerge": "Fusionner",
     "importConfirm": "Écraser les préférences et decks existants ?\n\nOK : tout remplacer par la sauvegarde (destructif).\nAnnuler : fusionner — conserver les decks existants, ajouter les nouveaux de la sauvegarde.",
     "backupDownloaded": "Sauvegarde téléchargée.",
     "imported_one": "{{count}} deck importé.",
@@ -119,11 +184,14 @@
     "importedWithPreferences_one": "{{count}} deck et les préférences importés.",
     "importedWithPreferences_other": "{{count}} decks et les préférences importés.",
     "skippedMalformed_one": "{{count}} entrée malformée ignorée.",
-    "skippedMalformed_other": "{{count}} entrées malformées ignorées."
+    "skippedMalformed_other": "{{count}} entrées malformées ignorées.",
+    "telemetry": "Envoyer des rapports anonymes de plantage et d'utilisation",
+    "telemetryDescription": "Aide à corriger les plantages et à prioriser la prise en charge des cartes. Aucun compte, aucune donnée personnelle — uniquement des comptages d'erreurs et de résumés de partie."
   },
   "resetAll": {
     "confirm": "Réinitialiser toutes les préférences aux valeurs par défaut ? Cela efface tous les paramètres de cette boîte de dialogue.",
-    "button": "Réinitialiser toutes les préférences"
+    "button": "Réinitialiser toutes les préférences",
+    "confirmAction": "Réinitialiser"
   },
   "pacing": {
     "title": "Rythme",

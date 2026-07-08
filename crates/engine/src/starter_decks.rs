@@ -5,13 +5,31 @@ use crate::game::bracket_estimate::CommanderBracketTier;
 /// A deck specified as card name strings — the wire format used by clients
 /// and the starter deck module. Distinct from `PlayerDeckPayload` which
 /// contains fully-parsed `CardFace` data resolved against the card database.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct DeckData {
     pub main_deck: Vec<String>,
     #[serde(default)]
     pub sideboard: Vec<String>,
     #[serde(default)]
     pub commander: Vec<String>,
+    /// CR 717.2: Supplementary Attraction deck (Unfinity) as card names.
+    #[serde(default)]
+    pub attraction_deck: Vec<String>,
+    /// CR 901.15a: Supplementary Planechase planar deck as card names.
+    #[serde(default)]
+    pub planar_deck: Vec<String>,
+    /// CR 904.3: Supplementary Archenemy scheme deck as card names.
+    #[serde(default)]
+    pub scheme_deck: Vec<String>,
+    /// Unstable Contraptions: supplementary Contraption deck as card names.
+    #[serde(default)]
+    pub contraption_deck: Vec<String>,
+    /// CR 123.2c: The sticker sheets selected for this deck/game.
+    #[serde(default)]
+    pub sticker_sheets: Vec<String>,
+    /// Oathbreaker RC: the signature spell card name. Empty for all non-Oathbreaker formats.
+    #[serde(default)]
+    pub signature_spell: Vec<String>,
     /// Declared bracket tier for this deck. Defaults to `Core` when omitted,
     /// preserving backward compatibility with older wire payloads.
     #[serde(default)]
@@ -132,9 +150,7 @@ fn starter_to_deck_data(deck: &StarterDeck) -> DeckData {
         .collect();
     DeckData {
         main_deck,
-        sideboard: Vec::new(),
-        commander: Vec::new(),
-        bracket_tier: CommanderBracketTier::default(),
+        ..Default::default()
     }
 }
 

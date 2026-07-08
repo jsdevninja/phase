@@ -7,9 +7,10 @@
 
 use engine::types::ability::{
     AbilityCost, AbilityDefinition, AbilityKind, ChoiceType, ContinuousModification, ControllerRef,
-    DamageModification, DamageTargetFilter, DamageTargetPlayerScope, Effect, ManaReplacementScope,
-    QuantityExpr, QuantityModification, QuantityRef, ReplacementCondition, ReplacementDefinition,
-    ReplacementMode, RestrictionExpiry, TargetFilter,
+    DamageModification, DamageTargetFilter, DamageTargetPlayerScope, Effect, EffectScope,
+    FilterProp, ManaReplacementScope, QuantityExpr, QuantityModification, QuantityRef,
+    ReplacementCondition, ReplacementDefinition, ReplacementMode, RestrictionExpiry,
+    TapStateChange, TargetFilter, TypedFilter,
 };
 use engine::types::card_type::Supertype;
 use engine::types::counter::{parse_counter_type, CounterType as EngineCounterType};
@@ -17,15 +18,16 @@ use engine::types::replacements::ReplacementEvent;
 use engine::types::zones::Zone;
 
 use crate::convert::filter::{
-    artifact_type_name, choice_type_for_choosable_color, convert as convert_permanents,
-    convert_permanent, damage_sources_to_filter, land_type_name,
+    artifact_type_name, cards_to_filter, choice_type_for_choosable_color,
+    convert as convert_permanents, convert_permanent, damage_sources_to_filter, land_type_name,
+    player_to_controller, players_to_controller,
 };
 use crate::convert::mana;
 use crate::convert::quantity;
 use crate::convert::result::{ConvResult, ConversionGap};
 use crate::convert::static_effect;
 use crate::schema::types::{
-    Condition, CopyEffect, CopyEffects, CounterType, Expiration,
+    CardInExile, Condition, CopyEffect, CopyEffects, CounterType, DamageRecipientsList, Expiration,
     FutureReplacableEventWouldDealDamage, GameNumber, Permanent, Permanents, Player, Players,
     ReplacableEventWouldDealDamage, ReplacableEventWouldDraw, ReplacableEventWouldEnter,
     ReplacableEventWouldGainLife, ReplacableEventWouldPutCounters,
@@ -87,6 +89,7 @@ pub fn convert_as_enters(
             token_owner_scope: None,
             token_owner_redirect: None,
             valid_player: None,
+            consume_on_apply: false,
             is_consumed: false,
             redirect_target: None,
             mana_modification: None,
@@ -94,6 +97,8 @@ pub fn convert_as_enters(
             additional_token_spec: None,
             ensure_token_specs: None,
             counter_match: None,
+            enters_under: None,
+            source_controller: None,
         });
     }
     Ok(out)
@@ -166,6 +171,7 @@ pub fn convert_replace_would_enter(
             token_owner_scope: None,
             token_owner_redirect: None,
             valid_player: None,
+            consume_on_apply: false,
             is_consumed: false,
             redirect_target: None,
             mana_modification: None,
@@ -173,6 +179,8 @@ pub fn convert_replace_would_enter(
             additional_token_spec: None,
             ensure_token_specs: None,
             counter_match: None,
+            enters_under: None,
+            source_controller: None,
         });
     }
     Ok(out)
@@ -228,6 +236,7 @@ pub fn convert_replace_would_deal_damage(
             token_owner_scope: None,
             token_owner_redirect: None,
             valid_player: None,
+            consume_on_apply: false,
             is_consumed: false,
             redirect_target: None,
             mana_modification: None,
@@ -235,6 +244,8 @@ pub fn convert_replace_would_deal_damage(
             additional_token_spec: None,
             ensure_token_specs: None,
             counter_match: None,
+            enters_under: None,
+            source_controller: None,
         });
     }
     Ok(out)
@@ -599,6 +610,7 @@ pub fn convert_replace_would_draw(
             token_owner_scope: None,
             token_owner_redirect: None,
             valid_player: valid_player.clone(),
+            consume_on_apply: false,
             is_consumed: false,
             redirect_target: None,
             mana_modification: None,
@@ -606,6 +618,8 @@ pub fn convert_replace_would_draw(
             additional_token_spec: None,
             ensure_token_specs: None,
             counter_match: None,
+            enters_under: None,
+            source_controller: None,
         });
     }
     Ok(out)
@@ -693,10 +707,13 @@ pub fn convert_replace_would_put_into_graveyard(
                 owner_library: false,
                 enter_transformed: false,
                 enters_under: None,
-                enter_tapped: false,
+                enter_tapped: engine::types::zones::EtbTapState::Unspecified,
                 enters_attacking: false,
                 up_to: false,
                 enter_with_counters: Vec::new(),
+                conditional_enter_with_counters: vec![],
+                face_down_profile: None,
+                enters_modified_if: None,
             },
         );
         out.push(ReplacementDefinition {
@@ -718,6 +735,7 @@ pub fn convert_replace_would_put_into_graveyard(
             token_owner_scope: None,
             token_owner_redirect: None,
             valid_player: None,
+            consume_on_apply: false,
             is_consumed: false,
             redirect_target: None,
             mana_modification: None,
@@ -725,6 +743,8 @@ pub fn convert_replace_would_put_into_graveyard(
             additional_token_spec: None,
             ensure_token_specs: None,
             counter_match: None,
+            enters_under: None,
+            source_controller: None,
         });
     }
     Ok(out)
@@ -850,6 +870,32 @@ fn graveyard_event_to_valid_card(
         E::APermanentWouldDie(perms) | E::APermanentWouldBePutIntoAGraveyard(perms) => {
             Ok(Some(convert_permanents(perms)?))
         }
+        // CR 614.6: "If a card [predicate] would be put into [player]'s graveyard from anywhere".
+        // Combines the card predicate with an ownership filter derived from the player scope.
+        // CR 400.3: Cards go to their owner's graveyard, so owner == destination player.
+        E::WouldPutACardInAPlayersGraveyardFromAnywhere(cards, players)
+        | E::WouldPutACardInAPlayersGraveyardFromAnywhereOtherThanBattlefield(cards, players)
+        | E::WouldPutACardOrTokenInAPlayersGraveyardFromAnywhere(cards, players) => {
+            let card_filter = cards_to_filter(cards)?;
+            let ctrl = players_to_controller(players)?;
+            let owner_filter = TargetFilter::Typed(
+                TypedFilter::default().properties(vec![FilterProp::Owned { controller: ctrl }]),
+            );
+            Ok(Some(TargetFilter::And {
+                filters: vec![card_filter, owner_filter],
+            }))
+        }
+        E::WouldPutACardInPlayersGraveyardFromAnywhere(cards, player)
+        | E::WouldPutACardInPlayersGraveyardFromAnywhereNotCycled(cards, player) => {
+            let card_filter = cards_to_filter(cards)?;
+            let ctrl = player_to_controller(player)?;
+            let owner_filter = TargetFilter::Typed(
+                TypedFilter::default().properties(vec![FilterProp::Owned { controller: ctrl }]),
+            );
+            Ok(Some(TargetFilter::And {
+                filters: vec![card_filter, owner_filter],
+            }))
+        }
         other => Err(ConversionGap::UnknownVariant {
             path: String::new(),
             repr: serde_json::to_value(other)
@@ -911,10 +957,13 @@ pub fn convert_as_put_into_graveyard_from_anywhere(
                 owner_library: false,
                 enter_transformed: false,
                 enters_under: None,
-                enter_tapped: false,
+                enter_tapped: engine::types::zones::EtbTapState::Unspecified,
                 enters_attacking: false,
                 up_to: false,
                 enter_with_counters: Vec::new(),
+                conditional_enter_with_counters: vec![],
+                face_down_profile: None,
+                enters_modified_if: None,
             },
         );
         out.push(ReplacementDefinition {
@@ -936,6 +985,7 @@ pub fn convert_as_put_into_graveyard_from_anywhere(
             token_owner_scope: None,
             token_owner_redirect: None,
             valid_player: None,
+            consume_on_apply: false,
             is_consumed: false,
             redirect_target: None,
             mana_modification: None,
@@ -943,6 +993,8 @@ pub fn convert_as_put_into_graveyard_from_anywhere(
             additional_token_spec: None,
             ensure_token_specs: None,
             counter_match: None,
+            enters_under: None,
+            source_controller: None,
         });
     }
     Ok(out)
@@ -985,11 +1037,11 @@ fn graveyard_action_to_destination(
 /// - `Plus(WouldPutCounters_NumberOfCounters, Integer(n))` →
 ///   `QuantityModification::Plus { value: n }`
 /// - `Twice(WouldPutCounters_NumberOfCounters)` →
-///   `QuantityModification::Double`
+///   `QuantityModification::DOUBLE` (`Times { factor: 2 }`)
 ///
-/// Other quantity expressions (multipliers other than 2, references to
-/// other game state) strict-fail until `QuantityModification` grows
-/// additional axes.
+/// Other quantity expressions (multipliers other than 2 — the engine's
+/// `Times { factor }` axis exists but no mtgish counter idiom emits a
+/// non-2 multiplier — or references to other game state) strict-fail.
 pub fn convert_replace_would_put_counters(
     event: &ReplacableEventWouldPutCounters,
     actions: &[ReplacementActionWouldPutCounters],
@@ -1023,6 +1075,7 @@ pub fn convert_replace_would_put_counters(
             token_owner_scope: None,
             token_owner_redirect: None,
             valid_player: None,
+            consume_on_apply: false,
             is_consumed: false,
             redirect_target: None,
             mana_modification: None,
@@ -1030,6 +1083,8 @@ pub fn convert_replace_would_put_counters(
             additional_token_spec: None,
             ensure_token_specs: None,
             counter_match: counter_match.clone(),
+            enters_under: None,
+            source_controller: None,
         });
     }
     Ok(out)
@@ -1128,7 +1183,7 @@ fn game_number_to_modification(
     idiom: &'static str,
 ) -> ConvResult<QuantityModification> {
     match g {
-        GameNumber::Twice(inner) if is_self_ref(inner) => Ok(QuantityModification::Double),
+        GameNumber::Twice(inner) if is_self_ref(inner) => Ok(QuantityModification::DOUBLE),
         GameNumber::Plus(a, b) if is_self_ref(a) || is_self_ref(b) => {
             let n_node = if is_self_ref(a) { &**b } else { &**a };
             match n_node {
@@ -1172,8 +1227,8 @@ fn game_number_to_modification(
 ///
 /// - `GainLife(Plus(LifeAmount, Integer(N)))` →
 ///   `QuantityModification::Plus { value: N }` (Hardened-Heart pattern).
-/// - `GainLife(Twice(LifeAmount))` → `QuantityModification::Double`
-///   (Boon Reflection / Rhox Faithmender).
+/// - `GainLife(Twice(LifeAmount))` → `QuantityModification::DOUBLE`
+///   (`Times { factor: 2 }`; Boon Reflection / Rhox Faithmender).
 ///
 /// Other actions (DrawNumberCards, GainNoLifeInstead, LoseLife,
 /// PlayerAction wrappers) strict-fail.
@@ -1204,6 +1259,7 @@ pub fn convert_replace_would_gain_life(
             token_owner_scope: None,
             token_owner_redirect: None,
             valid_player: valid_player.clone(),
+            consume_on_apply: false,
             is_consumed: false,
             redirect_target: None,
             mana_modification: None,
@@ -1211,6 +1267,8 @@ pub fn convert_replace_would_gain_life(
             additional_token_spec: None,
             ensure_token_specs: None,
             counter_match: None,
+            enters_under: None,
+            source_controller: None,
         });
     }
     Ok(out)
@@ -1322,6 +1380,7 @@ fn try_build_may_cost_pair(
         token_owner_scope: None,
         token_owner_redirect: None,
         valid_player: None,
+        consume_on_apply: false,
         is_consumed: false,
         redirect_target: None,
         mana_modification: None,
@@ -1329,6 +1388,8 @@ fn try_build_may_cost_pair(
         additional_token_spec: None,
         ensure_token_specs: None,
         counter_match: None,
+        enters_under: None,
+        source_controller: None,
     }))
 }
 
@@ -1357,6 +1418,85 @@ fn convert_enter_cost(cost: &ReplacementActionWouldEnterCost) -> ConvResult<Abil
         ReplacementActionWouldEnterCost::PayLife(amount) => AbilityCost::PayLife {
             amount: quantity::convert(amount)?,
         },
+        ReplacementActionWouldEnterCost::ExileTwoCardsFromAmongPlayersGraveyards(
+            cards,
+            players,
+        ) => {
+            let controller = players_to_controller(players)?;
+            // Convert CardsInGraveyard to a basic filter - for now, just use creature cards
+            let card_filter = match cards {
+                crate::schema::types::CardsInGraveyard::IsCardtype(
+                    crate::schema::types::CardType::Creature,
+                ) => TargetFilter::Typed(TypedFilter::creature()),
+                _ => {
+                    return Err(ConversionGap::EnginePrerequisiteMissing {
+                        engine_type: "AbilityCost",
+                        needed_variant: format!("CardsInGraveyard variant: {cards:?}"),
+                    });
+                }
+            };
+            // Combine the card filter with the controller constraint from Players
+            let filter = match controller {
+                ControllerRef::You => {
+                    // "from among players' graveyards" when Players = You means "your graveyard"
+                    Some(TargetFilter::And {
+                        filters: vec![
+                            card_filter,
+                            TargetFilter::Typed(
+                                TypedFilter::default()
+                                    .controller(ControllerRef::You)
+                                    .properties(vec![FilterProp::InZone {
+                                        zone: Zone::Graveyard,
+                                    }]),
+                            ),
+                        ],
+                    })
+                }
+                ControllerRef::Opponent => {
+                    // "from among players' graveyards" when Players = Opponent means "opponents' graveyards"
+                    Some(TargetFilter::And {
+                        filters: vec![
+                            card_filter,
+                            TargetFilter::Typed(
+                                TypedFilter::default()
+                                    .controller(ControllerRef::Opponent)
+                                    .properties(vec![FilterProp::InZone {
+                                        zone: Zone::Graveyard,
+                                    }]),
+                            ),
+                        ],
+                    })
+                }
+                ControllerRef::TargetPlayer => {
+                    // Targeted player scope - defer to interactive selection
+                    Some(TargetFilter::And {
+                        filters: vec![
+                            card_filter,
+                            TargetFilter::Typed(
+                                TypedFilter::default()
+                                    .controller(ControllerRef::TargetPlayer)
+                                    .properties(vec![FilterProp::InZone {
+                                        zone: Zone::Graveyard,
+                                    }]),
+                            ),
+                        ],
+                    })
+                }
+                _ => {
+                    // Other scopes (ScopedPlayer, ParentTargetController, etc.) not expected for this cost
+                    return Err(ConversionGap::MalformedIdiom {
+                        idiom: "ExileTwoCardsFromAmongPlayersGraveyards",
+                        path: String::new(),
+                        detail: format!("Unsupported Players axis: {controller:?}"),
+                    });
+                }
+            };
+            AbilityCost::Exile {
+                count: 2,
+                zone: Some(Zone::Graveyard),
+                filter,
+            }
+        }
         other => {
             return Err(ConversionGap::EnginePrerequisiteMissing {
                 engine_type: "AbilityCost",
@@ -1530,13 +1670,15 @@ fn build_replacement_exec(
         return Ok((None, ReplacementMode::Optional { decline: None }, exec));
     }
     let effect = match act {
-        // CR 614.12 + CR 121.6: Enters tapped — direct Effect::Tap.
-        A::EntersTapped => Effect::Tap {
+        // CR 614.12 + CR 121.6: Enters tapped — single-target tap of the source.
+        A::EntersTapped => Effect::SetTapState {
             target: target.clone(),
+            scope: EffectScope::Single,
+            state: TapStateChange::Tap,
         },
         // CR 614.12 + CR 122.1: Enters with a counter (default 1) /
         // enters with N counters of a typed kind.
-        A::EntersWithACounter(ct) => Effect::AddCounter {
+        A::EntersWithACounter(ct) => Effect::PutCounter {
             counter_type: counter_type_name(ct),
             count: QuantityExpr::Fixed { value: 1 },
             target: target.clone(),
@@ -1555,12 +1697,23 @@ fn build_replacement_exec(
         A::EntersWithNumberCounters(g, ct) => {
             let mut count = quantity::convert(g)?;
             rewrite_variable_x_to_cost_x_paid(&mut count);
-            Effect::AddCounter {
+            Effect::PutCounter {
                 counter_type: counter_type_name(ct),
                 count,
                 target: target.clone(),
             }
         }
+        // CR 722.3a: Prepare (Strixhaven preparation cards) — "As this enters,
+        // it's prepared." The engine prerequisite EXISTS: `Effect::BecomePrepared`
+        // resolved through this ETB ChangeZone replacement (engine
+        // `game/effects/prepare.rs::resolve_become_prepared`). The runtime
+        // `has_prepare_face` gate ensures only cards with a prepare-spell back
+        // face actually gain the designation, matching the CR 722.3a clause
+        // "A permanent can't gain this designation unless it has a prepare spell."
+        // `target` is the replacement's `valid_card` (SelfRef for ThisPermanent).
+        A::EntersPrepared => Effect::BecomePrepared {
+            target: target.clone(),
+        },
         // CR 614.12 + CR 110.2a: "Enters under [opponent / a player]'s
         // control." `Effect::ChangeZone` carries `enters_under`,
         // but the engine has no slot for "under SOME OTHER player's
@@ -1573,26 +1726,24 @@ fn build_replacement_exec(
                 needed_variant: "ETB action: enters under another player's control".into(),
             });
         }
-        // CR 122.1 (counter-of-choice / EntersPrepared / per-each /
-        // for-each-kind / different-counters / etc.) — these need new
-        // engine ETB action shapes (player picks counter type, "ready"
-        // counter primitive, dynamic per-each-quantity, etc.).
+        // CR 122.1 (counter-of-choice / per-each / for-each-kind /
+        // different-counters / etc.) — these need new engine ETB action
+        // shapes (player picks counter type, "ready" counter primitive,
+        // dynamic per-each-quantity, etc.).
         A::EntersWithACounterOfChoice(_)
         | A::EntersWithNumberDifferentCountersOfChoice(_, _)
         | A::EntersWithNumberCombinationCountersOfChoice(_, _)
         | A::EntersWithACounterOfTypeForEachKindOfCounterOnPermanent(_)
         | A::EntersWithAnAbilityCounterForEachAbilityOnACardDiscardedThisWay(_)
         | A::EntersWithNotedCounters
-        | A::EntersWithNumberCountersForEach(_, _, _)
-        | A::EntersPrepared => {
+        | A::EntersWithNumberCountersForEach(_, _, _) => {
             return Err(ConversionGap::EnginePrerequisiteMissing {
                 engine_type: "Effect",
                 needed_variant: format!("ETB counter-action shape ({})", variant_tag(act)),
             });
         }
-        // CR 614.12: Untapped-instead replacement — needs an engine
-        // "force-untapped" override since `enter_tapped: false` is the
-        // default (no replacement fires for the default).
+        // CR 614.12: Untapped-instead replacement needs an explicit
+        // force-untapped override, distinct from the default/no-modifier state.
         A::EntersUntapped => {
             return Err(ConversionGap::EnginePrerequisiteMissing {
                 engine_type: "ReplacementDefinition",
@@ -1632,24 +1783,29 @@ fn build_replacement_exec(
         // the native parser shape in `oracle_replacement.rs`
         // (`parse_as_enters_choose`).
         A::ChooseACreatureType => Effect::Choose {
-            choice_type: ChoiceType::CreatureType,
+            choice_type: ChoiceType::creature_type(),
             persist: true,
+            selection: engine::types::ability::TargetSelectionMode::Chosen,
         },
         A::ChooseAColor(choice) => Effect::Choose {
             choice_type: choice_type_for_choosable_color(choice),
             persist: true,
+            selection: engine::types::ability::TargetSelectionMode::Chosen,
         },
         A::ChooseACardName(_) => Effect::Choose {
             choice_type: ChoiceType::CardName,
             persist: true,
+            selection: engine::types::ability::TargetSelectionMode::Chosen,
         },
         A::ChooseACardtype => Effect::Choose {
-            choice_type: ChoiceType::CardType,
+            choice_type: ChoiceType::card_type(),
             persist: true,
+            selection: engine::types::ability::TargetSelectionMode::Chosen,
         },
         A::ChooseABasicLandType => Effect::Choose {
             choice_type: ChoiceType::BasicLandType,
             persist: true,
+            selection: engine::types::ability::TargetSelectionMode::Chosen,
         },
         // CR 305.7: "land type" includes basic + nonbasic. Both
         // unparameterized (ChooseALandType) and parameterized
@@ -1659,6 +1815,7 @@ fn build_replacement_exec(
         A::ChooseALandType | A::ChooseLandType(_) => Effect::Choose {
             choice_type: ChoiceType::LandType,
             persist: true,
+            selection: engine::types::ability::TargetSelectionMode::Chosen,
         },
         // CR 800.4a: opponent-scoped player choice when the schema
         // filter narrows to opponents; broader player choice
@@ -1667,12 +1824,13 @@ fn build_replacement_exec(
         A::ChooseAPlayer(players) => {
             let choice_type = match crate::convert::filter::players_to_controller(players.as_ref())
             {
-                Ok(ControllerRef::Opponent) => ChoiceType::Opponent,
+                Ok(ControllerRef::Opponent) => ChoiceType::Opponent { restriction: None },
                 _ => ChoiceType::Player,
             };
             Effect::Choose {
                 choice_type,
                 persist: true,
+                selection: engine::types::ability::TargetSelectionMode::Chosen,
             }
         }
         // CR 614.12a: "Choose a number between X and Y" — engine's
@@ -1696,17 +1854,21 @@ fn build_replacement_exec(
                 choice_type: ChoiceType::NumberRange {
                     min: min_u8,
                     max: max_u8,
+                    distinctness: engine::types::ability::NumberDistinctness::Repeatable,
                 },
                 persist: true,
+                selection: engine::types::ability::TargetSelectionMode::Chosen,
             }
         }
         A::ChooseEvenOrOdd => Effect::Choose {
             choice_type: ChoiceType::OddOrEven,
             persist: true,
+            selection: engine::types::ability::TargetSelectionMode::Chosen,
         },
         A::ChooseTwoColors => Effect::Choose {
             choice_type: ChoiceType::TwoColors,
             persist: true,
+            selection: engine::types::ability::TargetSelectionMode::Chosen,
         },
         // CR 614.12a + CR 701.x voting: enumerated option lists become
         // `ChoiceType::Labeled`. Each variant supplies its own option
@@ -1716,6 +1878,7 @@ fn build_replacement_exec(
                 options: vec!["Left".to_string(), "Right".to_string()],
             },
             persist: true,
+            selection: engine::types::ability::TargetSelectionMode::Chosen,
         },
         A::ChooseACreatureTypeFromList(opts) => {
             if opts.is_empty() {
@@ -1729,22 +1892,19 @@ fn build_replacement_exec(
                     options: opts.iter().map(|c| format!("{c:?}")).collect(),
                 },
                 persist: true,
+                selection: engine::types::ability::TargetSelectionMode::Chosen,
             }
         }
-        A::ChooseACardtypeFromList(opts) => {
-            if opts.is_empty() {
-                return Err(ConversionGap::EnginePrerequisiteMissing {
-                    engine_type: "ChoiceType::Labeled",
-                    needed_variant: "ChooseACardtypeFromList with empty option list".into(),
-                });
-            }
-            Effect::Choose {
-                choice_type: ChoiceType::Labeled {
-                    options: opts.iter().map(|c| format!("{c:?}")).collect(),
-                },
-                persist: true,
-            }
-        }
+        // CR 205.2a + CR 607.2d: a restricted card-type enumeration ("choose
+        // artifact, enchantment, instant, sorcery, or planeswalker", Archon
+        // of Valor's Reach) is a narrowed `ChoiceType::CardType`, not a
+        // free-form `Labeled` choice — see `filter::restricted_card_type_choice`
+        // (shared with the spell-action sibling in `action.rs`) for why.
+        A::ChooseACardtypeFromList(opts) => Effect::Choose {
+            choice_type: crate::convert::filter::restricted_card_type_choice(opts)?,
+            persist: true,
+            selection: engine::types::ability::TargetSelectionMode::Chosen,
+        },
         A::ChooseWord(opts) => {
             if opts.is_empty() {
                 return Err(ConversionGap::EnginePrerequisiteMissing {
@@ -1757,6 +1917,7 @@ fn build_replacement_exec(
                     options: opts.clone(),
                 },
                 persist: true,
+                selection: engine::types::ability::TargetSelectionMode::Chosen,
             }
         }
         // CR 614.12a strict-fails — each gets its own refined tag so
@@ -1887,12 +2048,23 @@ fn build_replacement_exec(
         // `Unless` and `MayActions` are handled by the early-return guards above.
         A::Unless(_, _) => unreachable!("Unless handled by early-return guard"),
         A::MayActions(_) => unreachable!("MayActions handled by early-return guard"),
+        // CR 707.2: Enter as a copy of a specific card exiled by the source.
+        // Used by The Mimeoplasm to copy the first exiled card.
+        A::EnterAsCopyOfExiled(card_in_exile, copy_effects) => {
+            let target = convert_card_in_exile_to_target_filter(card_in_exile)?;
+            let additional_modifications = convert_copy_effects(copy_effects)?;
+            Effect::BecomeCopy {
+                target,
+                duration: None,
+                mana_value_limit: None,
+                additional_modifications,
+            }
+        }
         // CR 707.x / CR 614.12: Remaining copy-source zones plus face-down /
         // transformed / attached / attacking / blocking modifier shapes need
         // dedicated engine primitives or converter-side source filters.
         A::EnterAsACopyOfACardInAPlayersGraveyard(_, _, _)
         | A::EnterAsACopyOfACardInExile(_, _)
-        | A::EnterAsCopyOfExiled(_, _)
         | A::EntersAsFaceDownArtifactCreature(_, _)
         | A::EntersAsFaceDownCreatureWithAbilitiesAndNotedName(_, _, _)
         | A::EntersAsFaceDownLand(_)
@@ -1950,6 +2122,17 @@ fn build_replacement_exec(
 /// `Effect::BecomeCopy.additional_modifications` channel. Unsupported
 /// "keep original characteristic" shapes strict-fail because they need a
 /// source-relative override primitive, not a no-op.
+fn convert_card_in_exile_to_target_filter(card: &CardInExile) -> ConvResult<TargetFilter> {
+    match card {
+        CardInExile::TheFirstCardExiledThisWay => Ok(TargetFilter::ExiledCardByIndex { index: 0 }),
+        CardInExile::TheSecondCardExiledThisWay => Ok(TargetFilter::ExiledCardByIndex { index: 1 }),
+        _ => Err(ConversionGap::EnginePrerequisiteMissing {
+            engine_type: "TargetFilter",
+            needed_variant: format!("CardInExile variant: {card:?}"),
+        }),
+    }
+}
+
 fn convert_copy_effects(effects: &CopyEffects) -> ConvResult<Vec<ContinuousModification>> {
     let list = match effects {
         CopyEffects::NoCopyEffects => return Ok(Vec::new()),
@@ -2538,7 +2721,7 @@ fn variant_tag(a: &ReplacementActionWouldEnter) -> String {
 /// permanent's own `cost_x_paid` field — populated by `finalize_cast` and
 /// preserved across the stack → battlefield zone change. Walks the
 /// expression tree so wrapped forms (`Multiply`, `DivideRounded`, `Offset`,
-/// `Sum`, `UpTo`) all rewrite correctly.
+/// `ClampMin`, `Sum`, `UpTo`) all rewrite correctly.
 ///
 /// Mirrors `engine::parser::oracle_replacement::rewrite_variable_x_to_cost_x_paid`
 /// (which is `pub(crate)` to the engine crate). Replicated here so the
@@ -2553,9 +2736,10 @@ fn rewrite_variable_x_to_cost_x_paid(expr: &mut QuantityExpr) {
         }
         QuantityExpr::Fixed { .. } => {}
         QuantityExpr::DivideRounded { inner, .. }
+        | QuantityExpr::ClampMin { inner, .. }
         | QuantityExpr::Offset { inner, .. }
         | QuantityExpr::Multiply { inner, .. } => rewrite_variable_x_to_cost_x_paid(inner),
-        QuantityExpr::Sum { exprs } => {
+        QuantityExpr::Sum { exprs } | QuantityExpr::Max { exprs } => {
             for inner in exprs {
                 rewrite_variable_x_to_cost_x_paid(inner);
             }
@@ -2605,13 +2789,16 @@ pub fn convert_create_replace_would_deal_damage_until(
         });
     }
     let amount = single_prevent_amount(actions)?;
-    let (scope, source_filter) = damage_event_to_prevent_scope(event)?;
+    let (scope, source_filter, target) = damage_event_to_prevent_params(event)?;
     Ok(engine::types::ability::Effect::PreventDamage {
         amount,
         amount_dynamic: None,
-        target: engine::types::ability::TargetFilter::Any,
+        target,
         scope,
         damage_source_filter: source_filter,
+        // CR 514.2: EOT expiration is the only shape this converter accepts
+        // (guarded above), so no explicit "this combat" window applies.
+        prevention_duration: None,
     })
 }
 
@@ -2648,6 +2835,8 @@ pub fn convert_create_future_replace_would_deal_damage(
         target: engine::types::ability::TargetFilter::Any,
         scope,
         damage_source_filter: source_filter,
+        // CR 514.2: future-damage shields are EOT-scoped; no "this combat" window.
+        prevention_duration: None,
     })
 }
 
@@ -2721,53 +2910,200 @@ fn require_prevention_only(actions: &[ReplacementActionWouldDealDamage]) -> Conv
     }
 }
 
+/// CR 614.2: Map a `DamageRecipientsList` onto the `Effect::PreventDamage`
+/// recipient axis. The engine's `prevent_damage::resolve` routes typed
+/// permanent filters through the shield's `valid_card` slot (Losheel /
+/// Pack Leader class).
+fn damage_recipients_list_to_prevent_target(
+    recipients: &DamageRecipientsList,
+) -> ConvResult<TargetFilter> {
+    use DamageRecipientsList as R;
+    Ok(match recipients {
+        R::APermanent(perms) => convert_permanents(perms)?,
+        R::APlayer(players) => players_to_prevent_target(players)?,
+        R::APlayerOrAPermanent(_, _) => {
+            return Err(ConversionGap::EnginePrerequisiteMissing {
+                engine_type: "Effect::PreventDamage::target",
+                needed_variant: "combined player-plus-permanent damage recipient".into(),
+            });
+        }
+    })
+}
+
+fn players_to_prevent_target(players: &Players) -> ConvResult<TargetFilter> {
+    match players {
+        Players::SinglePlayer(player) => player_to_prevent_target(player),
+        // CR 614.1a: "a player" is a damage-recipient class, not an object
+        // controller filter. `prevent_damage::resolve` maps `TargetFilter::Player`
+        // to `DamageTargetPlayerScope::Any` when no target slot is present.
+        Players::AnyPlayer => Ok(TargetFilter::Player),
+        other => Err(ConversionGap::EnginePrerequisiteMissing {
+            engine_type: "Effect::PreventDamage::target",
+            needed_variant: format!("player damage recipient {other:?}"),
+        }),
+    }
+}
+
+fn player_to_prevent_target(player: &Player) -> ConvResult<TargetFilter> {
+    match player {
+        Player::You | Player::HostPlayer | Player::HostController | Player::SelfPlayer => {
+            Ok(TargetFilter::Controller)
+        }
+        Player::Ref_TargetPlayer
+        | Player::Ref_TargetPlayer1
+        | Player::Ref_TargetPlayer2
+        | Player::Ref_TargetPlayer3 => Ok(TargetFilter::Player),
+        other => Err(ConversionGap::EnginePrerequisiteMissing {
+            engine_type: "Effect::PreventDamage::target",
+            needed_variant: format!("player damage recipient {other:?}"),
+        }),
+    }
+}
+
+/// CR 614.2: Map a `SingleDamageRecipient` onto the `Effect::PreventDamage`
+/// recipient axis.
+fn single_damage_recipient_to_prevent_target(
+    recipient: &SingleDamageRecipient,
+) -> ConvResult<TargetFilter> {
+    match recipient {
+        SingleDamageRecipient::Permanent(p) => convert_permanent(p),
+        SingleDamageRecipient::Player(p) => player_to_prevent_target(p),
+        other => Err(ConversionGap::EnginePrerequisiteMissing {
+            engine_type: "Effect::PreventDamage::target",
+            needed_variant: format!("SingleDamageRecipient::{other:?}"),
+        }),
+    }
+}
+
 /// CR 615 + CR 614.1a: Decompose a `ReplacableEventWouldDealDamage` into
-/// the `(scope, damage_source_filter)` tuple expected by
+/// the `(scope, damage_source_filter, target)` tuple expected by
 /// `Effect::PreventDamage`. Combat-prefixed variants set
 /// `PreventionScope::CombatDamage`; others remain `AllDamage`. When the
 /// event names a typed source (`...ByACreature(perms)` /
 /// `...ByAPermanent(perms)`), convert via `convert_permanents` and use
 /// it as the source filter; otherwise leave the source slot `None`.
-fn damage_event_to_prevent_scope(
+/// Recipient-bearing variants populate `target` from the event's damage
+/// recipient description.
+fn damage_event_to_prevent_params(
     event: &ReplacableEventWouldDealDamage,
 ) -> ConvResult<(
     engine::types::ability::PreventionScope,
     Option<engine::types::ability::TargetFilter>,
+    engine::types::ability::TargetFilter,
 )> {
     use engine::types::ability::PreventionScope;
     use ReplacableEventWouldDealDamage as E;
     Ok(match event {
-        E::CombatDamageWouldBeDealt
-        | E::CombatDamageWouldBeDealtToARecipient(_)
-        | E::CombatDamageWouldBeDealtToRecipient(_) => (PreventionScope::CombatDamage, None),
-        E::CombatDamageWouldBeDealtByACreature(perms)
-        | E::CombatDamageWouldBeDealtByACreatureToARecipient(perms, _)
-        | E::CombatDamageWouldBeDealtByACreatureToASetOfRecipients(perms, _)
-        | E::CombatDamageWouldBeDealtByACreatureToRecipient(perms, _) => (
+        E::CombatDamageWouldBeDealt => (PreventionScope::CombatDamage, None, TargetFilter::Any),
+        E::CombatDamageWouldBeDealtToARecipient(recipients) => (
+            PreventionScope::CombatDamage,
+            None,
+            damage_recipients_list_to_prevent_target(recipients)?,
+        ),
+        E::CombatDamageWouldBeDealtToRecipient(recipient) => (
+            PreventionScope::CombatDamage,
+            None,
+            single_damage_recipient_to_prevent_target(recipient)?,
+        ),
+        E::CombatDamageWouldBeDealtByACreature(perms) => (
             PreventionScope::CombatDamage,
             Some(convert_permanents(perms)?),
+            TargetFilter::Any,
         ),
-        E::CombatDamageWouldBeDealtByCreature(perm)
-        | E::CombatDamageWouldBeDealtByCreatureToARecipient(perm, _)
-        | E::CombatDamageWouldBeDealtByCreatureToRecipient(perm, _) => (
+        E::CombatDamageWouldBeDealtByACreatureToARecipient(perms, recipients) => (
+            PreventionScope::CombatDamage,
+            Some(convert_permanents(perms)?),
+            damage_recipients_list_to_prevent_target(recipients)?,
+        ),
+        E::CombatDamageWouldBeDealtByACreatureToASetOfRecipients(perms, recipients) => (
+            PreventionScope::CombatDamage,
+            Some(convert_permanents(perms)?),
+            damage_recipients_list_to_prevent_target(recipients)?,
+        ),
+        E::CombatDamageWouldBeDealtByACreatureToRecipient(perms, recipient) => (
+            PreventionScope::CombatDamage,
+            Some(convert_permanents(perms)?),
+            single_damage_recipient_to_prevent_target(recipient)?,
+        ),
+        E::CombatDamageWouldBeDealtByCreature(perm) => (
             PreventionScope::CombatDamage,
             Some(convert_permanent(perm)?),
+            TargetFilter::Any,
         ),
-        E::DamageWouldBeDealtByAPermanent(perms)
-        | E::DamageWouldBeDealtByAPermanentToARecipient(perms, _)
-        | E::DamageWouldBeDealtByAPermanentToRecipient(perms, _) => {
-            (PreventionScope::AllDamage, Some(convert_permanents(perms)?))
-        }
-        E::DamageWouldBeDealtByASource(sources)
-        | E::DamageWouldBeDealtByASourceToARecipient(sources, _)
-        | E::DamageWouldBeDealtByASourceToRecipient(sources, _) => (
+        E::CombatDamageWouldBeDealtByCreatureToARecipient(perm, recipients) => (
+            PreventionScope::CombatDamage,
+            Some(convert_permanent(perm)?),
+            damage_recipients_list_to_prevent_target(recipients)?,
+        ),
+        E::CombatDamageWouldBeDealtByCreatureToRecipient(perm, recipient) => (
+            PreventionScope::CombatDamage,
+            Some(convert_permanent(perm)?),
+            single_damage_recipient_to_prevent_target(recipient)?,
+        ),
+        E::DamageWouldBeDealtToARecipient(recipients) => (
+            PreventionScope::AllDamage,
+            None,
+            damage_recipients_list_to_prevent_target(recipients)?,
+        ),
+        E::DamageWouldBeDealtToRecipient(recipient) => (
+            PreventionScope::AllDamage,
+            None,
+            single_damage_recipient_to_prevent_target(recipient)?,
+        ),
+        E::DamageWouldBeDealtByAPermanent(perms) => (
+            PreventionScope::AllDamage,
+            Some(convert_permanents(perms)?),
+            TargetFilter::Any,
+        ),
+        E::DamageWouldBeDealtByAPermanentToARecipient(perms, recipients) => (
+            PreventionScope::AllDamage,
+            Some(convert_permanents(perms)?),
+            damage_recipients_list_to_prevent_target(recipients)?,
+        ),
+        E::DamageWouldBeDealtByAPermanentToRecipient(perms, recipient) => (
+            PreventionScope::AllDamage,
+            Some(convert_permanents(perms)?),
+            single_damage_recipient_to_prevent_target(recipient)?,
+        ),
+        E::DamageWouldBeDealtByASource(sources) => (
             PreventionScope::AllDamage,
             Some(damage_sources_to_filter(sources)?),
+            TargetFilter::Any,
         ),
-        E::DamageWouldBeDealtBySource(source)
-        | E::DamageWouldBeDealtBySourceToRecipient(source, _) => (
+        E::DamageWouldBeDealtByASourceToARecipient(sources, recipients) => (
+            PreventionScope::AllDamage,
+            Some(damage_sources_to_filter(sources)?),
+            damage_recipients_list_to_prevent_target(recipients)?,
+        ),
+        E::DamageWouldBeDealtByASourceToRecipient(sources, recipient) => (
+            PreventionScope::AllDamage,
+            Some(damage_sources_to_filter(sources)?),
+            single_damage_recipient_to_prevent_target(recipient)?,
+        ),
+        E::DamageWouldBeDealtBySource(source) => (
             PreventionScope::AllDamage,
             Some(single_damage_source_to_filter(source)),
+            TargetFilter::Any,
+        ),
+        E::DamageWouldBeDealtBySourceToRecipient(source, recipient) => (
+            PreventionScope::AllDamage,
+            Some(single_damage_source_to_filter(source)),
+            single_damage_recipient_to_prevent_target(recipient)?,
+        ),
+        E::NoncombatDamageWouldBeDealtToARecipient(recipients) => (
+            PreventionScope::AllDamage,
+            None,
+            damage_recipients_list_to_prevent_target(recipients)?,
+        ),
+        E::NoncombatDamageWouldBeDealtToRecipient(recipient) => (
+            PreventionScope::AllDamage,
+            None,
+            single_damage_recipient_to_prevent_target(recipient)?,
+        ),
+        E::NoncombatDamageWouldBeDealtByASourceToARecipient(sources, recipients) => (
+            PreventionScope::AllDamage,
+            Some(damage_sources_to_filter(sources)?),
+            damage_recipients_list_to_prevent_target(recipients)?,
         ),
         // CR 614.x: `Or` over a list of inner events — the engine has no
         // OR slot on `Effect::PreventDamage`. Strict-fail (rather than
@@ -2911,9 +3247,10 @@ mod tests {
 
     use super::*;
     use crate::schema::types::{
-        CardType, Condition, CopyEffect, CopyEffects, FutureReplacableEventWouldDealDamage,
-        GameNumber, Permanent, Permanents, ReplacementActionWouldDealDamage,
-        ReplacementActionWouldEnter, Rule, SingleDamageSource, SuperType,
+        CardInExile, CardType, Condition, CopyEffect, CopyEffects,
+        FutureReplacableEventWouldDealDamage, GameNumber, Permanent, Permanents, Player, Players,
+        ReplacementActionWouldDealDamage, ReplacementActionWouldEnter, Rule, SingleDamageSource,
+        SuperType,
     };
 
     #[test]
@@ -2942,7 +3279,149 @@ mod tests {
                     amount: QuantityExpr::Fixed { value: 2 }
                 },
                 decline: Some(decline),
-            } if matches!(&*decline.effect, Effect::Tap { target } if *target == TargetFilter::SelfRef)
+            } if matches!(
+                &*decline.effect,
+                Effect::SetTapState {
+                    target,
+                    scope: EffectScope::Single,
+                    state: TapStateChange::Tap,
+                } if *target == TargetFilter::SelfRef
+            )
+        ));
+    }
+
+    // Issue #4201 — Archon of Valor's Reach's "choose artifact, enchantment,
+    // instant, sorcery, or planeswalker" ETB action must lower to a
+    // restricted `ChoiceType::CardType` (excluding Creature and Land), not a
+    // free-form `Labeled` choice, so the companion "can't cast spells of the
+    // chosen type" prohibition (`FilterProp::IsChosenCardType`) can bind.
+    #[test]
+    fn choose_a_cardtype_from_list_lowers_to_restricted_card_type_choice() {
+        let defs = convert_as_enters(
+            &Permanent::ThisPermanent,
+            &[ReplacementActionWouldEnter::ChooseACardtypeFromList(vec![
+                CardType::Artifact,
+                CardType::Enchantment,
+                CardType::Instant,
+                CardType::Sorcery,
+                CardType::Planeswalker,
+            ])],
+        )
+        .unwrap();
+
+        assert_eq!(defs.len(), 1);
+        let exec = defs[0].execute.as_ref().expect("execute must be set");
+        match exec.effect.as_ref() {
+            Effect::Choose {
+                choice_type: engine::types::ability::ChoiceType::CardType { excluded },
+                persist,
+                ..
+            } => {
+                assert!(*persist);
+                assert_eq!(excluded, &vec![CoreType::Creature, CoreType::Land]);
+            }
+            other => panic!("expected a restricted CardType choice, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pack_leader_prevent_damage_scopes_to_dogs_you_control() {
+        use crate::schema::types::{
+            CreatureType, DamageRecipientsList, ReplacableEventWouldDealDamage,
+        };
+        use engine::types::ability::{
+            ControllerRef, PreventionAmount, PreventionScope, TypeFilter,
+        };
+
+        let effect = convert_create_replace_would_deal_damage_until(
+            &ReplacableEventWouldDealDamage::CombatDamageWouldBeDealtToARecipient(
+                DamageRecipientsList::APermanent(Box::new(Permanents::And(vec![
+                    Permanents::IsCreatureType(CreatureType::Dog),
+                    Permanents::ControlledByAPlayer(Box::new(Players::SinglePlayer(Box::new(
+                        Player::You,
+                    )))),
+                ]))),
+            ),
+            &[ReplacementActionWouldDealDamage::PreventThatDamage],
+            &Expiration::UntilEndOfTurn,
+        )
+        .unwrap();
+
+        let Effect::PreventDamage {
+            amount,
+            target,
+            scope,
+            damage_source_filter,
+            ..
+        } = effect
+        else {
+            panic!("expected PreventDamage, got {effect:?}");
+        };
+        assert_eq!(amount, PreventionAmount::All);
+        assert_eq!(scope, PreventionScope::CombatDamage);
+        assert!(damage_source_filter.is_none());
+        assert_eq!(
+            target,
+            TargetFilter::Typed(
+                TypedFilter::creature()
+                    .with_type(TypeFilter::Subtype("Dog".into()))
+                    .controller(ControllerRef::You)
+            )
+        );
+    }
+
+    #[test]
+    fn player_damage_recipient_maps_to_player_target_filter() {
+        use crate::schema::types::DamageRecipientsList;
+
+        assert_eq!(
+            damage_recipients_list_to_prevent_target(&DamageRecipientsList::APlayer(Box::new(
+                Players::AnyPlayer
+            )))
+            .unwrap(),
+            TargetFilter::Player
+        );
+        assert_eq!(
+            damage_recipients_list_to_prevent_target(&DamageRecipientsList::APlayer(Box::new(
+                Players::SinglePlayer(Box::new(Player::You))
+            )))
+            .unwrap(),
+            TargetFilter::Controller
+        );
+    }
+
+    #[test]
+    fn mixed_player_or_permanent_damage_recipient_strict_fails() {
+        use crate::schema::types::DamageRecipientsList;
+
+        let err =
+            damage_recipients_list_to_prevent_target(&DamageRecipientsList::APlayerOrAPermanent(
+                Box::new(Players::AnyPlayer),
+                Box::new(Permanents::AnyPermanent),
+            ))
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            ConversionGap::EnginePrerequisiteMissing {
+                engine_type: "Effect::PreventDamage::target",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn unrecognized_single_damage_recipient_strict_fails() {
+        let err =
+            single_damage_recipient_to_prevent_target(&SingleDamageRecipient::DistributedAnyTarget)
+                .unwrap_err();
+
+        assert!(matches!(
+            err,
+            ConversionGap::EnginePrerequisiteMissing {
+                engine_type: "Effect::PreventDamage::target",
+                ..
+            }
         ));
     }
 
@@ -2981,6 +3460,29 @@ mod tests {
             ConversionGap::EnginePrerequisiteMissing {
                 engine_type: "ReplacementDefinition",
                 ..
+            }
+        ));
+    }
+
+    #[test]
+    fn as_enters_prepared_lowers_to_self_targeted_become_prepared() {
+        // CR 722.3a: "As this enters, it's prepared." (e.g. Jadzi, Steward of
+        // Fate) must lower to a self-targeted `BecomePrepared` ETB replacement,
+        // not strict-fail — the engine prerequisite exists.
+        let defs = convert_as_enters(
+            &Permanent::ThisPermanent,
+            &[ReplacementActionWouldEnter::EntersPrepared],
+        )
+        .unwrap();
+
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].valid_card, Some(TargetFilter::SelfRef));
+        assert_eq!(defs[0].event, ReplacementEvent::ChangeZone);
+        let execute = defs[0].execute.as_ref().expect("prepared execute");
+        assert!(matches!(
+            &*execute.effect,
+            Effect::BecomePrepared {
+                target: TargetFilter::SelfRef
             }
         ));
     }
@@ -3132,7 +3634,7 @@ mod tests {
 
         let execute = defs[0].execute.as_ref().expect("ETB AddCounter execute");
         match &*execute.effect {
-            Effect::AddCounter {
+            Effect::PutCounter {
                 counter_type,
                 count,
                 target,
@@ -3169,7 +3671,7 @@ mod tests {
 
         let execute = defs[0].execute.as_ref().unwrap();
         match &*execute.effect {
-            Effect::AddCounter { count, .. } => match count {
+            Effect::PutCounter { count, .. } => match count {
                 QE::Offset { inner, offset } => {
                     assert_eq!(*offset, 1);
                     assert!(
@@ -3181,5 +3683,98 @@ mod tests {
             },
             other => panic!("expected AddCounter, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn graveyard_would_put_card_in_players_graveyard_from_anywhere_lowers_to_moved_exile() {
+        use crate::schema::types::{Cards, Players, ReplacableEventWouldPutIntoGraveyard as E};
+
+        let event = E::WouldPutACardInAPlayersGraveyardFromAnywhere(
+            Box::new(Cards::ControlledByAPlayer(Box::new(Players::Other(
+                Box::new(crate::schema::types::Player::You),
+            )))),
+            Box::new(Players::Opponent),
+        );
+        let defs = convert_replace_would_put_into_graveyard(
+            &event,
+            &[ReplacementActionWouldPutIntoGraveyard::ExileItInstead],
+        )
+        .unwrap();
+        assert_eq!(defs.len(), 1);
+        let def = &defs[0];
+        assert_eq!(def.event, ReplacementEvent::Moved);
+        assert_eq!(def.destination_zone, Some(Zone::Graveyard));
+        let execute = def.execute.as_ref().expect("execute");
+        assert!(matches!(
+            &*execute.effect,
+            Effect::ChangeZone {
+                destination: Zone::Exile,
+                ..
+            }
+        ));
+        let TargetFilter::And { filters } = def.valid_card.as_ref().expect("valid card filter")
+        else {
+            panic!("expected And valid-card filter, got {:?}", def.valid_card);
+        };
+        assert!(filters.iter().any(|filter| matches!(
+            filter,
+            TargetFilter::Typed(TypedFilter { properties, .. })
+                if properties.contains(&FilterProp::Owned {
+                    controller: ControllerRef::Opponent,
+                })
+        )));
+    }
+
+    #[test]
+    fn exile_two_cards_from_graveyards_cost_converts_to_exile_cost() {
+        use crate::schema::types::{CardType, CardsInGraveyard, Player, Players};
+
+        let cost = ReplacementActionWouldEnterCost::ExileTwoCardsFromAmongPlayersGraveyards(
+            CardsInGraveyard::IsCardtype(CardType::Creature),
+            Box::new(Players::SinglePlayer(Box::new(Player::You))),
+        );
+        let result = convert_enter_cost(&cost);
+        assert!(result.is_ok());
+        let ability_cost = result.unwrap();
+        assert!(matches!(
+            ability_cost,
+            AbilityCost::Exile {
+                count: 2,
+                zone: Some(Zone::Graveyard),
+                filter: Some(_),
+            }
+        ));
+    }
+
+    #[test]
+    fn enter_as_copy_of_exiled_converts_to_become_copy_with_indexed_filter() {
+        use crate::schema::types::CopyEffects;
+
+        let action = ReplacementActionWouldEnter::EnterAsCopyOfExiled(
+            CardInExile::TheFirstCardExiledThisWay,
+            CopyEffects::NoCopyEffects,
+        );
+        let def = build_replacement_exec(&action, &TargetFilter::SelfRef)
+            .unwrap()
+            .2;
+        assert!(matches!(
+            &*def.effect,
+            Effect::BecomeCopy {
+                target: TargetFilter::ExiledCardByIndex { index: 0 },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn card_in_exile_to_target_filter_maps_indices_correctly() {
+        assert!(matches!(
+            convert_card_in_exile_to_target_filter(&CardInExile::TheFirstCardExiledThisWay),
+            Ok(TargetFilter::ExiledCardByIndex { index: 0 })
+        ));
+        assert!(matches!(
+            convert_card_in_exile_to_target_filter(&CardInExile::TheSecondCardExiledThisWay),
+            Ok(TargetFilter::ExiledCardByIndex { index: 1 })
+        ));
     }
 }

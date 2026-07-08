@@ -1,5 +1,7 @@
 //! Atomic parsing combinators for numbers, mana symbols, colors, counters, and P/T modifiers.
 
+use std::borrow::Cow;
+
 use nom::branch::alt;
 use nom::bytes::complete::{tag, take_till1, take_until, take_while_m_n};
 use nom::character::complete::{char, digit1, space0};
@@ -65,23 +67,15 @@ fn parse_digit_number(input: &str) -> OracleResult<'_, u32> {
 /// "a"/"an" require a word boundary after the match (whitespace, punctuation, or
 /// end-of-input) to prevent false matches on words like "another" or "anyone".
 ///
-/// Supports multiples of ten from thirty through ninety, plus "one hundred",
-/// for cards like Lux Artillery ("thirty or more counters") and Hundred-Handed
-/// One. Compound forms like "twenty-one" are not currently printed in Oracle
-/// text — add them here if that changes.
+/// Supports multiples of ten from thirty through ninety, hyphenated compounds
+/// from twenty-one through ninety-nine, plus "one hundred".
 fn parse_english_number(input: &str) -> OracleResult<'_, u32> {
     // Longest-match-first ordering within shared prefixes (e.g. "fourteen" before "four").
     // Split into multiple alt groups to stay within nom's 21-element tuple limit.
-    alt((
+    let (rest, matched) = alt((
         value(100u32, tag("one hundred")),
-        value(90, tag("ninety")),
-        value(80, tag("eighty")),
-        value(70, tag("seventy")),
-        value(60, tag("sixty")),
-        value(50, tag("fifty")),
-        value(40, tag("forty")),
-        value(30, tag("thirty")),
-        value(20, tag("twenty")),
+        parse_hyphenated_english_number,
+        parse_english_tens,
     ))
     .or(alt((
         value(19u32, tag("nineteen")),
@@ -107,6 +101,58 @@ fn parse_english_number(input: &str) -> OracleResult<'_, u32> {
         value(1, tag("one")),
         parse_article_number,
     )))
+    .parse(input)?;
+
+    // Require a word boundary after the number word so a cardinal isn't matched
+    // inside a longer word ("sixth" → "six", "tenfold" → "ten", "nineteenth" →
+    // "nineteen"). This mirrors the boundary guard `parse_article_number` already
+    // applies to "a"/"an"; the multi-character number words previously lacked it
+    // because the `oracle_util::parse_number` wrapper only guards matches of ≤2
+    // characters. A following ASCII alphanumeric means the token continues, so
+    // the match was a spurious substring.
+    match rest.chars().next() {
+        Some(c) if c.is_ascii_alphanumeric() => Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Fail,
+        ))),
+        _ => Ok((rest, matched)),
+    }
+}
+
+fn parse_english_tens(input: &str) -> OracleResult<'_, u32> {
+    alt((
+        value(90u32, tag("ninety")),
+        value(80, tag("eighty")),
+        value(70, tag("seventy")),
+        value(60, tag("sixty")),
+        value(50, tag("fifty")),
+        value(40, tag("forty")),
+        value(30, tag("thirty")),
+        value(20, tag("twenty")),
+    ))
+    .parse(input)
+}
+
+fn parse_english_one_to_nine(input: &str) -> OracleResult<'_, u32> {
+    alt((
+        value(9u32, tag("nine")),
+        value(8, tag("eight")),
+        value(7, tag("seven")),
+        value(6, tag("six")),
+        value(5, tag("five")),
+        value(4, tag("four")),
+        value(3, tag("three")),
+        value(2, tag("two")),
+        value(1, tag("one")),
+    ))
+    .parse(input)
+}
+
+fn parse_hyphenated_english_number(input: &str) -> OracleResult<'_, u32> {
+    map(
+        (parse_english_tens, tag("-"), parse_english_one_to_nine),
+        |(tens, _, ones)| tens + ones,
+    )
     .parse(input)
 }
 
@@ -154,6 +200,11 @@ pub fn parse_mana_symbol(input: &str) -> OracleResult<'_, ManaCostShard> {
 /// Parse the inner content of a mana symbol (between `{` and `}`).
 fn parse_mana_symbol_inner(input: &str) -> OracleResult<'_, ManaCostShard> {
     alt((
+        // Phyrexian-hybrid symbols (longest match first). These 3-part `{C1/C2/P}`
+        // symbols must be tried before the 2-part hybrid arms below — otherwise
+        // `alt` matches the `W/U` prefix of `{W/U/P}` and the trailing `/P`
+        // breaks the `}` delimiter, silently dropping the pip (issue #1416).
+        parse_phyrexian_hybrid_symbol_inner,
         // Hybrid symbols (longest match first)
         value(ManaCostShard::WhiteBlue, tag("W/U")),
         value(ManaCostShard::WhiteBlack, tag("W/B")),
@@ -251,6 +302,28 @@ fn parse_two_generic_hybrid_symbol_inner(input: &str) -> OracleResult<'_, ManaCo
         value(ManaCostShard::TwoBlack, tag("2/B")),
         value(ManaCostShard::TwoRed, tag("2/R")),
         value(ManaCostShard::TwoGreen, tag("2/G")),
+    ))
+    .parse(input)
+}
+
+/// CR 107.4f: Phyrexian-hybrid symbols `{C1/C2/P}` may be paid with one mana of
+/// either color or 2 life. Mirrors the 10 such symbols in
+/// `ManaCostShard::from_str`. Kept as a dedicated combinator (like
+/// `parse_two_generic_hybrid_symbol_inner`) so the 3-part forms can be matched
+/// ahead of the 2-part hybrid arms in `parse_mana_symbol_inner` — `alt` does not
+/// backtrack, so the longer form must be tried first.
+fn parse_phyrexian_hybrid_symbol_inner(input: &str) -> OracleResult<'_, ManaCostShard> {
+    alt((
+        value(ManaCostShard::PhyrexianWhiteBlue, tag("W/U/P")),
+        value(ManaCostShard::PhyrexianWhiteBlack, tag("W/B/P")),
+        value(ManaCostShard::PhyrexianBlueBlack, tag("U/B/P")),
+        value(ManaCostShard::PhyrexianBlueRed, tag("U/R/P")),
+        value(ManaCostShard::PhyrexianBlackRed, tag("B/R/P")),
+        value(ManaCostShard::PhyrexianBlackGreen, tag("B/G/P")),
+        value(ManaCostShard::PhyrexianRedWhite, tag("R/W/P")),
+        value(ManaCostShard::PhyrexianRedGreen, tag("R/G/P")),
+        value(ManaCostShard::PhyrexianGreenWhite, tag("G/W/P")),
+        value(ManaCostShard::PhyrexianGreenBlue, tag("G/U/P")),
     ))
     .parse(input)
 }
@@ -634,6 +707,7 @@ pub fn parse_alt_cost_keyword_name_to_kind(input: &str) -> OracleResult<'_, Keyw
         value(KeywordKind::Mutate, tag("mutate")),
         value(KeywordKind::Bestow, tag("bestow")),
         value(KeywordKind::Harmonize, tag("harmonize")),
+        value(KeywordKind::Madness, tag("madness")),
     ))
     .parse(input)
 }
@@ -643,7 +717,7 @@ pub fn parse_alt_cost_keyword_name_to_kind(input: &str) -> OracleResult<'_, Keyw
 /// Matches common Oracle text action verbs: "destroy", "exile", "draw",
 /// "create", "sacrifice", "discard", "return", "put", "counter", "gain",
 /// "lose", "deal", "tap", "untap", "search", "shuffle", "reveal", "mill",
-/// "scry", "surveil", "fight".
+/// "scry", "surveil", "fight", "seek", "choose", "double".
 /// Returns the matched verb as a string slice.
 pub fn parse_verb(input: &str) -> OracleResult<'_, &str> {
     static VERBS: &[&str] = &[
@@ -700,6 +774,12 @@ pub fn parse_verb(input: &str) -> OracleResult<'_, &str> {
         "bolster",
         "explore",
         "adapt",
+        "seeks",
+        "seek",
+        "chooses",
+        "choose",
+        "doubles",
+        "double",
     ];
 
     for &verb in VERBS {
@@ -718,6 +798,20 @@ pub fn parse_verb(input: &str) -> OracleResult<'_, &str> {
         input,
         nom::error::ErrorKind::Fail,
     )))
+}
+
+/// Test whether a lowercased candidate word is a complete Oracle-text imperative
+/// verb (e.g. `search`, `destroy`, `return`). Used by `normalize_card_name_refs`
+/// strategy-5 guard to reject single-word card-name first-word replacements that
+/// would corrupt a sentence-initial instruction verb (e.g. `Search for Tomorrow`
+/// must not rewrite `Search your library...` to `~ your library...`).
+///
+/// Uses `all_consuming(parse_verb)` so only a candidate that *is* a verb in its
+/// entirety returns true; a card-name prefix that merely starts with a verb does
+/// not. CR 201.5: self-references are by name, never by an instruction verb, so
+/// no genuine self-reference is ever an imperative verb.
+pub(crate) fn is_verb_word(candidate_lower: &str) -> bool {
+    all_consuming(parse_verb).parse(candidate_lower).is_ok()
 }
 
 /// Parse common Oracle phrase fragments.
@@ -791,6 +885,86 @@ where
     None
 }
 
+/// Like [`scan_at_word_boundaries`] but returns the **last** successful match,
+/// together with the byte offset where that match began.
+pub fn scan_last_at_word_boundaries_with_offset<'a, O, F>(
+    text: &'a str,
+    mut combinator: F,
+) -> Option<(usize, O, &'a str)>
+where
+    F: FnMut(&'a str) -> nom::IResult<&'a str, O, OracleError<'a>>,
+{
+    let mut remaining = text;
+    let mut offset = 0;
+    let mut last = None;
+    while !remaining.is_empty() {
+        if let Ok((rest, val)) = combinator(remaining) {
+            last = Some((offset, val, rest));
+        }
+        if let Some(rel) = remaining.find(' ') {
+            offset += rel + 1;
+            remaining = remaining[rel + 1..].trim_start();
+        } else {
+            break;
+        }
+    }
+    last
+}
+
+/// Like [`scan_last_at_word_boundaries_with_offset`] but only retains matches
+/// whose offset passes `accept_offset`.
+pub fn scan_last_valid_at_word_boundaries_with_offset<'a, O, F, P>(
+    text: &'a str,
+    mut combinator: F,
+    mut accept_offset: P,
+) -> Option<(usize, O, &'a str)>
+where
+    F: FnMut(&'a str) -> nom::IResult<&'a str, O, OracleError<'a>>,
+    P: FnMut(usize) -> bool,
+{
+    let mut remaining = text;
+    let mut offset = 0;
+    let mut last = None;
+    while !remaining.is_empty() {
+        if let Ok((rest, val)) = combinator(remaining) {
+            if accept_offset(offset) {
+                last = Some((offset, val, rest));
+            }
+        }
+        if let Some(rel) = remaining.find(' ') {
+            offset += rel + 1;
+            remaining = remaining[rel + 1..].trim_start();
+        } else {
+            break;
+        }
+    }
+    last
+}
+
+/// Like [`scan_at_word_boundaries`] but returns the **last** successful match.
+///
+/// Use for terminal riders ("... if <condition>", "... as long as <condition>")
+/// where an earlier `as if` phrase must not steal the gate.
+pub fn scan_last_at_word_boundaries<'a, O, F>(
+    text: &'a str,
+    mut combinator: F,
+) -> Option<(O, &'a str)>
+where
+    F: FnMut(&'a str) -> nom::IResult<&'a str, O, OracleError<'a>>,
+{
+    let mut remaining = text;
+    let mut last = None;
+    while !remaining.is_empty() {
+        if let Ok((rest, val)) = combinator(remaining) {
+            last = Some((val, rest));
+        }
+        remaining = remaining
+            .find(' ')
+            .map_or("", |i| remaining[i + 1..].trim_start());
+    }
+    last
+}
+
 /// Check whether `phrase` appears at any word boundary in `text`.
 ///
 /// More precise than `str::contains()` — matches complete phrases at word
@@ -813,6 +987,54 @@ pub fn scan_contains(text: &str, phrase: &str) -> bool {
             .map_or("", |i| remaining[i + 1..].trim_start());
     }
     false
+}
+
+/// Mask every double-quoted span (the quotes and their contents) with a single
+/// ASCII space, so line classifiers see the spell's own grammar and not the text
+/// of a granted/printed ability inside quotes (a created token's "with \"…\"" text
+/// or a perpetually-gained spell ability). Borrowed when the text has no '"'.
+/// An unterminated quote passes the remainder through unchanged (no panic).
+pub fn strip_double_quoted_spans(text: &str) -> Cow<'_, str> {
+    // Zero-alloc fast path: no double quote means nothing to mask. This scans for
+    // a char (a single quote mark), not a string literal, so it is not parsing
+    // dispatch and stays off the combinator-mandate ban list.
+    if text.find('"').is_none() {
+        return Cow::Borrowed(text);
+    }
+
+    let mut out = String::with_capacity(text.len());
+    let mut remaining = text;
+    while !remaining.is_empty() {
+        match remaining.find('"') {
+            None => {
+                // No further quote: copy the tail verbatim and finish.
+                out.push_str(remaining);
+                break;
+            }
+            Some(open) => {
+                // Copy the verbatim text before the opening quote.
+                out.push_str(&remaining[..open]);
+                let after_open = &remaining[open..];
+                // Recognize the quoted span with combinators: opening quote,
+                // contents up to the closing quote, closing quote.
+                match delimited(char::<_, OracleError<'_>>('"'), take_until("\""), char('"'))
+                    .parse(after_open)
+                {
+                    Ok((rest, _span)) => {
+                        // Whole span (quotes + contents) collapses to one space.
+                        out.push(' ');
+                        remaining = rest;
+                    }
+                    Err(_) => {
+                        // Unterminated quote: pass the remainder through unchanged.
+                        out.push_str(after_open);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    Cow::Owned(out)
 }
 
 /// Scan `text` at word boundaries using `combinator`. Returns `(prefix, matched_start)` where
@@ -916,6 +1138,40 @@ mod tests {
     use super::*;
     use nom::bytes::complete::tag;
 
+    #[test]
+    fn strip_double_quoted_spans_no_quote_borrows_unchanged() {
+        let out = strip_double_quoted_spans("creatures you control can't block");
+        assert!(matches!(out, Cow::Borrowed(_)));
+        assert_eq!(out, "creatures you control can't block");
+    }
+
+    #[test]
+    fn strip_double_quoted_spans_single_span_collapses_to_one_space() {
+        // The span plus its quotes becomes a single space; surrounding text intact.
+        let out = strip_double_quoted_spans(r#"a "b c" d"#);
+        assert_eq!(out, "a   d");
+        assert!(matches!(out, Cow::Owned(_)));
+    }
+
+    #[test]
+    fn strip_double_quoted_spans_masks_two_spans() {
+        let out = strip_double_quoted_spans(r#"x "one" y "two" z"#);
+        assert_eq!(out, "x   y   z");
+    }
+
+    #[test]
+    fn strip_double_quoted_spans_unterminated_passes_through() {
+        let out = strip_double_quoted_spans(r#"a "b c"#);
+        assert_eq!(out, r#"a "b c"#);
+    }
+
+    #[test]
+    fn strip_double_quoted_spans_empty_ok() {
+        let out = strip_double_quoted_spans("");
+        assert_eq!(out, "");
+        assert!(matches!(out, Cow::Borrowed(_)));
+    }
+
     /// Extended number words (30, 40, ..., 100) for cards like Lux Artillery
     /// ("thirty or more counters") and Hundred-Handed One.
     #[test]
@@ -928,6 +1184,51 @@ mod tests {
         assert_eq!(parse_number("eighty").unwrap().1, 80);
         assert_eq!(parse_number("ninety").unwrap().1, 90);
         assert_eq!(parse_number("one hundred").unwrap().1, 100);
+    }
+
+    #[test]
+    fn test_parse_number_hyphenated_words() {
+        assert_eq!(parse_number("twenty-one").unwrap().1, 21);
+        assert_eq!(parse_number("ninety-nine").unwrap().1, 99);
+        assert_eq!(parse_number("ninety").unwrap().1, 90);
+        assert_eq!(parse_number("one hundred").unwrap().1, 100);
+    }
+
+    /// A cardinal number word must not be matched inside a longer word (e.g.
+    /// the ordinal "sixth" or "tenfold"). The multi-character words previously
+    /// lacked the word-boundary guard that `parse_article_number` applies to
+    /// "a"/"an", and the `oracle_util::parse_number` wrapper only guarded
+    /// matches of ≤2 characters — so "sixth" parsed as 6, "tenth" as 10, etc.
+    #[test]
+    fn test_parse_english_number_requires_word_boundary() {
+        // Longer words that merely start with a cardinal must NOT parse.
+        for embedded in [
+            "sixth",
+            "tenth",
+            "tenfold",
+            "threefold",
+            "nineteenth",
+            "fourteener",
+        ] {
+            assert!(
+                parse_number(embedded).is_err(),
+                "{embedded:?} must not parse as an embedded cardinal"
+            );
+        }
+        // Genuine cardinals with a trailing boundary still parse, remainder intact.
+        assert_eq!(parse_number("six cards").unwrap(), (" cards", 6));
+        assert_eq!(parse_number("ten").unwrap(), ("", 10));
+        assert_eq!(
+            parse_number("nineteen creatures").unwrap(),
+            (" creatures", 19)
+        );
+        assert_eq!(
+            parse_number("three, then draw").unwrap(),
+            (", then draw", 3)
+        );
+        // Distinct number words that merely share a prefix are unaffected.
+        assert_eq!(parse_number("sixteen").unwrap(), ("", 16));
+        assert_eq!(parse_number("sixty").unwrap(), ("", 60));
     }
 
     /// `parse_strict_counter_type` accepts recognized counter tokens (keyword
@@ -1017,6 +1318,44 @@ mod tests {
         let result = scan_preceded("the creature enters", |i| {
             tag::<_, _, OracleError<'_>>("dies").parse(i)
         });
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_scan_last_at_word_boundaries_picks_terminal_if_gate() {
+        let (_, tail) = scan_last_at_word_boundaries(
+            "you may cast as if they had flash if you control a zombie",
+            |i| tag::<_, _, OracleError<'_>>("if ").parse(i),
+        )
+        .expect("terminal if gate");
+        assert_eq!(tail, "you control a zombie");
+    }
+
+    #[test]
+    fn test_scan_last_at_word_boundaries_with_offset_picks_terminal_if_gate() {
+        let (_, _, tail) = scan_last_at_word_boundaries_with_offset(
+            "you can't play lands as if there were no rule if ten or more lands are on the battlefield",
+            |i| tag::<_, _, OracleError<'_>>("if ").parse(i),
+        )
+        .expect("terminal if gate");
+        assert_eq!(tail, "ten or more lands are on the battlefield");
+    }
+
+    #[test]
+    fn test_scan_last_at_word_boundaries_with_offset_skips_as_if() {
+        let result = scan_last_valid_at_word_boundaries_with_offset(
+            "you can't play lands as if there were no rule",
+            |i| tag::<_, _, OracleError<'_>>("if ").parse(i),
+            |if_offset| {
+                let Some(start) = if_offset.checked_sub(3) else {
+                    return true;
+                };
+                !"you can't play lands as if there were no rule".is_char_boundary(start)
+                    || tag::<_, _, OracleError<'_>>("as ")
+                        .parse(&"you can't play lands as if there were no rule"[start..if_offset])
+                        .is_err()
+            },
+        );
         assert!(result.is_none());
     }
 
@@ -1499,6 +1838,7 @@ mod tests {
             ("mutate ability", KeywordKind::Mutate),
             ("bestow ability", KeywordKind::Bestow),
             ("harmonize ability", KeywordKind::Harmonize),
+            ("madness", KeywordKind::Madness),
         ];
         for (input, expected) in cases {
             let (_, kind) = parse_alt_cost_keyword_name_to_kind(input).unwrap();

@@ -1,6 +1,6 @@
 use crate::game::quantity::resolve_quantity_with_targets;
 use crate::game::replacement::{self, ReplacementResult};
-use crate::game::zones;
+use crate::game::zone_pipeline::{self, BatchMoveResult, ZoneMoveRequest};
 use crate::types::ability::{Effect, EffectError, EffectKind, ResolvedAbility};
 use crate::types::events::GameEvent;
 use crate::types::game_state::GameState;
@@ -8,8 +8,8 @@ use crate::types::proposed_event::ProposedEvent;
 use crate::types::zones::Zone;
 
 /// CR 701.17a: Mill N — put the top N cards of a player's library into their graveyard.
-/// When `destination` is set to a zone other than Graveyard (e.g., Exile),
-/// cards are moved there instead -- building block for "exile the top N cards" patterns.
+/// When `destination` is set to a zone other than Graveyard (e.g., Exile or Hand),
+/// cards are moved there instead -- building block for top-of-library move patterns.
 pub fn resolve(
     state: &mut GameState,
     ability: &ResolvedAbility,
@@ -22,8 +22,14 @@ pub fn resolve(
             target,
         } => (
             // CR 107.1b: Resolve with full ability context so `QuantityRef::Variable { "X" }`
-            // reads the caster-chosen X from the resolving ability.
-            resolve_quantity_with_targets(state, count, ability) as usize,
+            // reads the caster-chosen X from the resolving ability, and clamp a
+            // negative result to zero before the `as usize` cast. Mill shares the
+            // Draw/Mill/Discard dynamic-count parser, so a subtractive count
+            // ("mill cards equal to A minus B" with B > A) resolves negative;
+            // without the clamp `-1 as usize` wraps huge and the downstream
+            // library-size `min` mills the entire library instead of nothing.
+            // Mirrors the guard in `draw.rs` / `discard.rs`.
+            resolve_quantity_with_targets(state, count, ability).max(0) as usize,
             *destination,
             // CR 701.17a + CR 115.1: Mirror Draw/Scry/Surveil — context-ref
             // target filters (Controller, PostReplacementSourceController,
@@ -45,7 +51,14 @@ pub fn resolve(
 
         match replacement::replace_event(state, proposed, events) {
             ReplacementResult::Execute(event) => {
-                apply_mill_after_replacement(state, event, events)?;
+                // CR 616.1: a per-card pause leaves `state.waiting_for` set and
+                // the tail parked; bail before emitting `EffectResolved` so the
+                // surfaced prompt is not clobbered. The resume path
+                // (`zone_pipeline::drain_pending_batch_deliveries`) finishes the
+                // batch.
+                if !apply_mill_after_replacement(state, event, events)? {
+                    return Ok(());
+                }
             }
             ReplacementResult::Prevented => {}
             ReplacementResult::NeedsChoice(player) => {
@@ -54,17 +67,18 @@ pub fn resolve(
                 return Ok(());
             }
         }
-    } else {
-        apply_mill_after_replacement(
-            state,
-            ProposedEvent::Mill {
-                player_id: target_player,
-                count: num_cards as u32,
-                destination,
-                applied: Default::default(),
-            },
-            events,
-        )?;
+    } else if !apply_mill_after_replacement(
+        state,
+        ProposedEvent::Mill {
+            player_id: target_player,
+            count: num_cards as u32,
+            destination,
+            applied: Default::default(),
+        },
+        events,
+    )? {
+        // CR 616.1: per-card pause (see above) — bail before `EffectResolved`.
+        return Ok(());
     }
 
     events.push(GameEvent::EffectResolved {
@@ -77,11 +91,19 @@ pub fn resolve(
 
 /// CR 701.17a-b: Apply an accepted mill event after replacement effects have
 /// had a chance to modify the count.
+///
+/// Returns `true` when every milled card was delivered, `false` when a per-card
+/// `Moved` replacement surfaced a CR 616.1 ordering choice that parked the batch
+/// (`state.waiting_for` is left set, the undelivered tail in
+/// `state.pending_batch_deliveries`). Callers that reset `state.waiting_for`
+/// after applying an accepted event MUST early-return on `false` so they don't
+/// clobber the parked prompt (mirrors the `apply_etb_counters` early-return
+/// precedent in `handle_replacement_choice`).
 pub fn apply_mill_after_replacement(
     state: &mut GameState,
     event: ProposedEvent,
     events: &mut Vec<GameEvent>,
-) -> Result<(), EffectError> {
+) -> Result<bool, EffectError> {
     let ProposedEvent::Mill {
         player_id,
         count,
@@ -89,7 +111,7 @@ pub fn apply_mill_after_replacement(
         ..
     } = event
     else {
-        return Ok(());
+        return Ok(true);
     };
 
     let player = state
@@ -104,11 +126,32 @@ pub fn apply_mill_after_replacement(
     let cards_to_mill: Vec<_> = player.library.iter().take(count).copied().collect();
     state.last_effect_count = Some(cards_to_mill.len() as i32);
 
-    for obj_id in cards_to_mill {
-        zones::move_to_zone(state, obj_id, destination, events);
-    }
-
-    Ok(())
+    // CR 701.17a + CR 614.6: Route each milled card through the zone-change
+    // pipeline (the shared `zone_pipeline::move_objects_simultaneously` batch
+    // entry) rather than a raw `zones::move_to_zone`. The raw move never
+    // proposed a per-card ZoneChange, so `Moved` redirects ("if a card would be
+    // put into a graveyard from anywhere, exile it instead" — Rest in Peace /
+    // Leyline of the Void class) never fired for milled cards. The batch entry
+    // proposes each inner ZoneChange and consults those replacements before
+    // delivery, fixing the known bug.
+    //
+    // Attribution: the milled card itself anchors the `Effect` cause (mill to a
+    // graveyard creates no exile-link, and a `Moved` replacement's `valid_card`
+    // is evaluated against the moved card, so this matches the pre-pipeline raw
+    // behavior while enabling the replacement consult).
+    //
+    // CR 616.1: a per-card ordering choice (two simultaneous graveyard→exile
+    // redirects) parks `state.waiting_for` + the undelivered tail in
+    // `state.pending_batch_deliveries`; the replacement-choice resume path
+    // (`zone_pipeline::drain_pending_batch_deliveries`) finishes the batch.
+    let reqs: Vec<ZoneMoveRequest> = cards_to_mill
+        .iter()
+        .map(|&obj_id| ZoneMoveRequest::effect(obj_id, destination, obj_id))
+        .collect();
+    Ok(matches!(
+        zone_pipeline::move_objects_simultaneously(state, reqs, events),
+        BatchMoveResult::Done
+    ))
 }
 
 #[cfg(test)]
@@ -138,6 +181,110 @@ mod tests {
             ObjectId(100),
             PlayerId(0),
         )
+    }
+
+    /// CR 614.6: a graveyard→exile `Moved` redirect (Rest in Peace / Leyline of
+    /// the Void class). Two of these are simultaneously applicable to each milled
+    /// card, so the CR 616.1 materiality classifier prompts for ordering per card.
+    fn graveyard_exile_redirect(description: &str) -> ReplacementDefinition {
+        use crate::types::zones::EtbTapState;
+        ReplacementDefinition::new(ReplacementEvent::Moved)
+            .destination_zone(Zone::Graveyard)
+            .execute(AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::ChangeZone {
+                    destination: Zone::Exile,
+                    origin: None,
+                    target: TargetFilter::SelfRef,
+                    owner_library: false,
+                    enter_transformed: false,
+                    enters_under: None,
+                    enter_tapped: EtbTapState::Unspecified,
+                    enters_attacking: false,
+                    up_to: false,
+                    enter_with_counters: vec![],
+                    conditional_enter_with_counters: vec![],
+                    face_down_profile: None,
+                    enters_modified_if: None,
+                },
+            ))
+            .description(description.to_string())
+    }
+
+    /// P1 regression (round-2 review): `apply_mill_after_replacement` MUST report
+    /// a per-card pause to its caller (return `false`) rather than swallow it.
+    ///
+    /// The nested Mill-event resume path (`handle_replacement_choice`'s Mill arm)
+    /// applies an accepted Mill event and then unconditionally resets
+    /// `waiting_for` to Priority. If `apply_mill_after_replacement` swallowed a
+    /// per-card CR 616.1 pause (the old `let _ =`), that reset would clobber the
+    /// parked prompt and strand the first paused milled card. This test drives the
+    /// shared seam directly: with two simultaneously-applicable graveyard→exile
+    /// redirects, the first milled card surfaces a CR 616.1 ordering prompt, so
+    /// the helper must return `false`, leave `state.waiting_for` set to that
+    /// prompt, and park the undelivered tail.
+    #[test]
+    fn apply_mill_after_replacement_reports_per_card_pause_to_caller() {
+        let mut state = GameState::new_two_player(42);
+
+        for (description, source_card) in [
+            ("Rest in Peace redirect", CardId(1000)),
+            ("Leyline of the Void redirect", CardId(1001)),
+        ] {
+            let source = create_object(
+                &mut state,
+                source_card,
+                PlayerId(0),
+                "Redirect Source".to_string(),
+                Zone::Battlefield,
+            );
+            state
+                .objects
+                .get_mut(&source)
+                .unwrap()
+                .replacement_definitions = vec![graveyard_exile_redirect(description)].into();
+        }
+
+        for i in 0..3 {
+            create_object(
+                &mut state,
+                CardId(i + 1),
+                PlayerId(1),
+                format!("Milled {i}"),
+                Zone::Library,
+            );
+        }
+
+        let mut events = Vec::new();
+        let delivered = apply_mill_after_replacement(
+            &mut state,
+            ProposedEvent::Mill {
+                player_id: PlayerId(1),
+                count: 3,
+                destination: Zone::Graveyard,
+                applied: Default::default(),
+            },
+            &mut events,
+        )
+        .expect("mill applies");
+
+        // The pause signal must reach the caller so it can early-return before
+        // resetting `waiting_for`.
+        assert!(
+            !delivered,
+            "a per-card CR 616.1 pause must be reported as a non-delivery (false)"
+        );
+        assert!(
+            matches!(
+                state.waiting_for,
+                crate::types::game_state::WaitingFor::ReplacementChoice { .. }
+            ),
+            "the per-card ordering prompt must be parked in waiting_for"
+        );
+        assert!(
+            state.pending_batch_deliveries.is_some(),
+            "the undelivered tail must be stashed for the resume path"
+        );
     }
 
     #[test]
@@ -441,6 +588,7 @@ mod tests {
                             zone: ZoneRef::Library,
                             card_types: vec![],
                             scope: CountScope::ScopedPlayer,
+                            filter: None,
                         },
                     }),
                     divisor: 2,
@@ -530,6 +678,7 @@ mod tests {
                         zone: ZoneRef::Hand,
                         card_types: vec![],
                         scope: CountScope::Controller,
+                        filter: None,
                     },
                 },
                 target: TargetFilter::Controller,
@@ -571,7 +720,7 @@ mod tests {
     /// `GainLife`. It is a runtime test, not a shape test.
     fn renegade_reaper_chain() -> ResolvedAbility {
         use crate::types::ability::{
-            AbilityCondition, GainLifePlayer, TargetFilter as TF, TypeFilter, TypedFilter,
+            AbilityCondition, TargetFilter as TF, TypeFilter, TypedFilter,
         };
         ResolvedAbility::new(
             Effect::Mill {
@@ -587,7 +736,7 @@ mod tests {
             let mut gain = ResolvedAbility::new(
                 Effect::GainLife {
                     amount: QuantityExpr::Fixed { value: 4 },
-                    player: GainLifePlayer::Controller,
+                    player: TargetFilter::Controller,
                 },
                 vec![],
                 ObjectId(100),
@@ -661,6 +810,93 @@ mod tests {
         assert_eq!(
             state.players[0].life, life_before,
             "life must be unchanged — no Angel was milled this way"
+        );
+    }
+
+    /// CR 107.1b: a mill count that resolves negative must clamp to 0, not wrap
+    /// through the `as usize` cast and mill the whole library. Mill shares the
+    /// Draw/Mill/Discard dynamic-count parser, so "mill cards equal to A minus B"
+    /// (with B > A) resolves negative. Revert-probe: without the `.max(0)` the
+    /// downstream library-size `min` mills the target's entire library instead of
+    /// nothing.
+    #[test]
+    fn mill_negative_count_clamps_to_zero() {
+        use crate::types::ability::{AggregateFunction, PlayerScope};
+
+        let mut state = GameState::new_two_player(7);
+        // Controller (P0): 1 card in hand, 2 in library. Opponent (P1): 3 in hand.
+        create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Hand".into(),
+            Zone::Hand,
+        );
+        create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "LibA".into(),
+            Zone::Library,
+        );
+        create_object(
+            &mut state,
+            CardId(3),
+            PlayerId(0),
+            "LibB".into(),
+            Zone::Library,
+        );
+        for i in 0..3u64 {
+            create_object(
+                &mut state,
+                CardId(10 + i),
+                PlayerId(1),
+                "Theirs".into(),
+                Zone::Hand,
+            );
+        }
+
+        // count = HandSize{You} − HandSize{Opponent} = 1 − 3 = −2.
+        let count = QuantityExpr::Sum {
+            exprs: vec![
+                QuantityExpr::Ref {
+                    qty: QuantityRef::HandSize {
+                        player: PlayerScope::Controller,
+                    },
+                },
+                QuantityExpr::Multiply {
+                    factor: -1,
+                    inner: Box::new(QuantityExpr::Ref {
+                        qty: QuantityRef::HandSize {
+                            player: PlayerScope::Opponent {
+                                aggregate: AggregateFunction::Sum,
+                            },
+                        },
+                    }),
+                },
+            ],
+        };
+        let ability = ResolvedAbility::new(
+            Effect::Mill {
+                count,
+                target: TargetFilter::Controller,
+                destination: Zone::Graveyard,
+            },
+            vec![],
+            ObjectId(100),
+            PlayerId(0),
+        );
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        assert_eq!(
+            state.players[0].library.len(),
+            2,
+            "CR 107.1b: a negative mill count must mill 0, not the whole library"
+        );
+        assert!(
+            state.players[0].graveyard.is_empty(),
+            "no card may be milled"
         );
     }
 }

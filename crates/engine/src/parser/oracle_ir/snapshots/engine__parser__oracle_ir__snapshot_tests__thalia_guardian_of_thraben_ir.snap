@@ -17,7 +17,6 @@ expression: "&ir"
         "duration": null,
         "description": "First strike",
         "target_prompt": null,
-        "sorcery_speed": false,
         "condition": null,
         "optional_targeting": false,
         "optional": false,
@@ -27,7 +26,8 @@ expression: "&ir"
     {
       "PreLoweredStatic": {
         "mode": {
-          "RaiseCost": {
+          "ModifyCost": {
+            "mode": "Raise",
             "amount": {
               "type": "Cost",
               "shards": [],
@@ -42,8 +42,7 @@ expression: "&ir"
               ],
               "controller": null,
               "properties": []
-            },
-            "dynamic_count": null
+            }
           }
         },
         "affected": {
